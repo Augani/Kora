@@ -93,18 +93,24 @@ pub struct KeyEntry {
     pub last_access: u32,
     /// Encoding hints, dirty bit, tier marker.
     pub flags: u8,
+    /// Per-key xorshift PRNG state for LFU probabilistic increment.
+    pub lfu_seed: u32,
 }
 
 impl KeyEntry {
     /// Create a new KeyEntry with default metadata.
     pub fn new(key: CompactKey, value: Value) -> Self {
+        let seed = key.as_bytes().iter().fold(0x1234_5678u32, |acc, &b| {
+            acc.wrapping_mul(31).wrapping_add(b as u32)
+        });
         Self {
             key,
             value,
             ttl: None,
-            lfu_counter: 5, // Initial LFU value (same as Redis default)
+            lfu_counter: 5,
             last_access: 0,
             flags: 0,
+            lfu_seed: seed,
         }
     }
 
@@ -135,13 +141,11 @@ impl KeyEntry {
     pub fn touch_lfu(&mut self) {
         let counter = self.lfu_counter;
         if counter < 255 {
+            self.lfu_seed ^= self.lfu_seed << 13;
+            self.lfu_seed ^= self.lfu_seed >> 17;
+            self.lfu_seed ^= self.lfu_seed << 5;
             let p = 1.0 / ((counter as f64) * 10.0 + 1.0);
-            let r = (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos()
-                % 1000) as f64
-                / 1000.0;
+            let r = (self.lfu_seed % 1000) as f64 / 1000.0;
             if r < p {
                 self.lfu_counter = counter.saturating_add(1);
             }

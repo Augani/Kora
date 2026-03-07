@@ -87,6 +87,7 @@ impl ShardStore {
     /// Remove all keys from this shard.
     pub fn flush(&mut self) {
         self.entries.clear();
+        self.memory_used = 0;
     }
 
     /// Execute a command on this shard and return the response.
@@ -379,7 +380,14 @@ impl ShardStore {
             return CommandResponse::Nil;
         }
 
-        let mut entry = KeyEntry::new(compact.clone(), Value::from_bytes(value));
+        if let Some(old_entry) = self.entries.get(&compact) {
+            self.memory_used = self
+                .memory_used
+                .saturating_sub(Self::estimate_key_entry_size(key, &old_entry.value));
+        }
+        let new_value = Value::from_bytes(value);
+        self.memory_used += Self::estimate_key_entry_size(key, &new_value);
+        let mut entry = KeyEntry::new(compact.clone(), new_value);
         if let Some(dur) = Command::ttl_duration(ex, px) {
             entry.set_ttl(dur);
         }
@@ -507,7 +515,14 @@ impl ShardStore {
 
     fn del(&mut self, key: &[u8]) -> bool {
         let compact = CompactKey::new(key);
-        self.entries.remove(&compact).is_some()
+        if let Some(removed) = self.entries.remove(&compact) {
+            self.memory_used = self
+                .memory_used
+                .saturating_sub(Self::estimate_key_entry_size(key, &removed.value));
+            true
+        } else {
+            false
+        }
     }
 
     fn exists(&mut self, key: &[u8]) -> bool {
@@ -617,13 +632,29 @@ impl ShardStore {
     fn cmd_lpush(&mut self, key: &[u8], values: &[Vec<u8>]) -> CommandResponse {
         self.lazy_expire(key);
         let compact = CompactKey::new(key);
+        let is_new = !self.entries.contains_key(&compact);
+        let mut mem_delta: usize = 0;
+        if is_new {
+            mem_delta +=
+                key.len() + std::mem::size_of::<CompactKey>() + std::mem::size_of::<KeyEntry>();
+        }
+        let prepared_values: Vec<Value> = values
+            .iter()
+            .map(|v| {
+                let val = Value::from_bytes(v);
+                mem_delta += val.estimated_size();
+                val
+            })
+            .collect();
         let list = self.get_or_create_list(&compact);
         match list {
             Ok(deque) => {
-                for v in values {
-                    deque.push_front(Value::from_bytes(v));
+                for val in prepared_values {
+                    deque.push_front(val);
                 }
-                CommandResponse::Integer(deque.len() as i64)
+                let len = deque.len() as i64;
+                self.memory_used += mem_delta;
+                CommandResponse::Integer(len)
             }
             Err(e) => e,
         }
@@ -632,13 +663,29 @@ impl ShardStore {
     fn cmd_rpush(&mut self, key: &[u8], values: &[Vec<u8>]) -> CommandResponse {
         self.lazy_expire(key);
         let compact = CompactKey::new(key);
+        let is_new = !self.entries.contains_key(&compact);
+        let mut mem_delta: usize = 0;
+        if is_new {
+            mem_delta +=
+                key.len() + std::mem::size_of::<CompactKey>() + std::mem::size_of::<KeyEntry>();
+        }
+        let prepared_values: Vec<Value> = values
+            .iter()
+            .map(|v| {
+                let val = Value::from_bytes(v);
+                mem_delta += val.estimated_size();
+                val
+            })
+            .collect();
         let list = self.get_or_create_list(&compact);
         match list {
             Ok(deque) => {
-                for v in values {
-                    deque.push_back(Value::from_bytes(v));
+                for val in prepared_values {
+                    deque.push_back(val);
                 }
-                CommandResponse::Integer(deque.len() as i64)
+                let len = deque.len() as i64;
+                self.memory_used += mem_delta;
+                CommandResponse::Integer(len)
             }
             Err(e) => e,
         }
@@ -780,15 +827,32 @@ impl ShardStore {
     fn cmd_hset(&mut self, key: &[u8], fields: &[(Vec<u8>, Vec<u8>)]) -> CommandResponse {
         self.lazy_expire(key);
         let compact = CompactKey::new(key);
+        let is_new = !self.entries.contains_key(&compact);
         let hash = self.get_or_create_hash(&compact);
         match hash {
             Ok(map) => {
+                let mut memory_delta: isize = 0;
+                if is_new {
+                    memory_delta += (key.len()
+                        + std::mem::size_of::<CompactKey>()
+                        + std::mem::size_of::<KeyEntry>())
+                        as isize;
+                }
                 let mut count = 0i64;
                 for (f, v) in fields {
                     let fk = CompactKey::new(f);
-                    if map.insert(fk, Value::from_bytes(v)).is_none() {
+                    let new_val = Value::from_bytes(v);
+                    memory_delta += (fk.as_bytes().len() + new_val.estimated_size()) as isize;
+                    if let Some(old_val) = map.insert(fk, new_val) {
+                        memory_delta -= (f.len() + old_val.estimated_size()) as isize;
+                    } else {
                         count += 1;
                     }
+                }
+                if memory_delta >= 0 {
+                    self.memory_used += memory_delta as usize;
+                } else {
+                    self.memory_used = self.memory_used.saturating_sub(memory_delta.unsigned_abs());
                 }
                 CommandResponse::Integer(count)
             }
@@ -941,13 +1005,26 @@ impl ShardStore {
     fn cmd_sadd(&mut self, key: &[u8], members: &[Vec<u8>]) -> CommandResponse {
         self.lazy_expire(key);
         let compact = CompactKey::new(key);
+        let is_new = !self.entries.contains_key(&compact);
         let set = self.get_or_create_set(&compact);
         match set {
             Ok(set) => {
-                let count = members
-                    .iter()
-                    .filter(|m| set.insert(Value::from_bytes(m)))
-                    .count();
+                let mut memory_delta: usize = 0;
+                if is_new {
+                    memory_delta += key.len()
+                        + std::mem::size_of::<CompactKey>()
+                        + std::mem::size_of::<KeyEntry>();
+                }
+                let mut count = 0usize;
+                for m in members {
+                    let val = Value::from_bytes(m);
+                    let size = val.estimated_size();
+                    if set.insert(val) {
+                        memory_delta += size;
+                        count += 1;
+                    }
+                }
+                self.memory_used += memory_delta;
                 CommandResponse::Integer(count as i64)
             }
             Err(e) => e,
@@ -1039,15 +1116,25 @@ impl ShardStore {
     fn cmd_zadd(&mut self, key: &[u8], members: &[(f64, Vec<u8>)]) -> CommandResponse {
         self.lazy_expire(key);
         let compact = CompactKey::new(key);
+        let is_new = !self.entries.contains_key(&compact);
         let zset = self.get_or_create_sorted_set(&compact);
         match zset {
             Ok(map) => {
+                let mut memory_delta: usize = 0;
+                if is_new {
+                    memory_delta += key.len()
+                        + std::mem::size_of::<CompactKey>()
+                        + std::mem::size_of::<KeyEntry>();
+                }
                 let mut added = 0i64;
+                let member_overhead = std::mem::size_of::<f64>();
                 for (score, member) in members {
                     if map.insert(member.clone(), *score).is_none() {
+                        memory_delta += member.len() + member_overhead;
                         added += 1;
                     }
                 }
+                self.memory_used += memory_delta;
                 CommandResponse::Integer(added)
             }
             Err(e) => e,
@@ -1399,34 +1486,21 @@ impl ShardStore {
         }
     }
 
-    /// Estimate the memory footprint of a single entry.
     fn estimate_entry_size(&self, key: &CompactKey) -> usize {
         let key_size = key.as_bytes().len() + std::mem::size_of::<CompactKey>();
         let value_size = self
             .entries
             .get(key)
-            .map(|e| Self::estimate_value_size(&e.value))
+            .map(|e| e.value.estimated_size())
             .unwrap_or(0);
         key_size + value_size + std::mem::size_of::<KeyEntry>()
     }
 
-    /// Rough estimate of value memory usage.
-    fn estimate_value_size(value: &Value) -> usize {
-        match value {
-            Value::InlineStr { .. } | Value::Int(_) => std::mem::size_of::<Value>(),
-            Value::HeapStr(arc) => std::mem::size_of::<Value>() + arc.len(),
-            Value::List(deque) => {
-                std::mem::size_of::<VecDeque<Value>>() + deque.len() * std::mem::size_of::<Value>()
-            }
-            Value::Hash(map) => {
-                std::mem::size_of::<HashMap<CompactKey, Value>>()
-                    + map.len() * (std::mem::size_of::<CompactKey>() + std::mem::size_of::<Value>())
-            }
-            Value::Set(set) => {
-                std::mem::size_of::<HashSet<Value>>() + set.len() * std::mem::size_of::<Value>()
-            }
-            _ => std::mem::size_of::<Value>(),
-        }
+    fn estimate_key_entry_size(key: &[u8], value: &Value) -> usize {
+        key.len()
+            + std::mem::size_of::<CompactKey>()
+            + std::mem::size_of::<KeyEntry>()
+            + value.estimated_size()
     }
 
     fn get_or_create_list(

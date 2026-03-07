@@ -133,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
         script_max_fuel,
         metrics_port,
         unix_socket,
+        password: None,
     };
 
     tracing::info!(

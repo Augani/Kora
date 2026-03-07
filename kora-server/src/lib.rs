@@ -49,6 +49,8 @@ pub struct ServerConfig {
     pub metrics_port: u16,
     /// Optional Unix socket path.
     pub unix_socket: Option<std::path::PathBuf>,
+    /// Optional password for AUTH command validation.
+    pub password: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -63,6 +65,7 @@ impl Default for ServerConfig {
             script_max_fuel: 0,
             metrics_port: 0,
             unix_socket: None,
+            password: None,
         }
     }
 }
@@ -77,6 +80,7 @@ struct ServerState {
     histograms: Arc<CommandHistograms>,
     memory_trie: Arc<PrefixTrie>,
     tenants: RwLock<TenantRegistry>,
+    auth_password: Option<String>,
 }
 
 /// The Kōra TCP server.
@@ -157,6 +161,7 @@ impl KoraServer {
 
         let bind_address = config.bind_address.clone();
         let unix_socket = config.unix_socket.clone();
+        let auth_password = config.password.clone();
         let metrics_port = config.metrics_port;
         let histograms = Arc::new(CommandHistograms::new());
         let memory_trie = Arc::new(PrefixTrie::new());
@@ -173,6 +178,7 @@ impl KoraServer {
             histograms,
             memory_trie,
             tenants: RwLock::new(tenant_reg),
+            auth_password,
         });
 
         if metrics_port > 0 {
@@ -256,50 +262,8 @@ struct ConnectionState {
     tenant_id: TenantId,
 }
 
-async fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> std::io::Result<()> {
-    let mut parser = RespParser::new();
-    let mut write_buf = BytesMut::with_capacity(4096);
-    let mut read_buf = vec![0u8; 8192];
-    let mut conn = ConnectionState {
-        resp3: false,
-        tenant_id: TenantId(0),
-    };
-
-    loop {
-        let n = stream.read(&mut read_buf).await?;
-        if n == 0 {
-            return Ok(());
-        }
-
-        parser.feed(&read_buf[..n]);
-
-        loop {
-            match parser.try_parse() {
-                Ok(Some(frame)) => {
-                    let response = match parse_command(frame) {
-                        Ok(cmd) => handle_command(cmd, &state, &mut conn).await,
-                        Err(e) => CommandResponse::Error(e.to_string()),
-                    };
-                    serialize_response_versioned(&response, &mut write_buf, conn.resp3);
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    let err_resp = CommandResponse::Error(e.to_string());
-                    serialize_response_versioned(&err_resp, &mut write_buf, conn.resp3);
-                    break;
-                }
-            }
-        }
-
-        if !write_buf.is_empty() {
-            stream.write_all(&write_buf).await?;
-            write_buf.clear();
-        }
-    }
-}
-
-async fn handle_unix_connection(
-    mut stream: tokio::net::UnixStream,
+async fn handle_stream<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    mut stream: S,
     state: Arc<ServerState>,
 ) -> std::io::Result<()> {
     let mut parser = RespParser::new();
@@ -343,6 +307,17 @@ async fn handle_unix_connection(
     }
 }
 
+async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> std::io::Result<()> {
+    handle_stream(stream, state).await
+}
+
+async fn handle_unix_connection(
+    stream: tokio::net::UnixStream,
+    state: Arc<ServerState>,
+) -> std::io::Result<()> {
+    handle_stream(stream, state).await
+}
+
 async fn handle_command(
     cmd: Command,
     state: &ServerState,
@@ -352,7 +327,13 @@ async fn handle_command(
         Command::Hello { version } => {
             return handle_hello(version, conn);
         }
-        Command::Auth { tenant, .. } => {
+        Command::Auth { tenant, password } => {
+            if let Some(ref expected) = state.auth_password {
+                let provided = String::from_utf8_lossy(password);
+                if provided.as_ref() != expected.as_str() {
+                    return CommandResponse::Error("ERR invalid password".into());
+                }
+            }
             if let Some(ref tenant_bytes) = tenant {
                 if let Ok(s) = std::str::from_utf8(tenant_bytes) {
                     if let Ok(id) = s.parse::<u32>() {
@@ -423,7 +404,8 @@ async fn handle_command(
 
     {
         let registry = state.tenants.read();
-        if let Err(e) = registry.check_limits(conn.tenant_id, 0, 0) {
+        let key_count_delta = if cmd.is_mutation() { 1 } else { 0 };
+        if let Err(e) = registry.check_limits(conn.tenant_id, key_count_delta, 0) {
             return CommandResponse::Error(format!("ERR {}", e));
         }
         registry.record_operation(conn.tenant_id);
