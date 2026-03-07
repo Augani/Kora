@@ -190,6 +190,54 @@
 
 ---
 
+## Phase 5 — Deep Integration ✅
+
+**Status: Complete**
+
+### 5.1 — Per-Shard Vector Indexes ✅
+
+- Vector indexes owned per-shard (shared-nothing, no global mutex)
+- Fan-out query merging: dispatch to all shards, merge top-K results
+- Product quantizer for ~4x memory compression (k-means codebooks, asymmetric distance)
+- VECSET, VECQUERY, VECDEL commands fully wired through protocol → server → core
+
+### 5.2 — WASM Host Functions ✅
+
+- `HostContext` holding `Arc<ShardEngine>` in wasmtime Store data
+- Host functions: `kora_get`, `kora_set`, `kora_del`, `kora_hget`, `kora_hset`
+- Guest memory read/write helpers for passing data across WASM boundary
+- SCRIPTCALL command with byte arguments
+
+### 5.3 — CDC Consumer Groups ✅
+
+- `ConsumerGroup` with per-consumer state and pending entry tracking
+- `ConsumerGroupManager` coordinating multiple groups per shard
+- Operations: create_group, read_group, ack, pending, claim
+- Timeout-based redelivery for unacknowledged messages
+- CDC.GROUP CREATE/READ, CDC.ACK, CDC.PENDING commands
+
+### 5.4 — Observability Expansion ✅
+
+- HDR histograms for per-command latency distributions (P50/P99/P999)
+- `PrefixTrie` for memory attribution by key prefix with atomic counters
+- Prometheus exposition format metrics endpoint via hyper HTTP
+- STATS.HOTKEYS, STATS.LATENCY, STATS.MEMORY commands
+
+### 5.5 — Per-Shard Storage ✅
+
+- `ShardStorage`: per-shard WAL/RDB in `shard-{N}/` directories
+- `WalWriter` trait and `WalRecord` enum in kora-core (avoids circular deps)
+- WAL auto-rotation on size limit, RDB save auto-truncates WAL
+- Engine worker loop logs mutations to per-shard WAL
+
+### 5.6 — Embedded Mode Enhancements ✅
+
+- `vector_set`, `vector_search`, `vector_del` API methods
+- Hybrid mode: `start_listener()` spawns TCP server sharing same `Arc<ShardEngine>`
+- Feature-gated "server" dependency
+
+---
+
 ## Test Summary
 
 | Crate | Unit Tests | Integration/Stress Tests | Benchmarks |
@@ -198,10 +246,10 @@
 | kora-protocol | ✅ | 11 stress tests | 8 benchmarks |
 | kora-server | ✅ | 16 integration tests | — |
 | kora-embedded | ✅ | — | — |
-| kora-storage | ✅ (35 tests across modules) | — | — |
-| kora-vector | ✅ (16 tests) | — | 6 benchmarks |
-| kora-cdc | ✅ (14 tests) | — | — |
-| kora-observability | ✅ (15 tests) | — | — |
+| kora-storage | ✅ (43 tests across modules) | — | — |
+| kora-vector | ✅ (22 tests) | — | 6 benchmarks |
+| kora-cdc | ✅ (26 tests) | — | — |
+| kora-observability | ✅ (21 tests) | — | — |
 | kora-scripting | ✅ | — | — |
 
 ---
@@ -217,7 +265,10 @@
 7. **HNSW** over IVF/LSH — better recall/speed tradeoff for moderate dataset sizes
 8. **Count-Min Sketch** for hot keys — O(1) space, no heap allocation per key
 9. **Atomic counters** for stats — zero contention on the data path
+10. **Per-shard WAL/RDB** over global storage — eliminates cross-shard I/O contention
+11. **WalWriter trait in kora-core** — breaks circular dependency between core and storage
+12. **Product quantization** for vectors — ~4x compression with controllable accuracy loss
 
 ---
 
-*Implementation complete. All phases delivered.*
+*All phases (0–5) delivered. 324 tests passing.*
