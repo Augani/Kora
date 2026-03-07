@@ -492,3 +492,131 @@ async fn test_multiple_data_types_isolation() {
 
     let _ = shutdown.send(true);
 }
+
+// ---------------------------------------------------------------------------
+// Pub/Sub Tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_pubsub_subscribe_and_publish() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut sub = connect(port).await;
+    let mut pub_conn = connect(port).await;
+
+    let resp = cmd(&mut sub, &["SUBSCRIBE", "chat"]).await;
+    assert_resp(&resp, b"*3\r\n$9\r\nsubscribe\r\n$4\r\nchat\r\n:1\r\n");
+
+    sub.write_all(&resp_cmd(&["SUBSCRIBE", "news"]))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let mut buf = vec![0u8; 8192];
+    let n = sub.read(&mut buf).await.unwrap();
+    buf.truncate(n);
+    assert_resp(&buf, b"*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:2\r\n");
+
+    let resp = cmd(&mut pub_conn, &["PUBLISH", "chat", "hello"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut buf = vec![0u8; 8192];
+    let n = sub.read(&mut buf).await.unwrap();
+    buf.truncate(n);
+    let expected = b"*3\r\n$7\r\nmessage\r\n$4\r\nchat\r\n$5\r\nhello\r\n";
+    assert_resp(&buf, expected);
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_pubsub_publish_no_subscribers() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut pub_conn = connect(port).await;
+
+    let resp = cmd(&mut pub_conn, &["PUBLISH", "empty", "msg"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_pubsub_psubscribe() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut sub = connect(port).await;
+    let mut pub_conn = connect(port).await;
+
+    let resp = cmd(&mut sub, &["PSUBSCRIBE", "chat.*"]).await;
+    assert_resp(&resp, b"*3\r\n$10\r\npsubscribe\r\n$6\r\nchat.*\r\n:1\r\n");
+
+    let resp = cmd(&mut pub_conn, &["PUBLISH", "chat.general", "hi"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut buf = vec![0u8; 8192];
+    let n = sub.read(&mut buf).await.unwrap();
+    buf.truncate(n);
+    let expected = b"*4\r\n$8\r\npmessage\r\n$6\r\nchat.*\r\n$12\r\nchat.general\r\n$2\r\nhi\r\n";
+    assert_resp(&buf, expected);
+
+    let resp = cmd(&mut pub_conn, &["PUBLISH", "news.sports", "goal"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_pubsub_unsubscribe() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut sub = connect(port).await;
+    let mut pub_conn = connect(port).await;
+
+    cmd(&mut sub, &["SUBSCRIBE", "ch1"]).await;
+
+    let resp = cmd(&mut sub, &["UNSUBSCRIBE", "ch1"]).await;
+    assert_resp(&resp, b"*3\r\n$11\r\nunsubscribe\r\n$3\r\nch1\r\n:0\r\n");
+
+    let resp = cmd(&mut pub_conn, &["PUBLISH", "ch1", "gone"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_pubsub_multiple_channels() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut sub = connect(port).await;
+    let mut pub_conn = connect(port).await;
+
+    let resp = cmd(&mut sub, &["SUBSCRIBE", "ch-a", "ch-b"]).await;
+    let expected = [
+        &b"*3\r\n$9\r\nsubscribe\r\n$4\r\nch-a\r\n:1\r\n"[..],
+        b"*3\r\n$9\r\nsubscribe\r\n$4\r\nch-b\r\n:2\r\n",
+    ]
+    .concat();
+    assert_resp(&resp, &expected);
+
+    let resp = cmd(&mut pub_conn, &["PUBLISH", "ch-a", "msg-a"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut pub_conn, &["PUBLISH", "ch-b", "msg-b"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut buf = vec![0u8; 16384];
+    let n = sub.read(&mut buf).await.unwrap();
+    buf.truncate(n);
+
+    let expected = [
+        &b"*3\r\n$7\r\nmessage\r\n$4\r\nch-a\r\n$5\r\nmsg-a\r\n"[..],
+        b"*3\r\n$7\r\nmessage\r\n$4\r\nch-b\r\n$5\r\nmsg-b\r\n",
+    ]
+    .concat();
+    assert_resp(&buf, &expected);
+
+    let _ = shutdown.send(true);
+}
