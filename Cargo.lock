@@ -1022,8 +1022,19 @@ dependencies = [
  "bytes",
  "criterion",
  "kora-core",
+ "memchr",
  "rand",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "kora-pubsub"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "criterion",
+ "parking_lot",
+ "rand",
 ]
 
 [[package]]

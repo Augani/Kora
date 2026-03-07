@@ -10,6 +10,7 @@ members = [
     "kora-cdc",
     "kora-scripting",
     "kora-observability",
+    "kora-pubsub",
     "kora-cli",
 ]
 
@@ -25,6 +26,7 @@ tokio = { version = "1", features = ["full"] }
 
 # Buffers & bytes
 bytes = "1"
+memchr = "2"
 
 # Concurrency
 crossbeam-channel = "0.5"
@@ -83,6 +85,7 @@ kora-vector = { path = "kora-vector" }
 kora-cdc = { path = "kora-cdc" }
 kora-scripting = { path = "kora-scripting" }
 kora-observability = { path = "kora-observability" }
+kora-pubsub = { path = "kora-pubsub" }
 kora-cli = { path = "kora-cli" }
 
 [profile.release]

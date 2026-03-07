@@ -1,0 +1,19 @@
+[package]
+name = "kora-pubsub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Sharded Pub/Sub broker for Kōra"
+
+[dependencies]
+ahash.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+rand.workspace = true
+
+[[bench]]
+name = "pubsub"
+harness = false
