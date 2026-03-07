@@ -9,60 +9,143 @@ use std::time::Duration;
 pub enum Command {
     // -- String commands --
     /// GET key
-    Get { key: Vec<u8> },
-    /// SET key value [EX seconds] [PX millis] [NX|XX]
-    Set {
+    Get {
+        /// The key to retrieve.
         key: Vec<u8>,
+    },
+    /// SET key value \[EX seconds\] \[PX millis\] \[NX|XX\]
+    Set {
+        /// The key.
+        key: Vec<u8>,
+        /// The value.
         value: Vec<u8>,
+        /// Optional TTL in seconds.
         ex: Option<u64>,
+        /// Optional TTL in milliseconds.
         px: Option<u64>,
+        /// Only set if key does not exist.
         nx: bool,
+        /// Only set if key already exists.
         xx: bool,
     },
     /// GETSET key value (deprecated but supported)
-    GetSet { key: Vec<u8>, value: Vec<u8> },
+    GetSet {
+        /// The key.
+        key: Vec<u8>,
+        /// The new value.
+        value: Vec<u8>,
+    },
     /// APPEND key value
-    Append { key: Vec<u8>, value: Vec<u8> },
+    Append {
+        /// The key.
+        key: Vec<u8>,
+        /// The value to append.
+        value: Vec<u8>,
+    },
     /// STRLEN key
-    Strlen { key: Vec<u8> },
+    Strlen {
+        /// The key.
+        key: Vec<u8>,
+    },
     /// INCR key
-    Incr { key: Vec<u8> },
+    Incr {
+        /// The key.
+        key: Vec<u8>,
+    },
     /// DECR key
-    Decr { key: Vec<u8> },
+    Decr {
+        /// The key.
+        key: Vec<u8>,
+    },
     /// INCRBY key delta
-    IncrBy { key: Vec<u8>, delta: i64 },
+    IncrBy {
+        /// The key.
+        key: Vec<u8>,
+        /// The increment amount.
+        delta: i64,
+    },
     /// DECRBY key delta
-    DecrBy { key: Vec<u8>, delta: i64 },
-    /// MGET key [key ...]
-    MGet { keys: Vec<Vec<u8>> },
-    /// MSET key value [key value ...]
-    MSet { entries: Vec<(Vec<u8>, Vec<u8>)> },
+    DecrBy {
+        /// The key.
+        key: Vec<u8>,
+        /// The decrement amount.
+        delta: i64,
+    },
+    /// MGET key \[key ...\]
+    MGet {
+        /// The keys to retrieve.
+        keys: Vec<Vec<u8>>,
+    },
+    /// MSET key value \[key value ...\]
+    MSet {
+        /// Key-value pairs to set.
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    },
     /// SETNX key value
-    SetNx { key: Vec<u8>, value: Vec<u8> },
+    SetNx {
+        /// The key.
+        key: Vec<u8>,
+        /// The value.
+        value: Vec<u8>,
+    },
 
     // -- Key commands --
-    /// DEL key [key ...]
-    Del { keys: Vec<Vec<u8>> },
-    /// EXISTS key [key ...]
-    Exists { keys: Vec<Vec<u8>> },
+    /// DEL key \[key ...\]
+    Del {
+        /// The keys to delete.
+        keys: Vec<Vec<u8>>,
+    },
+    /// EXISTS key \[key ...\]
+    Exists {
+        /// The keys to check.
+        keys: Vec<Vec<u8>>,
+    },
     /// EXPIRE key seconds
-    Expire { key: Vec<u8>, seconds: u64 },
+    Expire {
+        /// The key.
+        key: Vec<u8>,
+        /// TTL in seconds.
+        seconds: u64,
+    },
     /// PEXPIRE key milliseconds
-    PExpire { key: Vec<u8>, millis: u64 },
+    PExpire {
+        /// The key.
+        key: Vec<u8>,
+        /// TTL in milliseconds.
+        millis: u64,
+    },
     /// PERSIST key
-    Persist { key: Vec<u8> },
+    Persist {
+        /// The key.
+        key: Vec<u8>,
+    },
     /// TTL key
-    Ttl { key: Vec<u8> },
+    Ttl {
+        /// The key.
+        key: Vec<u8>,
+    },
     /// PTTL key
-    PTtl { key: Vec<u8> },
+    PTtl {
+        /// The key.
+        key: Vec<u8>,
+    },
     /// TYPE key
-    Type { key: Vec<u8> },
+    Type {
+        /// The key.
+        key: Vec<u8>,
+    },
     /// KEYS pattern
-    Keys { pattern: String },
-    /// SCAN cursor [MATCH pattern] [COUNT count]
+    Keys {
+        /// Glob pattern to match.
+        pattern: String,
+    },
+    /// SCAN cursor \[MATCH pattern\] \[COUNT count\]
     Scan {
+        /// The cursor position.
         cursor: u64,
+        /// Optional glob pattern filter.
         pattern: Option<String>,
+        /// Optional count hint.
         count: Option<usize>,
     },
     /// DBSIZE
@@ -71,63 +154,150 @@ pub enum Command {
     FlushDb,
 
     // -- List commands --
-    /// LPUSH key value [value ...]
-    LPush { key: Vec<u8>, values: Vec<Vec<u8>> },
-    /// RPUSH key value [value ...]
-    RPush { key: Vec<u8>, values: Vec<Vec<u8>> },
+    /// LPUSH key value \[value ...\]
+    LPush {
+        /// The key.
+        key: Vec<u8>,
+        /// Values to push.
+        values: Vec<Vec<u8>>,
+    },
+    /// RPUSH key value \[value ...\]
+    RPush {
+        /// The key.
+        key: Vec<u8>,
+        /// Values to push.
+        values: Vec<Vec<u8>>,
+    },
     /// LPOP key
-    LPop { key: Vec<u8> },
+    LPop {
+        /// The key.
+        key: Vec<u8>,
+    },
     /// RPOP key
-    RPop { key: Vec<u8> },
+    RPop {
+        /// The key.
+        key: Vec<u8>,
+    },
     /// LLEN key
-    LLen { key: Vec<u8> },
+    LLen {
+        /// The key.
+        key: Vec<u8>,
+    },
     /// LRANGE key start stop
-    LRange { key: Vec<u8>, start: i64, stop: i64 },
+    LRange {
+        /// The key.
+        key: Vec<u8>,
+        /// Start index (0-based, negative from end).
+        start: i64,
+        /// Stop index (inclusive, negative from end).
+        stop: i64,
+    },
     /// LINDEX key index
-    LIndex { key: Vec<u8>, index: i64 },
+    LIndex {
+        /// The key.
+        key: Vec<u8>,
+        /// The index (negative from end).
+        index: i64,
+    },
 
     // -- Hash commands --
-    /// HSET key field value [field value ...]
+    /// HSET key field value \[field value ...\]
     HSet {
+        /// The key.
         key: Vec<u8>,
+        /// Field-value pairs.
         fields: Vec<(Vec<u8>, Vec<u8>)>,
     },
     /// HGET key field
-    HGet { key: Vec<u8>, field: Vec<u8> },
-    /// HDEL key field [field ...]
-    HDel { key: Vec<u8>, fields: Vec<Vec<u8>> },
+    HGet {
+        /// The key.
+        key: Vec<u8>,
+        /// The field name.
+        field: Vec<u8>,
+    },
+    /// HDEL key field \[field ...\]
+    HDel {
+        /// The key.
+        key: Vec<u8>,
+        /// Fields to delete.
+        fields: Vec<Vec<u8>>,
+    },
     /// HGETALL key
-    HGetAll { key: Vec<u8> },
+    HGetAll {
+        /// The key.
+        key: Vec<u8>,
+    },
     /// HLEN key
-    HLen { key: Vec<u8> },
+    HLen {
+        /// The key.
+        key: Vec<u8>,
+    },
     /// HEXISTS key field
-    HExists { key: Vec<u8>, field: Vec<u8> },
+    HExists {
+        /// The key.
+        key: Vec<u8>,
+        /// The field name.
+        field: Vec<u8>,
+    },
     /// HINCRBY key field increment
     HIncrBy {
+        /// The key.
         key: Vec<u8>,
+        /// The field name.
         field: Vec<u8>,
+        /// The increment amount.
         delta: i64,
     },
 
     // -- Set commands --
-    /// SADD key member [member ...]
-    SAdd { key: Vec<u8>, members: Vec<Vec<u8>> },
-    /// SREM key member [member ...]
-    SRem { key: Vec<u8>, members: Vec<Vec<u8>> },
+    /// SADD key member \[member ...\]
+    SAdd {
+        /// The key.
+        key: Vec<u8>,
+        /// Members to add.
+        members: Vec<Vec<u8>>,
+    },
+    /// SREM key member \[member ...\]
+    SRem {
+        /// The key.
+        key: Vec<u8>,
+        /// Members to remove.
+        members: Vec<Vec<u8>>,
+    },
     /// SMEMBERS key
-    SMembers { key: Vec<u8> },
+    SMembers {
+        /// The key.
+        key: Vec<u8>,
+    },
     /// SISMEMBER key member
-    SIsMember { key: Vec<u8>, member: Vec<u8> },
+    SIsMember {
+        /// The key.
+        key: Vec<u8>,
+        /// The member to check.
+        member: Vec<u8>,
+    },
     /// SCARD key
-    SCard { key: Vec<u8> },
+    SCard {
+        /// The key.
+        key: Vec<u8>,
+    },
 
     // -- Server commands --
-    /// PING [message]
-    Ping { message: Option<Vec<u8>> },
+    /// PING \[message\]
+    Ping {
+        /// Optional message to echo back.
+        message: Option<Vec<u8>>,
+    },
     /// ECHO message
-    Echo { message: Vec<u8> },
-    /// INFO [section]
-    Info { section: Option<String> },
+    Echo {
+        /// The message to echo.
+        message: Vec<u8>,
+    },
+    /// INFO \[section\]
+    Info {
+        /// Optional section filter.
+        section: Option<String>,
+    },
 }
 
 impl Command {
@@ -209,7 +379,7 @@ impl Command {
 }
 
 /// Response from executing a command on a shard.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CommandResponse {
     /// +OK
     Ok,

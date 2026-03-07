@@ -108,8 +108,12 @@ async fn handle_connection(mut stream: TcpStream, engine: Arc<ShardEngine>) -> s
                     let response = match parse_command(frame) {
                         Ok(cmd) => {
                             let rx = engine.dispatch(cmd);
-                            rx.recv()
-                                .unwrap_or(CommandResponse::Error("ERR internal error".into()))
+                            // Use spawn_blocking to avoid blocking the tokio runtime
+                            // on the synchronous crossbeam channel recv.
+                            match tokio::task::spawn_blocking(move || rx.recv()).await {
+                                Ok(Ok(resp)) => resp,
+                                _ => CommandResponse::Error("ERR internal error".into()),
+                            }
                         }
                         Err(e) => CommandResponse::Error(e.to_string()),
                     };

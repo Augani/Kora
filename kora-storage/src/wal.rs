@@ -35,7 +35,7 @@ pub enum SyncPolicy {
 /// A mutation that can be recorded in the WAL.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WalEntry {
-    /// SET key value [ttl_ms]
+    /// SET key value \[ttl_ms\]
     Set {
         /// The key.
         key: Vec<u8>,

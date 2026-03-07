@@ -13,3 +13,8 @@ thiserror.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+rand.workspace = true
+
+[[bench]]
+name = "resp"
+harness = false

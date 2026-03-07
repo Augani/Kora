@@ -4,29 +4,70 @@
 
 ## Project Overview
 
-Kōra is a **multi-threaded, embeddable, memory-safe cache engine written in Rust**. It is Redis protocol (RESP2/RESP3) compatible and designed to surpass Redis's single-threaded limitation using a shared-nothing threading architecture (inspired by Seastar/ScyllaDB/Dragonfly).
+Kōra is a **multi-threaded, embeddable, memory-safe cache engine written in Rust**. It is Redis protocol (RESP2) compatible and designed to surpass Redis's single-threaded limitation using a shared-nothing threading architecture (inspired by Seastar/ScyllaDB/Dragonfly).
 
-**Current status:** Architecture/design phase. The repository contains the architectural specification (`README.md`) and is ready for implementation.
+**Current status:** Phases 0–4 complete. Core engine, storage, advanced features, and production hardening are all implemented.
 
 ## Repository Structure
 
-This is a **Rust workspace monorepo** with the following planned crate layout:
+This is a **Rust workspace monorepo** with the following crate layout:
 
 ```
 kora/
 ├── Cargo.toml              # workspace root
 ├── CLAUDE.md               # this file
+├── PLAN.md                 # implementation plan & status
 ├── README.md               # architecture specification
 ├── kora-core/              # data structures, shard engine, memory management
-├── kora-protocol/          # RESP2/RESP3 parser and serializer
-├── kora-server/            # TCP/Unix listener, connection handling, command dispatch
+│   ├── src/
+│   │   ├── command.rs      # Command/CommandResponse enums
+│   │   ├── error.rs        # Core error types
+│   │   ├── hash.rs         # Key hashing & shard routing
+│   │   ├── shard.rs        # ShardEngine, ShardStore, worker threads
+│   │   └── types.rs        # Value, KeyEntry types
+│   ├── benches/engine.rs   # Criterion benchmarks (SET/GET/INCR/MGET)
+│   └── tests/stress.rs     # Concurrent stress tests
+├── kora-protocol/          # RESP2 parser and serializer
+│   ├── src/
+│   │   ├── command.rs      # parse_command (RespValue → Command)
+│   │   ├── error.rs        # Protocol errors
+│   │   ├── parser.rs       # Streaming RespParser
+│   │   ├── resp.rs         # RespValue enum
+│   │   └── serializer.rs   # serialize_response
+│   ├── benches/resp.rs     # Criterion benchmarks (parse/serialize)
+│   └── tests/stress.rs     # Fuzz-like, roundtrip, pipeline tests
+├── kora-server/            # TCP listener, connection handling
+│   ├── src/lib.rs          # KoraServer, ServerConfig, connection handler
+│   └── tests/integration.rs # TCP integration tests
 ├── kora-embedded/          # library mode — direct API, no network
-├── kora-storage/           # tiered storage, NVMe spill, io_uring async I/O
-├── kora-vector/            # HNSW index, similarity search, quantization
-├── kora-cdc/               # change data capture, stream subscriptions
-├── kora-scripting/         # WASM runtime (wasmtime), function registry
-├── kora-observability/     # per-key stats, hot-key detection, memory attribution
-└── kora-cli/               # CLI binary, config parsing, server entrypoint
+│   └── src/lib.rs          # Database struct with get/set/del/etc.
+├── kora-storage/           # persistence layer
+│   └── src/
+│       ├── backend.rs      # StorageBackend trait, FileBackend
+│       ├── compressor.rs   # LZ4 compression
+│       ├── error.rs        # Storage error types
+│       ├── manager.rs      # StorageManager (WAL + RDB + backend)
+│       ├── rdb.rs          # RDB snapshot save/load
+│       └── wal.rs          # Write-Ahead Log
+├── kora-vector/            # HNSW vector index
+│   ├── src/
+│   │   ├── distance.rs     # Cosine, L2, InnerProduct
+│   │   └── hnsw.rs         # HnswIndex
+│   └── benches/hnsw.rs     # Criterion benchmarks
+├── kora-cdc/               # change data capture
+│   └── src/
+│       ├── ring.rs         # CdcRing (per-shard ring buffer)
+│       └── subscription.rs # Subscription manager with glob patterns
+├── kora-scripting/         # WASM runtime (wasmtime)
+│   └── src/lib.rs          # WasmRuntime, FunctionRegistry
+├── kora-observability/     # statistics & hot-key detection
+│   └── src/
+│       ├── sketch.rs       # CountMinSketch
+│       └── stats.rs        # ShardStats, CommandTimer, StatsSnapshot
+└── kora-cli/               # CLI binary with TOML config
+    └── src/
+        ├── config.rs       # TOML config file parsing
+        └── main.rs         # Entrypoint with layered config
 ```
 
 ### Dependency Graph (strict, acyclic)
@@ -40,10 +81,10 @@ embedded → core, storage, vector, cdc, observability
 
 ## Language & Toolchain
 
-- **Language:** Rust (latest stable)
+- **Language:** Rust (edition 2021, MSRV 1.75)
 - **Build system:** Cargo workspace
-- **Async I/O:** io_uring (Linux), with fallback trait abstraction for other platforms
-- **WASM runtime:** wasmtime (for the scripting crate)
+- **Async runtime:** Tokio (server crate)
+- **WASM runtime:** wasmtime (scripting crate)
 
 ## Key Architectural Principles
 
@@ -51,15 +92,13 @@ These principles are non-negotiable — all code must follow them:
 
 1. **Shared-nothing threading:** Each worker thread owns a shard of the keyspace. No locks or mutexes on the data path. Cross-shard communication uses lock-free MPSC channels only.
 
-2. **Per-thread memory allocation:** Each worker uses its own slab allocator. No global `malloc` contention. Large allocations (>4096 bytes) fall through to the system allocator.
+2. **Zero-copy where possible:** Use `Arc<[u8]>` for shared strings, store keys/values as `Vec<u8>`.
 
-3. **Zero-copy where possible:** Use `Arc<[u8]>` for shared strings, inline small strings (≤23 bytes) directly in the `Value` enum, and store keys ≤64 bytes inline in hash table entries.
+3. **Trait-based storage abstraction:** All storage backends implement the `StorageBackend` trait. Never hardcode I/O strategies.
 
-4. **Trait-based storage abstraction:** All storage backends implement the `StorageBackend` trait. Never hardcode I/O strategies.
+4. **Memory safety:** This is Rust — avoid `unsafe` unless absolutely required for performance-critical paths, and document every `unsafe` block with a safety comment.
 
-5. **Memory safety:** This is Rust — avoid `unsafe` unless absolutely required for performance-critical paths, and document every `unsafe` block with a safety comment.
-
-6. **Redis compatibility:** Commands should behave identically to Redis. When in doubt, match Redis behavior exactly. Test against `redis-cli`.
+5. **Redis compatibility:** Commands should behave identically to Redis. When in doubt, match Redis behavior exactly.
 
 ## Build & Run Commands
 
@@ -67,17 +106,15 @@ These principles are non-negotiable — all code must follow them:
 # Build the entire workspace
 cargo build
 
-# Build a specific crate
-cargo build -p kora-core
-
 # Run all tests
-cargo test
+cargo test --workspace
 
 # Run tests for a specific crate
 cargo test -p kora-core
 
-# Run with release optimizations
-cargo build --release
+# Run stress/integration tests
+cargo test --test stress -p kora-core
+cargo test --test integration -p kora-server
 
 # Run clippy lints
 cargo clippy --workspace --all-targets
@@ -85,8 +122,17 @@ cargo clippy --workspace --all-targets
 # Format code
 cargo fmt --all
 
-# Run benchmarks (when available)
-cargo bench
+# Run benchmarks
+cargo bench -p kora-core
+cargo bench -p kora-protocol
+cargo bench -p kora-vector
+
+# Build documentation
+cargo doc --workspace --no-deps
+
+# Run the server
+cargo run -- --port 6379 --workers 4
+cargo run -- --config kora.toml
 ```
 
 ## Code Conventions
@@ -94,73 +140,88 @@ cargo bench
 ### Rust Style
 
 - Follow standard Rust naming: `snake_case` for functions/variables, `PascalCase` for types/traits, `SCREAMING_SNAKE_CASE` for constants.
-- Use `cargo fmt` formatting (default rustfmt settings unless a `rustfmt.toml` is added).
+- Use `cargo fmt` formatting (default rustfmt settings).
 - All code must pass `cargo clippy` with no warnings.
-- Prefer `thiserror` for library error types and `anyhow` for application-level error handling (in the CLI/server crates).
-- Use `#[must_use]` on functions that return values that should not be ignored.
+- Prefer `thiserror` for library error types and `anyhow` for application-level error handling.
+- All public items must have doc comments (`///`).
 
 ### Error Handling
 
 - Core/library crates: return `Result<T, E>` with crate-specific error types.
 - Server/CLI crates: can use `anyhow::Result` for convenience.
-- Never `unwrap()` or `expect()` in library code unless the invariant is provably guaranteed (document why in a comment).
-- Use `?` operator for error propagation.
-
-### Documentation
-
-- Public APIs must have doc comments (`///`).
-- Add `# Examples` sections to doc comments for key public functions.
-- Internal implementation details don't need doc comments unless the logic is non-obvious.
+- Never `unwrap()` or `expect()` in library code unless the invariant is provably guaranteed.
 
 ### Testing
 
-- Unit tests go in the same file as the code, inside a `#[cfg(test)] mod tests {}` block.
+- Unit tests go in `#[cfg(test)] mod tests {}` blocks.
 - Integration tests go in `tests/` directories within each crate.
-- Use descriptive test names: `test_set_and_get_inline_string`, not `test1`.
-- Test both happy paths and error cases.
-- Planned testing methodologies (Phase 4):
-  - Deterministic simulation testing (like FoundationDB)
-  - Crash recovery verification
-  - Fuzz testing on RESP parser and storage engine (`cargo-fuzz` / AFL)
-  - Benchmark suite against Redis, Dragonfly, KeyDB
+- Stress tests use multiple threads and randomized inputs.
+- Benchmarks use Criterion in `benches/` directories.
 
 ### Performance
 
-- Profile before optimizing. Don't guess at bottlenecks.
+- Profile before optimizing.
 - Benchmark critical paths (RESP parsing, hash lookups, shard routing).
-- Avoid allocations in hot paths — use the slab allocator or pre-allocated buffers.
-- Keep the read path allocation-free for single-key operations.
+- Avoid allocations in hot paths.
 
-## Key Data Structures
+## Implemented Features
 
-Understand these before modifying core code:
+### Core Engine (kora-core)
+- Sharded key-value store with configurable shard count
+- All Redis string commands: GET, SET, GETSET, APPEND, STRLEN, INCR, DECR, INCRBY, DECRBY, MGET, MSET, SETNX
+- Key commands: DEL, EXISTS, EXPIRE, PEXPIRE, PERSIST, TTL, PTTL, TYPE, KEYS, SCAN, DBSIZE, FLUSHDB
+- List commands: LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX
+- Hash commands: HSET, HGET, HDEL, HGETALL, HLEN, HEXISTS, HINCRBY
+- Set commands: SADD, SREM, SMEMBERS, SISMEMBER, SCARD
+- Server commands: PING, ECHO, INFO
+- Lazy TTL expiration with periodic sweep
 
-- **`Value` enum:** Discriminated union holding all Redis data types plus vectors and streams. Inline small strings, `Arc` heap strings, native `i64` integers.
-- **`KeyEntry`:** Key + value + TTL + LFU counter + access time + flags. The fundamental unit of storage.
-- **`ShardAllocator`:** Per-thread slab allocator with size classes (64, 128, 256, 512, 1024, 2048, 4096 bytes).
-- **`HnswIndex`:** Per-shard HNSW graph for vector similarity search.
-- **`CdcRing`:** Per-shard fixed-size ring buffer capturing mutations with monotonic sequence numbers.
+### Protocol (kora-protocol)
+- Streaming RESP2 parser with incremental parsing
+- Response serializer
+- Command parsing from RESP arrays
 
-## Implementation Phases
+### Server (kora-server)
+- Async TCP server with Tokio
+- Pipeline support (multiple commands per read)
+- Graceful shutdown
 
-When implementing features, follow this priority order:
+### Storage (kora-storage)
+- Write-Ahead Log with CRC-32C integrity, configurable sync policy, rotation
+- RDB snapshots with atomic writes and CRC verification
+- Cold-tier file backend with LZ4 compression and compaction
+- StorageManager coordinating WAL + RDB + backend
 
-1. **Phase 1 (Core):** Threading model, slab allocator, basic data structures, RESP parsing, TCP server, core Redis commands (GET/SET/DEL/MGET/MSET/EXPIRE/TTL/KEYS/SCAN), embedded API.
-2. **Phase 2 (Storage):** RDB snapshots, WAL, tiered storage with io_uring, background migration, eviction.
-3. **Phase 3 (Advanced):** Vector index, CDC, WASM scripting, multi-tenancy, observability.
-4. **Phase 4 (Hardening):** Simulation testing, fuzz testing, benchmarks, documentation.
+### Vector Search (kora-vector)
+- HNSW approximate nearest neighbor index
+- Cosine, L2, and Inner Product distance metrics
+- Configurable M, ef_construction parameters
+
+### CDC (kora-cdc)
+- Per-shard ring buffer with monotonic sequence numbers
+- Gap detection for slow consumers
+- Glob-pattern subscription filtering with cursor tracking
+
+### Observability (kora-observability)
+- Count-Min Sketch for hot key detection (~2KB)
+- Per-shard atomic statistics (command counts, durations, memory, bytes)
+- RAII CommandTimer for automatic duration recording
+- Snapshot merging across shards
+
+### CLI (kora-cli)
+- TOML config file support with layered configuration
+- CLI argument overrides (--bind, --port, --workers, --log-level, --data-dir)
 
 ## Common Pitfalls
 
 - **Don't add locks to the data path.** If you need shared state, use message passing via channels.
-- **Don't use global allocators in hot paths.** Route through the per-thread slab allocator.
 - **Don't break the crate dependency graph.** `kora-core` must remain dependency-free within the workspace.
-- **Don't deviate from Redis command semantics** without explicit discussion. Compatibility is a core feature.
-- **Don't use `unsafe` without a `// SAFETY:` comment** explaining the invariant being upheld.
-- **Don't forget platform abstraction.** io_uring is Linux-only; always go through the `StorageBackend` trait.
+- **Don't deviate from Redis command semantics** without explicit discussion.
+- **Don't use `unsafe` without a `// SAFETY:` comment.**
+- **Escape brackets in doc comments** that rustdoc might interpret as links (e.g., `\[optional\]`).
 
 ## Git Workflow
 
 - Use descriptive commit messages summarizing the "why" not the "what."
 - Keep commits focused — one logical change per commit.
-- Run `cargo fmt --all && cargo clippy --workspace --all-targets && cargo test` before committing.
+- Run `cargo fmt --all && cargo clippy --workspace --all-targets && cargo test --workspace` before committing.

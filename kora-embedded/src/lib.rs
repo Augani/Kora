@@ -115,6 +115,170 @@ impl Database {
         }
     }
 
+    /// Get the old value and set a new one.
+    pub fn getset(&self, key: &str, value: &[u8]) -> Option<Vec<u8>> {
+        match self.engine.dispatch_blocking(Command::GetSet {
+            key: key.as_bytes().to_vec(),
+            value: value.to_vec(),
+        }) {
+            CommandResponse::BulkString(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Append a value to a key, returning the new length.
+    pub fn append(&self, key: &str, value: &[u8]) -> i64 {
+        match self.engine.dispatch_blocking(Command::Append {
+            key: key.as_bytes().to_vec(),
+            value: value.to_vec(),
+        }) {
+            CommandResponse::Integer(n) => n,
+            _ => 0,
+        }
+    }
+
+    /// Get the length of the string value stored at key.
+    pub fn strlen(&self, key: &str) -> i64 {
+        match self.engine.dispatch_blocking(Command::Strlen {
+            key: key.as_bytes().to_vec(),
+        }) {
+            CommandResponse::Integer(n) => n,
+            _ => 0,
+        }
+    }
+
+    /// Decrement a key's integer value by 1.
+    pub fn decr(&self, key: &str) -> Result<i64, String> {
+        match self.engine.dispatch_blocking(Command::Decr {
+            key: key.as_bytes().to_vec(),
+        }) {
+            CommandResponse::Integer(n) => Ok(n),
+            CommandResponse::Error(e) => Err(e),
+            _ => Err("unexpected response".into()),
+        }
+    }
+
+    /// Increment a key's integer value by a given amount.
+    pub fn incrby(&self, key: &str, delta: i64) -> Result<i64, String> {
+        match self.engine.dispatch_blocking(Command::IncrBy {
+            key: key.as_bytes().to_vec(),
+            delta,
+        }) {
+            CommandResponse::Integer(n) => Ok(n),
+            CommandResponse::Error(e) => Err(e),
+            _ => Err("unexpected response".into()),
+        }
+    }
+
+    /// Decrement a key's integer value by a given amount.
+    pub fn decrby(&self, key: &str, delta: i64) -> Result<i64, String> {
+        match self.engine.dispatch_blocking(Command::DecrBy {
+            key: key.as_bytes().to_vec(),
+            delta,
+        }) {
+            CommandResponse::Integer(n) => Ok(n),
+            CommandResponse::Error(e) => Err(e),
+            _ => Err("unexpected response".into()),
+        }
+    }
+
+    /// Get the values of multiple keys.
+    pub fn mget(&self, keys: &[&str]) -> Vec<Option<Vec<u8>>> {
+        let cmd_keys: Vec<Vec<u8>> = keys.iter().map(|k| k.as_bytes().to_vec()).collect();
+        match self
+            .engine
+            .dispatch_blocking(Command::MGet { keys: cmd_keys })
+        {
+            CommandResponse::Array(items) => items
+                .into_iter()
+                .map(|r| match r {
+                    CommandResponse::BulkString(v) => Some(v),
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![None; keys.len()],
+        }
+    }
+
+    /// Set multiple key-value pairs.
+    pub fn mset(&self, entries: &[(&str, &[u8])]) {
+        let cmd_entries: Vec<(Vec<u8>, Vec<u8>)> = entries
+            .iter()
+            .map(|(k, v)| (k.as_bytes().to_vec(), v.to_vec()))
+            .collect();
+        self.engine.dispatch_blocking(Command::MSet {
+            entries: cmd_entries,
+        });
+    }
+
+    /// Set a key only if it does not already exist. Returns true if set.
+    pub fn setnx(&self, key: &str, value: &[u8]) -> bool {
+        matches!(
+            self.engine.dispatch_blocking(Command::SetNx {
+                key: key.as_bytes().to_vec(),
+                value: value.to_vec(),
+            }),
+            CommandResponse::Integer(1)
+        )
+    }
+
+    /// Set a TTL on a key in seconds. Returns true if the key exists.
+    pub fn expire(&self, key: &str, seconds: u64) -> bool {
+        matches!(
+            self.engine.dispatch_blocking(Command::Expire {
+                key: key.as_bytes().to_vec(),
+                seconds,
+            }),
+            CommandResponse::Integer(1)
+        )
+    }
+
+    /// Remove the TTL on a key. Returns true if the key exists and had a TTL.
+    pub fn persist(&self, key: &str) -> bool {
+        matches!(
+            self.engine.dispatch_blocking(Command::Persist {
+                key: key.as_bytes().to_vec(),
+            }),
+            CommandResponse::Integer(1)
+        )
+    }
+
+    /// Get the TTL of a key in seconds. Returns None if no TTL or key doesn't exist.
+    pub fn ttl(&self, key: &str) -> Option<i64> {
+        match self.engine.dispatch_blocking(Command::Ttl {
+            key: key.as_bytes().to_vec(),
+        }) {
+            CommandResponse::Integer(n) if n >= 0 => Some(n),
+            _ => None,
+        }
+    }
+
+    /// Get the type of a key as a string.
+    pub fn key_type(&self, key: &str) -> String {
+        match self.engine.dispatch_blocking(Command::Type {
+            key: key.as_bytes().to_vec(),
+        }) {
+            CommandResponse::SimpleString(s) => s,
+            _ => "none".into(),
+        }
+    }
+
+    /// Find all keys matching a glob pattern.
+    pub fn keys(&self, pattern: &str) -> Vec<Vec<u8>> {
+        match self.engine.dispatch_blocking(Command::Keys {
+            pattern: pattern.to_string(),
+        }) {
+            CommandResponse::Array(items) => items
+                .into_iter()
+                .filter_map(|r| match r {
+                    CommandResponse::BulkString(v) => Some(v),
+                    _ => None,
+                })
+                .collect(),
+            _ => vec![],
+        }
+    }
+
     // ─── List operations ─────────────────────────────────────────
 
     /// Push values to the left of a list, returning the new length.
@@ -157,6 +321,47 @@ impl Database {
         }
     }
 
+    /// Pop from the left of a list.
+    pub fn lpop(&self, key: &str) -> Option<Vec<u8>> {
+        match self.engine.dispatch_blocking(Command::LPop {
+            key: key.as_bytes().to_vec(),
+        }) {
+            CommandResponse::BulkString(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Pop from the right of a list.
+    pub fn rpop(&self, key: &str) -> Option<Vec<u8>> {
+        match self.engine.dispatch_blocking(Command::RPop {
+            key: key.as_bytes().to_vec(),
+        }) {
+            CommandResponse::BulkString(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Get the length of a list.
+    pub fn llen(&self, key: &str) -> i64 {
+        match self.engine.dispatch_blocking(Command::LLen {
+            key: key.as_bytes().to_vec(),
+        }) {
+            CommandResponse::Integer(n) => n,
+            _ => 0,
+        }
+    }
+
+    /// Get an element from a list by index.
+    pub fn lindex(&self, key: &str, index: i64) -> Option<Vec<u8>> {
+        match self.engine.dispatch_blocking(Command::LIndex {
+            key: key.as_bytes().to_vec(),
+            index,
+        }) {
+            CommandResponse::BulkString(v) => Some(v),
+            _ => None,
+        }
+    }
+
     // ─── Hash operations ─────────────────────────────────────────
 
     /// Set a hash field.
@@ -175,6 +380,72 @@ impl Database {
         }) {
             CommandResponse::BulkString(v) => Some(v),
             _ => None,
+        }
+    }
+
+    /// Delete hash fields, returning the number removed.
+    pub fn hdel(&self, key: &str, fields: &[&str]) -> i64 {
+        match self.engine.dispatch_blocking(Command::HDel {
+            key: key.as_bytes().to_vec(),
+            fields: fields.iter().map(|f| f.as_bytes().to_vec()).collect(),
+        }) {
+            CommandResponse::Integer(n) => n,
+            _ => 0,
+        }
+    }
+
+    /// Get all field-value pairs from a hash.
+    pub fn hgetall(&self, key: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+        match self.engine.dispatch_blocking(Command::HGetAll {
+            key: key.as_bytes().to_vec(),
+        }) {
+            CommandResponse::Array(items) => {
+                let mut result = Vec::new();
+                let mut iter = items.into_iter();
+                while let (
+                    Some(CommandResponse::BulkString(k)),
+                    Some(CommandResponse::BulkString(v)),
+                ) = (iter.next(), iter.next())
+                {
+                    result.push((k, v));
+                }
+                result
+            }
+            _ => vec![],
+        }
+    }
+
+    /// Get the number of fields in a hash.
+    pub fn hlen(&self, key: &str) -> i64 {
+        match self.engine.dispatch_blocking(Command::HLen {
+            key: key.as_bytes().to_vec(),
+        }) {
+            CommandResponse::Integer(n) => n,
+            _ => 0,
+        }
+    }
+
+    /// Check if a hash field exists.
+    pub fn hexists(&self, key: &str, field: &str) -> bool {
+        matches!(
+            self.engine.dispatch_blocking(Command::HExists {
+                key: key.as_bytes().to_vec(),
+                field: field.as_bytes().to_vec(),
+            }),
+            CommandResponse::Integer(1)
+        )
+    }
+
+    /// Increment a hash field by a given amount.
+    pub fn hincrby(&self, key: &str, field: &str, delta: i64) -> Result<i64, String> {
+        match self.engine.dispatch_blocking(Command::HIncrBy {
+            key: key.as_bytes().to_vec(),
+            field: field.as_bytes().to_vec(),
+            delta,
+        }) {
+            CommandResponse::Integer(n) => Ok(n),
+            CommandResponse::Error(e) => Err(e),
+            _ => Err("unexpected response".into()),
         }
     }
 
@@ -204,6 +475,38 @@ impl Database {
                 })
                 .collect(),
             _ => vec![],
+        }
+    }
+
+    /// Remove members from a set, returning the number removed.
+    pub fn srem(&self, key: &str, members: &[&[u8]]) -> i64 {
+        match self.engine.dispatch_blocking(Command::SRem {
+            key: key.as_bytes().to_vec(),
+            members: members.iter().map(|m| m.to_vec()).collect(),
+        }) {
+            CommandResponse::Integer(n) => n,
+            _ => 0,
+        }
+    }
+
+    /// Check if a member exists in a set.
+    pub fn sismember(&self, key: &str, member: &[u8]) -> bool {
+        matches!(
+            self.engine.dispatch_blocking(Command::SIsMember {
+                key: key.as_bytes().to_vec(),
+                member: member.to_vec(),
+            }),
+            CommandResponse::Integer(1)
+        )
+    }
+
+    /// Get the number of members in a set.
+    pub fn scard(&self, key: &str) -> i64 {
+        match self.engine.dispatch_blocking(Command::SCard {
+            key: key.as_bytes().to_vec(),
+        }) {
+            CommandResponse::Integer(n) => n,
+            _ => 0,
         }
     }
 

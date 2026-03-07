@@ -388,13 +388,17 @@ impl ShardStore {
     }
 
     fn cmd_scan(&self, cursor: u64, pattern: Option<&str>, count: usize) -> CommandResponse {
-        let keys: Vec<&CompactKey> = self
+        // Collect and sort keys for deterministic cursor iteration.
+        // Sorting ensures the same key set always yields the same order,
+        // so cursor-based pagination works correctly across calls.
+        let mut keys: Vec<&CompactKey> = self
             .entries
             .iter()
             .filter(|(_, entry)| !entry.is_expired())
             .filter(|(key, _)| pattern.map_or(true, |p| glob_match(p, key.as_bytes())))
             .map(|(key, _)| key)
             .collect();
+        keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
         let start = cursor as usize;
         let end = (start + count).min(keys.len());
@@ -454,41 +458,63 @@ impl ShardStore {
     fn cmd_lpop(&mut self, key: &[u8]) -> CommandResponse {
         self.lazy_expire(key);
         let compact = CompactKey::new(key);
-        match self.entries.get_mut(&compact) {
+        let (result, is_empty) = match self.entries.get_mut(&compact) {
             Some(entry) => match &mut entry.value {
-                Value::List(deque) => match deque.pop_front() {
-                    Some(val) => match val.as_bytes() {
-                        Some(b) => CommandResponse::BulkString(b),
-                        None => CommandResponse::Nil,
-                    },
-                    None => CommandResponse::Nil,
-                },
-                _ => CommandResponse::Error(
-                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                Value::List(deque) => {
+                    let val = deque.pop_front();
+                    let empty = deque.is_empty();
+                    match val {
+                        Some(v) => match v.as_bytes() {
+                            Some(b) => (CommandResponse::BulkString(b), empty),
+                            None => (CommandResponse::Nil, empty),
+                        },
+                        None => (CommandResponse::Nil, false),
+                    }
+                }
+                _ => (
+                    CommandResponse::Error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                    ),
+                    false,
                 ),
             },
-            None => CommandResponse::Nil,
+            None => (CommandResponse::Nil, false),
+        };
+        if is_empty {
+            self.entries.remove(&compact);
         }
+        result
     }
 
     fn cmd_rpop(&mut self, key: &[u8]) -> CommandResponse {
         self.lazy_expire(key);
         let compact = CompactKey::new(key);
-        match self.entries.get_mut(&compact) {
+        let (result, is_empty) = match self.entries.get_mut(&compact) {
             Some(entry) => match &mut entry.value {
-                Value::List(deque) => match deque.pop_back() {
-                    Some(val) => match val.as_bytes() {
-                        Some(b) => CommandResponse::BulkString(b),
-                        None => CommandResponse::Nil,
-                    },
-                    None => CommandResponse::Nil,
-                },
-                _ => CommandResponse::Error(
-                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                Value::List(deque) => {
+                    let val = deque.pop_back();
+                    let empty = deque.is_empty();
+                    match val {
+                        Some(v) => match v.as_bytes() {
+                            Some(b) => (CommandResponse::BulkString(b), empty),
+                            None => (CommandResponse::Nil, empty),
+                        },
+                        None => (CommandResponse::Nil, false),
+                    }
+                }
+                _ => (
+                    CommandResponse::Error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                    ),
+                    false,
                 ),
             },
-            None => CommandResponse::Nil,
+            None => (CommandResponse::Nil, false),
+        };
+        if is_empty {
+            self.entries.remove(&compact);
         }
+        result
     }
 
     fn cmd_llen(&mut self, key: &[u8]) -> CommandResponse {
@@ -607,21 +633,27 @@ impl ShardStore {
     fn cmd_hdel(&mut self, key: &[u8], fields: &[Vec<u8>]) -> CommandResponse {
         self.lazy_expire(key);
         let compact = CompactKey::new(key);
-        match self.entries.get_mut(&compact) {
+        let (count, is_empty) = match self.entries.get_mut(&compact) {
             Some(entry) => match &mut entry.value {
                 Value::Hash(map) => {
-                    let count = fields
+                    let c = fields
                         .iter()
                         .filter(|f| map.remove(&CompactKey::new(f)).is_some())
                         .count();
-                    CommandResponse::Integer(count as i64)
+                    (c as i64, map.is_empty())
                 }
-                _ => CommandResponse::Error(
-                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
-                ),
+                _ => {
+                    return CommandResponse::Error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                    )
+                }
             },
-            None => CommandResponse::Integer(0),
+            None => return CommandResponse::Integer(0),
+        };
+        if is_empty {
+            self.entries.remove(&compact);
         }
+        CommandResponse::Integer(count)
     }
 
     fn cmd_hgetall(&mut self, key: &[u8]) -> CommandResponse {
@@ -701,9 +733,15 @@ impl ShardStore {
                     },
                     None => 0,
                 };
-                let result = current + delta;
-                map.insert(fk, Value::Int(result));
-                CommandResponse::Integer(result)
+                match current.checked_add(delta) {
+                    Some(result) => {
+                        map.insert(fk, Value::Int(result));
+                        CommandResponse::Integer(result)
+                    }
+                    None => {
+                        CommandResponse::Error("ERR increment or decrement would overflow".into())
+                    }
+                }
             }
             Err(e) => e,
         }
@@ -730,21 +768,27 @@ impl ShardStore {
     fn cmd_srem(&mut self, key: &[u8], members: &[Vec<u8>]) -> CommandResponse {
         self.lazy_expire(key);
         let compact = CompactKey::new(key);
-        match self.entries.get_mut(&compact) {
+        let (count, is_empty) = match self.entries.get_mut(&compact) {
             Some(entry) => match &mut entry.value {
                 Value::Set(set) => {
-                    let count = members
+                    let c = members
                         .iter()
                         .filter(|m| set.remove(&Value::from_bytes(m)))
                         .count();
-                    CommandResponse::Integer(count as i64)
+                    (c as i64, set.is_empty())
                 }
-                _ => CommandResponse::Error(
-                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
-                ),
+                _ => {
+                    return CommandResponse::Error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                    )
+                }
             },
-            None => CommandResponse::Integer(0),
+            None => return CommandResponse::Integer(0),
+        };
+        if is_empty {
+            self.entries.remove(&compact);
         }
+        CommandResponse::Integer(count)
     }
 
     fn cmd_smembers(&mut self, key: &[u8]) -> CommandResponse {
@@ -888,21 +932,40 @@ fn glob_match(pattern: &str, key: &[u8]) -> bool {
     if pattern == "*" {
         return true;
     }
-    glob_match_recursive(pattern.as_bytes(), key_str.as_bytes())
+    glob_match_iterative(pattern.as_bytes(), key_str.as_bytes())
 }
 
-fn glob_match_recursive(pattern: &[u8], text: &[u8]) -> bool {
-    match (pattern.first(), text.first()) {
-        (None, None) => true,
-        (Some(b'*'), _) => {
-            // Try matching rest of pattern with current text, or skip one char of text
-            glob_match_recursive(&pattern[1..], text)
-                || (!text.is_empty() && glob_match_recursive(pattern, &text[1..]))
+/// Iterative glob matching — O(n*m) worst case, no exponential blowup.
+fn glob_match_iterative(pattern: &[u8], text: &[u8]) -> bool {
+    let mut pi = 0; // pattern index
+    let mut ti = 0; // text index
+    let mut star_pi = usize::MAX; // pattern index after last *
+    let mut star_ti = 0; // text index when last * was matched
+
+    while ti < text.len() {
+        if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == text[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pattern.len() && pattern[pi] == b'*' {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1; // try matching * with empty string first
+        } else if star_pi != usize::MAX {
+            // backtrack: let * match one more character
+            pi = star_pi + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
         }
-        (Some(b'?'), Some(_)) => glob_match_recursive(&pattern[1..], &text[1..]),
-        (Some(a), Some(b)) if a == b => glob_match_recursive(&pattern[1..], &text[1..]),
-        _ => false,
     }
+
+    // Consume trailing *'s in pattern
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+
+    pi == pattern.len()
 }
 
 #[cfg(test)]

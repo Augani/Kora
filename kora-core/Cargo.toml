@@ -16,3 +16,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+rand.workspace = true
+
+[[bench]]
+name = "engine"
+harness = false
