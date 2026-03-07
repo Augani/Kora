@@ -670,6 +670,45 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             Ok(Command::XTrim { key, maxlen })
         }
 
+        // Pub/Sub commands
+        b"SUBSCRIBE" => {
+            check_min_arity("SUBSCRIBE", args, 1)?;
+            let channels = args
+                .iter()
+                .map(extract_bytes)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Command::Subscribe { channels })
+        }
+        b"UNSUBSCRIBE" => {
+            let channels = args
+                .iter()
+                .map(extract_bytes)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Command::Unsubscribe { channels })
+        }
+        b"PSUBSCRIBE" => {
+            check_min_arity("PSUBSCRIBE", args, 1)?;
+            let patterns = args
+                .iter()
+                .map(extract_bytes)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Command::PSubscribe { patterns })
+        }
+        b"PUNSUBSCRIBE" => {
+            let patterns = args
+                .iter()
+                .map(extract_bytes)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Command::PUnsubscribe { patterns })
+        }
+        b"PUBLISH" => {
+            check_arity("PUBLISH", args, 2)?;
+            Ok(Command::Publish {
+                channel: extract_bytes(&args[0])?,
+                message: extract_bytes(&args[1])?,
+            })
+        }
+
         _ => Err(ProtocolError::UnknownCommand(
             String::from_utf8_lossy(&cmd_name).into_owned(),
         )),
@@ -1490,5 +1529,108 @@ mod tests {
             }
             other => panic!("Expected XTrim, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_parse_subscribe() {
+        let cmd = parse_command(make_cmd(&[b"SUBSCRIBE", b"ch1", b"ch2"])).unwrap();
+        match cmd {
+            Command::Subscribe { channels } => {
+                assert_eq!(channels.len(), 2);
+                assert_eq!(channels[0], b"ch1");
+                assert_eq!(channels[1], b"ch2");
+            }
+            other => panic!("Expected Subscribe, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_subscribe_requires_channel() {
+        let result = parse_command(make_cmd(&[b"SUBSCRIBE"]));
+        assert!(matches!(result, Err(ProtocolError::WrongArity(_))));
+    }
+
+    #[test]
+    fn test_parse_unsubscribe_with_channels() {
+        let cmd = parse_command(make_cmd(&[b"UNSUBSCRIBE", b"ch1", b"ch2"])).unwrap();
+        match cmd {
+            Command::Unsubscribe { channels } => {
+                assert_eq!(channels.len(), 2);
+                assert_eq!(channels[0], b"ch1");
+                assert_eq!(channels[1], b"ch2");
+            }
+            other => panic!("Expected Unsubscribe, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_unsubscribe_no_args() {
+        let cmd = parse_command(make_cmd(&[b"UNSUBSCRIBE"])).unwrap();
+        match cmd {
+            Command::Unsubscribe { channels } => {
+                assert!(channels.is_empty());
+            }
+            other => panic!("Expected Unsubscribe, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_psubscribe() {
+        let cmd = parse_command(make_cmd(&[b"PSUBSCRIBE", b"ch.*", b"news.*"])).unwrap();
+        match cmd {
+            Command::PSubscribe { patterns } => {
+                assert_eq!(patterns.len(), 2);
+                assert_eq!(patterns[0], b"ch.*");
+                assert_eq!(patterns[1], b"news.*");
+            }
+            other => panic!("Expected PSubscribe, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_psubscribe_requires_pattern() {
+        let result = parse_command(make_cmd(&[b"PSUBSCRIBE"]));
+        assert!(matches!(result, Err(ProtocolError::WrongArity(_))));
+    }
+
+    #[test]
+    fn test_parse_punsubscribe() {
+        let cmd = parse_command(make_cmd(&[b"PUNSUBSCRIBE", b"ch.*"])).unwrap();
+        match cmd {
+            Command::PUnsubscribe { patterns } => {
+                assert_eq!(patterns.len(), 1);
+                assert_eq!(patterns[0], b"ch.*");
+            }
+            other => panic!("Expected PUnsubscribe, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_punsubscribe_no_args() {
+        let cmd = parse_command(make_cmd(&[b"PUNSUBSCRIBE"])).unwrap();
+        match cmd {
+            Command::PUnsubscribe { patterns } => {
+                assert!(patterns.is_empty());
+            }
+            other => panic!("Expected PUnsubscribe, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_publish() {
+        let cmd = parse_command(make_cmd(&[b"PUBLISH", b"mychannel", b"hello world"])).unwrap();
+        match cmd {
+            Command::Publish { channel, message } => {
+                assert_eq!(channel, b"mychannel");
+                assert_eq!(message, b"hello world");
+            }
+            other => panic!("Expected Publish, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_publish_wrong_arity() {
+        let result = parse_command(make_cmd(&[b"PUBLISH", b"mychannel"]));
+        assert!(matches!(result, Err(ProtocolError::WrongArity(_))));
     }
 }

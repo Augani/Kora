@@ -597,6 +597,35 @@ pub enum Command {
         /// Key prefixes to query.
         prefixes: Vec<Vec<u8>>,
     },
+
+    // -- Pub/Sub commands --
+    /// SUBSCRIBE channel \[channel ...\]
+    Subscribe {
+        /// Channels to subscribe to.
+        channels: Vec<Vec<u8>>,
+    },
+    /// UNSUBSCRIBE \[channel ...\]
+    Unsubscribe {
+        /// Channels to unsubscribe from (empty = all).
+        channels: Vec<Vec<u8>>,
+    },
+    /// PSUBSCRIBE pattern \[pattern ...\]
+    PSubscribe {
+        /// Glob patterns to subscribe to.
+        patterns: Vec<Vec<u8>>,
+    },
+    /// PUNSUBSCRIBE \[pattern ...\]
+    PUnsubscribe {
+        /// Glob patterns to unsubscribe from (empty = all).
+        patterns: Vec<Vec<u8>>,
+    },
+    /// PUBLISH channel message
+    Publish {
+        /// The target channel.
+        channel: Vec<u8>,
+        /// The message payload.
+        message: Vec<u8>,
+    },
 }
 
 impl Command {
@@ -704,6 +733,11 @@ impl Command {
                 | Command::StatsHotkeys { .. }
                 | Command::StatsLatency { .. }
                 | Command::StatsMemory { .. }
+                | Command::Subscribe { .. }
+                | Command::Unsubscribe { .. }
+                | Command::PSubscribe { .. }
+                | Command::PUnsubscribe { .. }
+                | Command::Publish { .. }
         )
     }
 
@@ -791,6 +825,11 @@ impl Command {
             | Command::XRange { .. }
             | Command::XRevRange { .. }
             | Command::XRead { .. } => 34,
+            Command::Subscribe { .. }
+            | Command::Unsubscribe { .. }
+            | Command::PSubscribe { .. }
+            | Command::PUnsubscribe { .. }
+            | Command::Publish { .. } => 35,
             _ => 32,
         }
     }

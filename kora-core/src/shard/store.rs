@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
+use ahash::AHashMap;
+
 use crate::command::{Command, CommandResponse};
 use crate::shard::allocator::ShardAllocator;
 use crate::tenant::TenantId;
@@ -21,36 +23,42 @@ use kora_vector::hnsw::HnswIndex;
 /// Each worker thread owns exactly one `ShardStore`. All operations on it
 /// are single-threaded — no locking required.
 pub struct ShardStore {
-    entries: HashMap<CompactKey, KeyEntry>,
+    entries: AHashMap<CompactKey, KeyEntry>,
     shard_id: u16,
     max_memory: usize,
     memory_used: usize,
     eviction_counter: u64,
+    expire_scan_cursor: usize,
     allocator: ShardAllocator,
-    tenant_memory: HashMap<TenantId, usize>,
+    tenant_memory: AHashMap<TenantId, usize>,
     current_tenant: TenantId,
     #[cfg(feature = "observability")]
     stats: ShardStats,
+    #[cfg(feature = "observability")]
+    stats_enabled: bool,
     #[cfg(feature = "vector")]
-    vector_indexes: HashMap<CompactKey, HnswIndex>,
+    vector_indexes: AHashMap<CompactKey, HnswIndex>,
 }
 
 impl ShardStore {
     /// Create a new empty shard store.
     pub fn new(shard_id: u16) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: AHashMap::new(),
             shard_id,
             max_memory: 0,
             memory_used: 0,
             eviction_counter: 0,
+            expire_scan_cursor: 0,
             allocator: ShardAllocator::new(),
-            tenant_memory: HashMap::new(),
+            tenant_memory: AHashMap::new(),
             current_tenant: TenantId(0),
             #[cfg(feature = "observability")]
             stats: ShardStats::new(),
+            #[cfg(feature = "observability")]
+            stats_enabled: false,
             #[cfg(feature = "vector")]
-            vector_indexes: HashMap::new(),
+            vector_indexes: AHashMap::new(),
         }
     }
 
@@ -58,6 +66,12 @@ impl ShardStore {
     #[cfg(feature = "observability")]
     pub fn stats(&self) -> &ShardStats {
         &self.stats
+    }
+
+    /// Enable or disable per-command statistics recording.
+    #[cfg(feature = "observability")]
+    pub fn set_stats_enabled(&mut self, enabled: bool) {
+        self.stats_enabled = enabled;
     }
 
     /// Get the shard ID.
@@ -175,37 +189,94 @@ impl ShardStore {
 
     /// Remove all expired keys, returning the count removed.
     pub fn evict_expired(&mut self) -> usize {
-        let before = self.entries.len();
-        self.entries.retain(|_, entry| !entry.is_expired());
-        before - self.entries.len()
+        let expired_keys: Vec<CompactKey> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.is_expired())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &expired_keys {
+            let _ = self.remove_compact_entry(key);
+        }
+        expired_keys.len()
+    }
+
+    /// Remove expired keys by scanning a bounded sample of entries.
+    ///
+    /// This avoids latency spikes from full-map sweeps on the hot path.
+    pub fn evict_expired_sample(&mut self, sample_size: usize) -> usize {
+        if sample_size == 0 || self.entries.is_empty() {
+            return 0;
+        }
+
+        let len = self.entries.len();
+        let start = self.expire_scan_cursor % len;
+        let mut examined = 0usize;
+        let mut expired_keys = Vec::new();
+
+        for (key, entry) in self.entries.iter().skip(start) {
+            if examined >= sample_size {
+                break;
+            }
+            if entry.is_expired() {
+                expired_keys.push(key.clone());
+            }
+            examined += 1;
+        }
+
+        if examined < sample_size {
+            for (key, entry) in self.entries.iter().take(start) {
+                if examined >= sample_size {
+                    break;
+                }
+                if entry.is_expired() {
+                    expired_keys.push(key.clone());
+                }
+                examined += 1;
+            }
+        }
+
+        for key in &expired_keys {
+            let _ = self.remove_compact_entry(key);
+        }
+        self.expire_scan_cursor = self.expire_scan_cursor.wrapping_add(examined);
+
+        expired_keys.len()
     }
 
     /// Remove all keys from this shard.
     pub fn flush(&mut self) {
         self.entries.clear();
         self.memory_used = 0;
+        self.tenant_memory.clear();
+        self.expire_scan_cursor = 0;
     }
 
     /// Execute a command on this shard and return the response.
     pub fn execute(&mut self, cmd: Command) -> CommandResponse {
         #[cfg(feature = "observability")]
-        let start = std::time::Instant::now();
-
+        let track_stats = self.stats_enabled;
         #[cfg(feature = "observability")]
-        let cmd_type = cmd.cmd_type() as usize;
-
+        let start = if track_stats {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         #[cfg(feature = "observability")]
-        if let Some(key) = cmd.key() {
-            self.stats.record_key_access(key);
-        }
+        let cmd_type = if track_stats {
+            Some(cmd.cmd_type() as usize)
+        } else {
+            None
+        };
 
         if cmd.is_mutation() {
             self.maybe_evict();
         }
 
-        let is_read = !cmd.is_mutation();
-        let cmd_key = if is_read {
-            cmd.key().map(|k| k.to_vec())
+        // LFU touches are only needed when eviction is active (max_memory > 0).
+        let should_touch_lfu = !cmd.is_mutation() && self.max_memory > 0;
+        let cmd_key = if should_touch_lfu {
+            cmd.key().map(CompactKey::new)
         } else {
             None
         };
@@ -218,9 +289,11 @@ impl ShardStore {
 
         #[cfg(feature = "observability")]
         {
-            let duration_ns = start.elapsed().as_nanos() as u64;
-            self.stats.record_command(cmd_type, duration_ns);
-            self.stats.set_key_count(self.entries.len() as u64);
+            if let (Some(start), Some(cmd_type)) = (start, cmd_type) {
+                let duration_ns = start.elapsed().as_nanos() as u64;
+                self.stats.record_command(cmd_type, duration_ns);
+                self.stats.set_key_count(self.entries.len() as u64);
+            }
         }
 
         response
@@ -445,6 +518,8 @@ impl ShardStore {
                     _ => CommandResponse::Nil,
                 }
             }
+            Command::StatsHotkeys { count } => self.cmd_stats_hotkeys(count),
+            Command::StatsMemory { prefixes } => self.cmd_stats_memory(&prefixes),
 
             // Commands handled at server/engine level — should not reach here
             Command::BgSave
@@ -459,9 +534,12 @@ impl ShardStore {
             | Command::ScriptLoad { .. }
             | Command::ScriptCall { .. }
             | Command::ScriptDel { .. }
-            | Command::StatsHotkeys { .. }
             | Command::StatsLatency { .. }
-            | Command::StatsMemory { .. } => {
+            | Command::Subscribe { .. }
+            | Command::Unsubscribe { .. }
+            | Command::PSubscribe { .. }
+            | Command::PUnsubscribe { .. }
+            | Command::Publish { .. } => {
                 CommandResponse::Error("ERR command handled at server level".into())
             }
 
@@ -646,14 +724,7 @@ impl ShardStore {
 
     fn del(&mut self, key: &[u8]) -> bool {
         let compact = CompactKey::new(key);
-        if let Some(removed) = self.entries.remove(&compact) {
-            self.memory_used = self
-                .memory_used
-                .saturating_sub(Self::estimate_key_entry_size(key, &removed.value));
-            true
-        } else {
-            false
-        }
+        self.remove_compact_entry(&compact).is_some()
     }
 
     fn exists(&mut self, key: &[u8]) -> bool {
@@ -756,6 +827,49 @@ impl ShardStore {
             CommandResponse::BulkString(next_cursor.to_string().into_bytes()),
             CommandResponse::Array(result_keys),
         ])
+    }
+
+    fn cmd_stats_hotkeys(&self, count: usize) -> CommandResponse {
+        let mut hot: Vec<(&CompactKey, u8)> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| !entry.is_expired())
+            .map(|(key, entry)| (key, entry.lfu_counter))
+            .collect();
+        hot.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.0.as_bytes().cmp(b.0.as_bytes()))
+        });
+
+        let items = hot
+            .into_iter()
+            .take(count)
+            .map(|(key, freq)| {
+                CommandResponse::Array(vec![
+                    CommandResponse::BulkString(key.as_bytes().to_vec()),
+                    CommandResponse::Integer(i64::from(freq)),
+                ])
+            })
+            .collect();
+        CommandResponse::Array(items)
+    }
+
+    fn cmd_stats_memory(&self, prefixes: &[Vec<u8>]) -> CommandResponse {
+        let items: Vec<CommandResponse> = prefixes
+            .iter()
+            .map(|prefix| {
+                let total: usize = self
+                    .entries
+                    .iter()
+                    .filter(|(key, entry)| {
+                        !entry.is_expired() && key.as_bytes().starts_with(prefix.as_slice())
+                    })
+                    .map(|(key, entry)| Self::estimate_key_entry_size(key.as_bytes(), &entry.value))
+                    .sum();
+                CommandResponse::Integer(total as i64)
+            })
+            .collect();
+        CommandResponse::Array(items)
     }
 
     // ─── List operations ─────────────────────────────────────────────
@@ -1558,7 +1672,7 @@ impl ShardStore {
     fn lazy_expire(&mut self, key: &[u8]) {
         let compact = CompactKey::new(key);
         if self.is_expired(&compact) {
-            self.entries.remove(&compact);
+            let _ = self.remove_compact_entry(&compact);
         }
     }
 
@@ -1569,8 +1683,8 @@ impl ShardStore {
     }
 
     /// Update the LFU counter for a key on read access.
-    fn touch_key(&mut self, key: &[u8]) {
-        if let Some(entry) = self.entries.get_mut(&CompactKey::new(key)) {
+    fn touch_key(&mut self, key: &CompactKey) {
+        if let Some(entry) = self.entries.get_mut(key) {
             entry.touch_lfu();
         }
     }
@@ -1629,25 +1743,17 @@ impl ShardStore {
         }
 
         if let Some(key) = lowest_key {
-            let removed_size = self.estimate_entry_size(&key);
-            if let Some(entry) = self.entries.get(&key) {
-                let evicted_tenant = entry.tenant_id;
-                let tenant_mem = self.tenant_memory.entry(evicted_tenant).or_insert(0);
-                *tenant_mem = tenant_mem.saturating_sub(removed_size);
-            }
-            self.entries.remove(&key);
-            self.memory_used = self.memory_used.saturating_sub(removed_size);
+            let _ = self.remove_compact_entry(&key);
         }
     }
 
-    fn estimate_entry_size(&self, key: &CompactKey) -> usize {
-        let key_size = key.as_bytes().len() + std::mem::size_of::<CompactKey>();
-        let value_size = self
-            .entries
-            .get(key)
-            .map(|e| e.value.estimated_size())
-            .unwrap_or(0);
-        key_size + value_size + std::mem::size_of::<KeyEntry>()
+    fn remove_compact_entry(&mut self, key: &CompactKey) -> Option<KeyEntry> {
+        let removed = self.entries.remove(key)?;
+        let removed_size = Self::estimate_key_entry_size(key.as_bytes(), &removed.value);
+        self.memory_used = self.memory_used.saturating_sub(removed_size);
+        let tenant_mem = self.tenant_memory.entry(removed.tenant_id).or_insert(0);
+        *tenant_mem = tenant_mem.saturating_sub(removed_size);
+        Some(removed)
     }
 
     fn estimate_key_entry_size(key: &[u8], value: &Value) -> usize {
