@@ -9,22 +9,34 @@
 //! The data file is append-only with the following per-entry layout:
 //!
 //! ```text
-//! [len: u32 little-endian][data: len bytes]
+//! [key_hash: u64 little-endian][length: u32 little-endian][data: length bytes]
 //! ```
+//!
+//! Including the key hash makes the file self-describing, enabling full index
+//! rebuild on reopen without external metadata.
 //!
 //! Deletions are lazy — the index entry is removed but the data remains in
 //! the file until a future compaction pass.
 
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use memmap2::MmapMut;
 
-use crate::error::{Result, StorageError};
-
-/// Size of the length prefix for each entry (u32 = 4 bytes).
+const HASH_SIZE: usize = 8;
 const LEN_PREFIX_SIZE: usize = 4;
+const ENTRY_HEADER_SIZE: usize = HASH_SIZE + LEN_PREFIX_SIZE;
+const INITIAL_FILE_SIZE: u64 = 1024 * 1024;
+
+/// Describes a single entry's location within the mmap.
+pub struct WarmEntry {
+    /// Byte offset from the start of the file.
+    pub offset: u64,
+    /// Length of the data (not including the header).
+    pub length: u32,
+}
 
 /// Memory-mapped warm tier storage.
 ///
@@ -35,195 +47,304 @@ const LEN_PREFIX_SIZE: usize = 4;
 /// This tier is designed to be shard-local so it does not require internal
 /// synchronisation for concurrent access.
 pub struct WarmTier {
-    /// Path to the data file on disk (retained for future compaction).
-    #[allow(dead_code)]
-    data_path: PathBuf,
-    /// The memory-mapped region backing the data file.
-    mmap: MmapMut,
-    /// In-memory index mapping key hashes to `(offset, len)` in the mmap.
-    index: HashMap<u64, (usize, usize)>,
-    /// Current write position (next free byte) in the mmap.
-    write_pos: usize,
-    /// Maximum size (in bytes) of the memory-mapped region.
-    max_size: usize,
+    file: File,
+    mmap: Option<MmapMut>,
+    index: HashMap<u64, WarmEntry>,
+    write_offset: u64,
+    file_path: PathBuf,
+    max_size: u64,
+    file_size: u64,
 }
 
 impl WarmTier {
-    /// Open or create a warm tier data file in `dir`.
+    /// Open or create a warm tier data file at `path`.
     ///
-    /// The backing file is pre-allocated to `max_size` bytes and
-    /// memory-mapped. If the file already exists it is reopened and the
-    /// existing entries are re-indexed.
+    /// The backing file starts at a small initial size and grows as needed
+    /// up to `max_size`. If the file already exists, the index is rebuilt
+    /// by scanning existing entries.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Io`] if the directory cannot be created or
-    /// the file cannot be opened/mapped.
-    pub fn open(dir: impl AsRef<Path>, max_size: usize) -> Result<Self> {
-        let dir = dir.as_ref();
-        fs::create_dir_all(dir)?;
-
-        let data_path = dir.join("warm.dat");
+    /// Returns [`StorageError::Io`] if the file cannot be opened or mapped.
+    pub fn open(path: &Path, max_size: u64) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
 
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&data_path)?;
+            .open(path)?;
 
-        // Pre-allocate the file to the requested maximum size.
-        file.set_len(max_size as u64)?;
+        let metadata = file.metadata()?;
+        let existing_len = metadata.len();
 
-        // SAFETY: The file has been opened in read-write mode and pre-allocated
-        // to `max_size` bytes. We hold the only handle to the file within this
-        // struct. The warm tier is shard-local so no external concurrent access
-        // is expected.
+        let file_size = if existing_len == 0 {
+            let initial = INITIAL_FILE_SIZE.min(max_size);
+            file.set_len(initial)?;
+            initial
+        } else {
+            existing_len
+        };
+
+        // SAFETY: The file is opened in read-write mode and we hold the only
+        // handle. The warm tier is shard-local with no concurrent external access.
         let mmap = unsafe { MmapMut::map_mut(&file)? };
 
         let mut tier = Self {
-            data_path,
-            mmap,
+            file,
+            mmap: Some(mmap),
             index: HashMap::new(),
-            write_pos: 0,
+            write_offset: 0,
+            file_path: path.to_path_buf(),
             max_size,
+            file_size,
         };
 
-        tier.rebuild_index()?;
+        tier.rebuild_index_from_file()?;
         Ok(tier)
     }
 
-    /// Read a value directly from the memory-mapped region (zero-copy).
+    /// Store data associated with `key_hash`.
     ///
-    /// Returns `None` if no entry exists for the given `key_hash`.
-    pub fn get(&self, key_hash: u64) -> Option<&[u8]> {
-        let &(offset, len) = self.index.get(&key_hash)?;
-        let data_start = offset + LEN_PREFIX_SIZE;
-        let data_end = data_start + len;
-        if data_end <= self.max_size {
-            Some(&self.mmap[data_start..data_end])
+    /// If an entry for `key_hash` already exists, the old entry becomes
+    /// unreachable (lazy deletion) and the new value is appended.
+    ///
+    /// The file and mmap are automatically grown (doubled) when space is
+    /// insufficient, up to `max_size`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data does not fit within `max_size`.
+    pub fn store(&mut self, key_hash: u64, data: &[u8]) -> io::Result<()> {
+        let entry_size = ENTRY_HEADER_SIZE + data.len();
+        let needed = self.write_offset + entry_size as u64;
+
+        if needed > self.max_size {
+            return Err(io::Error::other("warm tier: exceeds max_size"));
+        }
+
+        if needed > self.file_size {
+            self.grow_file(needed)?;
+        }
+
+        let mmap = self
+            .mmap
+            .as_mut()
+            .ok_or_else(|| io::Error::other("warm tier: mmap not available"))?;
+
+        let off = self.write_offset as usize;
+        mmap[off..off + HASH_SIZE].copy_from_slice(&key_hash.to_le_bytes());
+        mmap[off + HASH_SIZE..off + ENTRY_HEADER_SIZE]
+            .copy_from_slice(&(data.len() as u32).to_le_bytes());
+        mmap[off + ENTRY_HEADER_SIZE..off + entry_size].copy_from_slice(data);
+
+        self.index.insert(
+            key_hash,
+            WarmEntry {
+                offset: self.write_offset,
+                length: data.len() as u32,
+            },
+        );
+        self.write_offset += entry_size as u64;
+
+        Ok(())
+    }
+
+    /// Load data associated with `key_hash`.
+    ///
+    /// Returns a zero-copy slice from the memory-mapped region, or `None`
+    /// if the key is not present.
+    pub fn load(&self, key_hash: u64) -> Option<&[u8]> {
+        let entry = self.index.get(&key_hash)?;
+        let mmap = self.mmap.as_ref()?;
+        let data_start = entry.offset as usize + ENTRY_HEADER_SIZE;
+        let data_end = data_start + entry.length as usize;
+        if data_end <= self.file_size as usize {
+            Some(&mmap[data_start..data_end])
         } else {
             None
         }
     }
 
-    /// Append a value to the warm tier and associate it with `key_hash`.
+    /// Remove an entry from the index. Does not reclaim disk space.
     ///
-    /// If an entry for `key_hash` already exists the old entry becomes
-    /// unreachable (lazy deletion) and the new value is appended.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError::Io`] if the value does not fit within the
-    /// remaining capacity of the memory-mapped region.
-    pub fn put(&mut self, key_hash: u64, value: &[u8]) -> Result<()> {
-        let entry_size = LEN_PREFIX_SIZE + value.len();
-
-        if self.write_pos + entry_size > self.max_size {
-            return Err(StorageError::Io(std::io::Error::other(
-                "warm tier: not enough space",
-            )));
-        }
-
-        let offset = self.write_pos;
-
-        // Write the length prefix (little-endian u32).
-        let len_bytes = (value.len() as u32).to_le_bytes();
-        self.mmap[offset..offset + LEN_PREFIX_SIZE].copy_from_slice(&len_bytes);
-
-        // Write the data.
-        let data_start = offset + LEN_PREFIX_SIZE;
-        self.mmap[data_start..data_start + value.len()].copy_from_slice(value);
-
-        self.write_pos += entry_size;
-        self.index.insert(key_hash, (offset, value.len()));
-
-        Ok(())
-    }
-
-    /// Remove an entry from the index by `key_hash`.
-    ///
-    /// This is a lazy deletion — the data remains in the backing file but is
-    /// no longer reachable through the index. Returns `true` if the entry
-    /// existed.
+    /// Returns `true` if the entry existed.
     pub fn remove(&mut self, key_hash: u64) -> bool {
         self.index.remove(&key_hash).is_some()
     }
 
-    /// Return the number of live entries in the warm tier.
+    /// Returns `true` if an entry exists for `key_hash`.
+    pub fn contains(&self, key_hash: u64) -> bool {
+        self.index.contains_key(&key_hash)
+    }
+
+    /// Compact the data file by rewriting only live entries.
+    ///
+    /// Creates a temporary file, writes all live entries, replaces the
+    /// original file, and remaps.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if I/O fails during compaction.
+    pub fn compact(&mut self) -> io::Result<()> {
+        let tmp_path = self.file_path.with_extension("tmp");
+
+        let live_entries: Vec<(u64, u64, u32)> = self
+            .index
+            .iter()
+            .map(|(&hash, entry)| (hash, entry.offset, entry.length))
+            .collect();
+
+        let mut new_data: Vec<u8> = Vec::new();
+        let mut new_index: HashMap<u64, WarmEntry> = HashMap::new();
+
+        let mmap = self
+            .mmap
+            .as_ref()
+            .ok_or_else(|| io::Error::other("warm tier: mmap not available"))?;
+
+        for (hash, offset, length) in &live_entries {
+            let new_offset = new_data.len() as u64;
+            new_data.extend_from_slice(&hash.to_le_bytes());
+            new_data.extend_from_slice(&length.to_le_bytes());
+
+            let src_start = *offset as usize + ENTRY_HEADER_SIZE;
+            let src_end = src_start + *length as usize;
+            new_data.extend_from_slice(&mmap[src_start..src_end]);
+
+            new_index.insert(
+                *hash,
+                WarmEntry {
+                    offset: new_offset,
+                    length: *length,
+                },
+            );
+        }
+
+        fs::write(&tmp_path, &new_data)?;
+
+        drop(self.mmap.take());
+
+        fs::rename(&tmp_path, &self.file_path)?;
+
+        let new_write_offset = new_data.len() as u64;
+        let new_file_size = INITIAL_FILE_SIZE.min(self.max_size).max(new_write_offset);
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.file_path)?;
+
+        file.set_len(new_file_size)?;
+
+        // SAFETY: File opened read-write, shard-local access only.
+        let new_mmap = unsafe { MmapMut::map_mut(&file)? };
+
+        self.file = file;
+        self.mmap = Some(new_mmap);
+        self.index = new_index;
+        self.write_offset = new_write_offset;
+        self.file_size = new_file_size;
+
+        Ok(())
+    }
+
+    /// Number of stored entries.
     pub fn len(&self) -> usize {
         self.index.len()
     }
 
-    /// Return `true` if the warm tier contains no live entries.
+    /// Returns `true` if there are no entries.
     pub fn is_empty(&self) -> bool {
         self.index.is_empty()
     }
 
-    /// Return the total number of bytes consumed by live entries (including
-    /// their length prefixes).
-    pub fn used_bytes(&self) -> usize {
-        self.index
-            .values()
-            .map(|&(_offset, len)| LEN_PREFIX_SIZE + len)
-            .sum()
+    /// Bytes of data written (including dead entries not yet compacted).
+    pub fn disk_usage(&self) -> u64 {
+        self.write_offset
     }
 
-    /// Flush the memory-mapped region to disk.
+    /// Flush the mmap to disk.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Io`] if the flush fails.
-    pub fn flush(&self) -> Result<()> {
-        self.mmap.flush()?;
+    /// Returns an error if the flush fails.
+    pub fn sync(&self) -> io::Result<()> {
+        if let Some(ref mmap) = self.mmap {
+            mmap.flush()?;
+        }
         Ok(())
     }
 
-    /// Rebuild the in-memory index by scanning the data file from the
-    /// beginning.
-    ///
-    /// This is used during [`open`](Self::open) to recover state from an
-    /// existing data file. Entries are read sequentially; if a duplicate
-    /// key hash is encountered the later entry wins (which matches the
-    /// append-only semantics).
-    fn rebuild_index(&mut self) -> Result<()> {
-        let mut pos: usize = 0;
+    fn grow_file(&mut self, needed: u64) -> io::Result<()> {
+        drop(self.mmap.take());
 
-        while pos + LEN_PREFIX_SIZE <= self.max_size {
-            let len_bytes: [u8; 4] = self.mmap[pos..pos + LEN_PREFIX_SIZE]
+        let mut new_size = self.file_size;
+        while new_size < needed {
+            new_size = (new_size * 2).min(self.max_size);
+            if new_size < needed && new_size == self.max_size {
+                return Err(io::Error::other("warm tier: exceeds max_size"));
+            }
+        }
+
+        self.file.set_len(new_size)?;
+        self.file_size = new_size;
+
+        // SAFETY: File opened read-write, shard-local access only.
+        let mmap = unsafe { MmapMut::map_mut(&self.file)? };
+        self.mmap = Some(mmap);
+
+        Ok(())
+    }
+
+    fn rebuild_index_from_file(&mut self) -> io::Result<()> {
+        let mmap = match self.mmap.as_ref() {
+            Some(m) => m,
+            None => return Ok(()),
+        };
+
+        let mut pos: u64 = 0;
+        let file_len = self.file_size;
+
+        while pos + ENTRY_HEADER_SIZE as u64 <= file_len {
+            let off = pos as usize;
+
+            let hash_bytes: [u8; 8] = mmap[off..off + HASH_SIZE]
                 .try_into()
-                .map_err(|_| StorageError::CorruptEntry("failed to read length prefix".into()))?;
+                .map_err(|_| io::Error::other("warm tier: corrupt hash"))?;
+            let key_hash = u64::from_le_bytes(hash_bytes);
 
-            let len = u32::from_le_bytes(len_bytes) as usize;
+            let len_bytes: [u8; 4] = mmap[off + HASH_SIZE..off + ENTRY_HEADER_SIZE]
+                .try_into()
+                .map_err(|_| io::Error::other("warm tier: corrupt length"))?;
+            let length = u32::from_le_bytes(len_bytes);
 
-            // A zero-length prefix signals the end of written data (the file
-            // is zero-filled beyond the write position).
-            if len == 0 {
+            if key_hash == 0 && length == 0 {
                 break;
             }
 
-            let data_end = pos + LEN_PREFIX_SIZE + len;
-            if data_end > self.max_size {
-                return Err(StorageError::CorruptEntry(
-                    "entry extends beyond file boundary".into(),
+            let entry_end = pos + ENTRY_HEADER_SIZE as u64 + length as u64;
+            if entry_end > file_len {
+                return Err(io::Error::other(
+                    "warm tier: entry extends beyond file boundary",
                 ));
             }
 
-            // During rebuild we do not know the key hash that was originally
-            // used. We store a positional pseudo-hash so that `write_pos` is
-            // correctly advanced. A production implementation would persist
-            // the key hash alongside each entry; for now the index is only
-            // populated during the current session and rebuild simply
-            // advances the write cursor.
-            //
-            // NOTE: We intentionally do *not* insert into the index here
-            // because we lack the key hash. The write cursor is still
-            // advanced so that new appends land after existing data.
+            self.index.insert(
+                key_hash,
+                WarmEntry {
+                    offset: pos,
+                    length,
+                },
+            );
 
-            pos = data_end;
+            pos = entry_end;
         }
 
-        self.write_pos = pos;
+        self.write_offset = pos;
         Ok(())
     }
 }
@@ -233,41 +354,120 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn warm_path(dir: &TempDir) -> PathBuf {
+        dir.path().join("warm.dat")
+    }
+
     #[test]
-    fn put_and_get() {
+    fn store_and_load_single() {
         let dir = TempDir::new().unwrap();
-        let mut tier = WarmTier::open(dir.path(), 4096).unwrap();
+        let mut tier = WarmTier::open(&warm_path(&dir), 4096).unwrap();
 
-        tier.put(1, b"hello").unwrap();
-        tier.put(2, b"world").unwrap();
+        tier.store(1, b"hello").unwrap();
+        assert_eq!(tier.load(1), Some(b"hello".as_slice()));
+        assert_eq!(tier.load(999), None);
+    }
 
-        assert_eq!(tier.get(1), Some(b"hello".as_slice()));
-        assert_eq!(tier.get(2), Some(b"world".as_slice()));
-        assert_eq!(tier.get(3), None);
+    #[test]
+    fn store_multiple_and_load_all() {
+        let dir = TempDir::new().unwrap();
+        let mut tier = WarmTier::open(&warm_path(&dir), 4096).unwrap();
+
+        tier.store(10, b"alpha").unwrap();
+        tier.store(20, b"bravo").unwrap();
+        tier.store(30, b"charlie").unwrap();
+
+        assert_eq!(tier.load(10), Some(b"alpha".as_slice()));
+        assert_eq!(tier.load(20), Some(b"bravo".as_slice()));
+        assert_eq!(tier.load(30), Some(b"charlie".as_slice()));
+        assert_eq!(tier.len(), 3);
     }
 
     #[test]
     fn remove_entry() {
         let dir = TempDir::new().unwrap();
-        let mut tier = WarmTier::open(dir.path(), 4096).unwrap();
+        let mut tier = WarmTier::open(&warm_path(&dir), 4096).unwrap();
 
-        tier.put(42, b"data").unwrap();
+        tier.store(42, b"data").unwrap();
+        assert!(tier.contains(42));
         assert!(tier.remove(42));
         assert!(!tier.remove(42));
-        assert_eq!(tier.get(42), None);
+        assert!(!tier.contains(42));
+        assert_eq!(tier.load(42), None);
+    }
+
+    #[test]
+    fn compact_reclaims_space() {
+        let dir = TempDir::new().unwrap();
+        let mut tier = WarmTier::open(&warm_path(&dir), 1024 * 1024).unwrap();
+
+        tier.store(1, b"aaa").unwrap();
+        tier.store(2, b"bbb").unwrap();
+        tier.store(3, b"ccc").unwrap();
+
+        let usage_before = tier.disk_usage();
+        tier.remove(2);
+        tier.compact().unwrap();
+        let usage_after = tier.disk_usage();
+
+        assert!(usage_after < usage_before);
+        assert_eq!(tier.len(), 2);
+        assert_eq!(tier.load(1), Some(b"aaa".as_slice()));
+        assert_eq!(tier.load(3), Some(b"ccc".as_slice()));
+        assert_eq!(tier.load(2), None);
+    }
+
+    #[test]
+    fn file_growth() {
+        let dir = TempDir::new().unwrap();
+        let max_size = 1024 * 1024 * 4;
+        let mut tier = WarmTier::open(&warm_path(&dir), max_size).unwrap();
+
+        let big_data = vec![0xABu8; 512 * 1024];
+        tier.store(1, &big_data).unwrap();
+        tier.store(2, &big_data).unwrap();
+
+        assert_eq!(tier.load(1).map(|s| s.len()), Some(512 * 1024));
+        assert_eq!(tier.load(2).map(|s| s.len()), Some(512 * 1024));
+        assert!(tier.file_size > INITIAL_FILE_SIZE);
+    }
+
+    #[test]
+    fn sync_no_error() {
+        let dir = TempDir::new().unwrap();
+        let mut tier = WarmTier::open(&warm_path(&dir), 4096).unwrap();
+        tier.store(1, b"data").unwrap();
+        tier.sync().unwrap();
+    }
+
+    #[test]
+    fn reopen_rebuilds_index() {
+        let dir = TempDir::new().unwrap();
+        let path = warm_path(&dir);
+
+        {
+            let mut tier = WarmTier::open(&path, 1024 * 1024).unwrap();
+            tier.store(100, b"persist_me").unwrap();
+            tier.store(200, b"and_me_too").unwrap();
+            tier.sync().unwrap();
+        }
+
+        let tier = WarmTier::open(&path, 1024 * 1024).unwrap();
+        assert_eq!(tier.len(), 2);
+        assert_eq!(tier.load(100), Some(b"persist_me".as_slice()));
+        assert_eq!(tier.load(200), Some(b"and_me_too".as_slice()));
     }
 
     #[test]
     fn len_and_is_empty() {
         let dir = TempDir::new().unwrap();
-        let mut tier = WarmTier::open(dir.path(), 4096).unwrap();
+        let mut tier = WarmTier::open(&warm_path(&dir), 4096).unwrap();
 
         assert!(tier.is_empty());
         assert_eq!(tier.len(), 0);
 
-        tier.put(1, b"a").unwrap();
-        tier.put(2, b"bb").unwrap();
-
+        tier.store(1, b"a").unwrap();
+        tier.store(2, b"bb").unwrap();
         assert_eq!(tier.len(), 2);
         assert!(!tier.is_empty());
 
@@ -276,72 +476,34 @@ mod tests {
     }
 
     #[test]
-    fn used_bytes() {
+    fn disk_usage_tracks_writes() {
         let dir = TempDir::new().unwrap();
-        let mut tier = WarmTier::open(dir.path(), 4096).unwrap();
+        let mut tier = WarmTier::open(&warm_path(&dir), 4096).unwrap();
 
-        tier.put(1, b"abc").unwrap(); // 4 + 3 = 7
-        tier.put(2, b"de").unwrap(); // 4 + 2 = 6
-
-        assert_eq!(tier.used_bytes(), 13);
-
-        // After removing one entry the used bytes should decrease.
-        tier.remove(1);
-        assert_eq!(tier.used_bytes(), 6);
+        assert_eq!(tier.disk_usage(), 0);
+        tier.store(1, b"abc").unwrap();
+        assert_eq!(tier.disk_usage(), (ENTRY_HEADER_SIZE + 3) as u64);
     }
 
     #[test]
     fn overwrite_same_key() {
         let dir = TempDir::new().unwrap();
-        let mut tier = WarmTier::open(dir.path(), 4096).unwrap();
+        let mut tier = WarmTier::open(&warm_path(&dir), 4096).unwrap();
 
-        tier.put(1, b"first").unwrap();
-        tier.put(1, b"second").unwrap();
+        tier.store(1, b"first").unwrap();
+        tier.store(1, b"second").unwrap();
 
-        assert_eq!(tier.get(1), Some(b"second".as_slice()));
+        assert_eq!(tier.load(1), Some(b"second".as_slice()));
         assert_eq!(tier.len(), 1);
     }
 
     #[test]
-    fn out_of_space() {
+    fn exceeds_max_size() {
         let dir = TempDir::new().unwrap();
-        // Only 10 bytes of space — enough for one small entry but not two.
-        let mut tier = WarmTier::open(dir.path(), 10).unwrap();
+        let mut tier = WarmTier::open(&warm_path(&dir), 30).unwrap();
 
-        // 4 (prefix) + 5 (data) = 9 bytes — fits.
-        tier.put(1, b"hello").unwrap();
-
-        // 4 + 5 = 9 more bytes — does not fit (only 1 byte left).
-        let result = tier.put(2, b"world");
+        tier.store(1, b"hello").unwrap();
+        let result = tier.store(2, b"this_is_too_long_to_fit");
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn flush_does_not_error() {
-        let dir = TempDir::new().unwrap();
-        let mut tier = WarmTier::open(dir.path(), 4096).unwrap();
-        tier.put(1, b"data").unwrap();
-        tier.flush().unwrap();
-    }
-
-    #[test]
-    fn reopen_advances_write_cursor() {
-        let dir = TempDir::new().unwrap();
-
-        {
-            let mut tier = WarmTier::open(dir.path(), 4096).unwrap();
-            tier.put(1, b"hello").unwrap();
-            tier.flush().unwrap();
-        }
-
-        // Reopen — the write cursor should be past the previously written data.
-        let mut tier = WarmTier::open(dir.path(), 4096).unwrap();
-
-        // The index is empty after reopen (key hashes are not persisted) but
-        // the write cursor has advanced so new writes do not clobber old data.
-        assert!(tier.is_empty());
-
-        tier.put(2, b"world").unwrap();
-        assert_eq!(tier.get(2), Some(b"world".as_slice()));
     }
 }

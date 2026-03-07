@@ -3,5 +3,5 @@
 mod key;
 mod value;
 
-pub use key::{CompactKey, KeyEntry};
-pub use value::Value;
+pub use key::{CompactKey, KeyEntry, TIER_COLD, TIER_HOT, TIER_WARM};
+pub use value::{StreamEntry, StreamId, StreamLog, Value};

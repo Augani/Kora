@@ -28,3 +28,7 @@ pub mod slab;
 
 /// Multi-tenancy support: tenant isolation, resource limits, and accounting.
 pub mod tenant;
+
+/// Deterministic simulation testing framework.
+#[cfg(any(test, feature = "simulation"))]
+pub mod sim;

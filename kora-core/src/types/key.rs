@@ -3,7 +3,15 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::tenant::TenantId;
 use crate::types::Value;
+
+/// Tier marker: key is in hot (RAM) tier.
+pub const TIER_HOT: u8 = 0;
+/// Tier marker: key is in warm (mmap) tier.
+pub const TIER_WARM: u8 = 1;
+/// Tier marker: key is in cold (LZ4 disk) tier.
+pub const TIER_COLD: u8 = 2;
 
 /// A compact key representation that stores small keys inline.
 ///
@@ -95,6 +103,8 @@ pub struct KeyEntry {
     pub flags: u8,
     /// Per-key xorshift PRNG state for LFU probabilistic increment.
     pub lfu_seed: u32,
+    /// The tenant that owns this key.
+    pub tenant_id: TenantId,
 }
 
 impl KeyEntry {
@@ -111,6 +121,24 @@ impl KeyEntry {
             last_access: 0,
             flags: 0,
             lfu_seed: seed,
+            tenant_id: TenantId(0),
+        }
+    }
+
+    /// Create a new KeyEntry with a specific tenant owner.
+    pub fn new_with_tenant(key: CompactKey, value: Value, tenant_id: TenantId) -> Self {
+        let seed = key.as_bytes().iter().fold(0x1234_5678u32, |acc, &b| {
+            acc.wrapping_mul(31).wrapping_add(b as u32)
+        });
+        Self {
+            key,
+            value,
+            ttl: None,
+            lfu_counter: 5,
+            last_access: 0,
+            flags: 0,
+            lfu_seed: seed,
+            tenant_id,
         }
     }
 
@@ -157,6 +185,16 @@ impl KeyEntry {
     /// Decrements the counter by `elapsed_minutes` (like Redis lfu-decay-time=1).
     pub fn decay_lfu(&mut self, elapsed_minutes: u32) {
         self.lfu_counter = self.lfu_counter.saturating_sub(elapsed_minutes as u8);
+    }
+
+    /// Get the storage tier of this key (TIER\_HOT, TIER\_WARM, or TIER\_COLD).
+    pub fn tier(&self) -> u8 {
+        self.flags & 0x03
+    }
+
+    /// Set the storage tier of this key.
+    pub fn set_tier(&mut self, tier: u8) {
+        self.flags = (self.flags & 0xFC) | (tier & 0x03);
     }
 }
 
@@ -230,5 +268,29 @@ mod tests {
         assert_eq!(entry.lfu_counter, 15);
         entry.decay_lfu(100);
         assert_eq!(entry.lfu_counter, 0);
+    }
+
+    #[test]
+    fn test_tier_roundtrip() {
+        let mut entry = KeyEntry::new(CompactKey::new(b"k"), Value::Int(1));
+        assert_eq!(entry.tier(), TIER_HOT);
+
+        entry.set_tier(TIER_WARM);
+        assert_eq!(entry.tier(), TIER_WARM);
+
+        entry.set_tier(TIER_COLD);
+        assert_eq!(entry.tier(), TIER_COLD);
+
+        entry.set_tier(TIER_HOT);
+        assert_eq!(entry.tier(), TIER_HOT);
+    }
+
+    #[test]
+    fn test_tier_preserves_other_flags() {
+        let mut entry = KeyEntry::new(CompactKey::new(b"k"), Value::Int(1));
+        entry.flags = 0xFC;
+        entry.set_tier(TIER_WARM);
+        assert_eq!(entry.tier(), TIER_WARM);
+        assert_eq!(entry.flags & 0xFC, 0xFC);
     }
 }

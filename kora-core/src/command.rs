@@ -511,6 +511,62 @@ pub enum Command {
         max: f64,
     },
 
+    // -- Stream commands --
+    /// XADD key \[MAXLEN count\] id field value \[field value ...\]
+    XAdd {
+        /// The key.
+        key: Vec<u8>,
+        /// The entry ID (usually "*" for auto-generate).
+        id: Vec<u8>,
+        /// Field-value pairs for the entry.
+        fields: Vec<(Vec<u8>, Vec<u8>)>,
+        /// Optional MAXLEN trimming threshold.
+        maxlen: Option<usize>,
+    },
+    /// XLEN key
+    XLen {
+        /// The key.
+        key: Vec<u8>,
+    },
+    /// XRANGE key start end \[COUNT count\]
+    XRange {
+        /// The key.
+        key: Vec<u8>,
+        /// Start ID (or "-" for minimum).
+        start: Vec<u8>,
+        /// End ID (or "+" for maximum).
+        end: Vec<u8>,
+        /// Optional maximum number of entries to return.
+        count: Option<usize>,
+    },
+    /// XREVRANGE key end start \[COUNT count\]
+    XRevRange {
+        /// The key.
+        key: Vec<u8>,
+        /// Start ID (or "+" for maximum, reversed semantics).
+        start: Vec<u8>,
+        /// End ID (or "-" for minimum, reversed semantics).
+        end: Vec<u8>,
+        /// Optional maximum number of entries to return.
+        count: Option<usize>,
+    },
+    /// XREAD \[COUNT count\] STREAMS key \[key ...\] id \[id ...\]
+    XRead {
+        /// Keys to read from.
+        keys: Vec<Vec<u8>>,
+        /// IDs to read after (one per key).
+        ids: Vec<Vec<u8>>,
+        /// Optional maximum number of entries per key.
+        count: Option<usize>,
+    },
+    /// XTRIM key MAXLEN count
+    XTrim {
+        /// The key.
+        key: Vec<u8>,
+        /// Maximum number of entries to keep.
+        maxlen: usize,
+    },
+
     // -- Object commands --
     /// OBJECT FREQ key — return the LFU frequency counter.
     ObjectFreq {
@@ -595,6 +651,11 @@ impl Command {
             | Command::ZCount { key, .. }
             | Command::VecSet { key, .. }
             | Command::VecDel { key }
+            | Command::XAdd { key, .. }
+            | Command::XLen { key }
+            | Command::XRange { key, .. }
+            | Command::XRevRange { key, .. }
+            | Command::XTrim { key, .. }
             | Command::ObjectFreq { key }
             | Command::ObjectEncoding { key } => Some(key),
             Command::VecQuery { .. } => None,
@@ -610,6 +671,7 @@ impl Command {
                 | Command::MSet { .. }
                 | Command::Del { .. }
                 | Command::Exists { .. }
+                | Command::XRead { .. }
         )
     }
 
@@ -678,6 +740,8 @@ impl Command {
                 | Command::ZIncrBy { .. }
                 | Command::VecSet { .. }
                 | Command::VecDel { .. }
+                | Command::XAdd { .. }
+                | Command::XTrim { .. }
         )
     }
 
@@ -722,6 +786,11 @@ impl Command {
             | Command::ZCount { .. } => 29,
             Command::ZRem { .. } | Command::ZIncrBy { .. } => 30,
             Command::ObjectFreq { .. } | Command::ObjectEncoding { .. } => 31,
+            Command::XAdd { .. } | Command::XTrim { .. } => 33,
+            Command::XLen { .. }
+            | Command::XRange { .. }
+            | Command::XRevRange { .. }
+            | Command::XRead { .. } => 34,
             _ => 32,
         }
     }

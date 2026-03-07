@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use crate::command::{Command, CommandResponse};
-use crate::types::{CompactKey, KeyEntry, Value};
+use crate::shard::allocator::ShardAllocator;
+use crate::tenant::TenantId;
+use crate::types::{CompactKey, KeyEntry, StreamEntry, StreamId, StreamLog, Value};
 
 #[cfg(feature = "observability")]
 use kora_observability::stats::ShardStats;
@@ -24,6 +26,9 @@ pub struct ShardStore {
     max_memory: usize,
     memory_used: usize,
     eviction_counter: u64,
+    allocator: ShardAllocator,
+    tenant_memory: HashMap<TenantId, usize>,
+    current_tenant: TenantId,
     #[cfg(feature = "observability")]
     stats: ShardStats,
     #[cfg(feature = "vector")]
@@ -39,6 +44,9 @@ impl ShardStore {
             max_memory: 0,
             memory_used: 0,
             eviction_counter: 0,
+            allocator: ShardAllocator::new(),
+            tenant_memory: HashMap::new(),
+            current_tenant: TenantId(0),
             #[cfg(feature = "observability")]
             stats: ShardStats::new(),
             #[cfg(feature = "vector")]
@@ -55,6 +63,16 @@ impl ShardStore {
     /// Get the shard ID.
     pub fn shard_id(&self) -> u16 {
         self.shard_id
+    }
+
+    /// Get a reference to the per-shard slab allocator.
+    pub fn allocator(&self) -> &ShardAllocator {
+        &self.allocator
+    }
+
+    /// Get a mutable reference to the per-shard slab allocator.
+    pub fn allocator_mut(&mut self) -> &mut ShardAllocator {
+        &mut self.allocator
     }
 
     /// Get the number of keys in this shard.
@@ -75,6 +93,84 @@ impl ShardStore {
     /// Get the maximum memory limit for this shard.
     pub fn max_memory(&self) -> usize {
         self.max_memory
+    }
+
+    /// Set the current tenant for subsequent commands.
+    pub fn set_current_tenant(&mut self, tenant_id: TenantId) {
+        self.current_tenant = tenant_id;
+    }
+
+    /// Get the current tenant ID.
+    pub fn current_tenant(&self) -> TenantId {
+        self.current_tenant
+    }
+
+    /// Get per-tenant memory usage for a specific tenant.
+    pub fn tenant_memory_used(&self, tenant_id: TenantId) -> usize {
+        self.tenant_memory.get(&tenant_id).copied().unwrap_or(0)
+    }
+
+    /// Iterate over all entries in this shard.
+    pub fn entries_iter(&self) -> impl Iterator<Item = (&CompactKey, &KeyEntry)> {
+        self.entries.iter()
+    }
+
+    /// Get a reference to a key entry.
+    pub fn get_entry(&self, key: &CompactKey) -> Option<&KeyEntry> {
+        self.entries.get(key)
+    }
+
+    /// Get a mutable reference to a key entry.
+    pub fn get_entry_mut(&mut self, key: &CompactKey) -> Option<&mut KeyEntry> {
+        self.entries.get_mut(key)
+    }
+
+    /// Insert a key entry directly (used by migration and restore paths).
+    pub fn insert_entry(&mut self, key: CompactKey, entry: KeyEntry) {
+        let size = Self::estimate_key_entry_size(key.as_bytes(), &entry.value);
+        self.memory_used += size;
+        let tenant = entry.tenant_id;
+        *self.tenant_memory.entry(tenant).or_insert(0) += size;
+        self.entries.insert(key, entry);
+    }
+
+    /// Replace a key's value with a tier reference after demotion.
+    pub fn mark_demoted(&mut self, key: &CompactKey, tier: u8, ref_hash: u64) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            let old_size = entry.value.estimated_size();
+            entry.value = match tier {
+                crate::types::TIER_WARM => Value::WarmRef(ref_hash),
+                _ => Value::ColdRef(ref_hash),
+            };
+            let new_size = entry.value.estimated_size();
+            if old_size > new_size {
+                self.memory_used = self.memory_used.saturating_sub(old_size - new_size);
+                let tenant_mem = self.tenant_memory.entry(entry.tenant_id).or_insert(0);
+                *tenant_mem = tenant_mem.saturating_sub(old_size - new_size);
+            }
+            entry.set_tier(tier);
+        }
+    }
+
+    /// Promote a key back to the hot tier with the given value.
+    pub fn promote(&mut self, key: &CompactKey, value: Value) {
+        if let Some(entry) = self.entries.get_mut(key) {
+            let old_size = entry.value.estimated_size();
+            let new_size = value.estimated_size();
+            entry.value = value;
+            entry.set_tier(crate::types::TIER_HOT);
+            entry.lfu_counter = 5;
+            if new_size > old_size {
+                let delta = new_size - old_size;
+                self.memory_used += delta;
+                *self.tenant_memory.entry(entry.tenant_id).or_insert(0) += delta;
+            } else {
+                let delta = old_size - new_size;
+                self.memory_used = self.memory_used.saturating_sub(delta);
+                let tenant_mem = self.tenant_memory.entry(entry.tenant_id).or_insert(0);
+                *tenant_mem = tenant_mem.saturating_sub(delta);
+            }
+        }
     }
 
     /// Remove all expired keys, returning the count removed.
@@ -235,6 +331,28 @@ impl ShardStore {
             Command::ZIncrBy { key, delta, member } => self.cmd_zincrby(&key, delta, &member),
             Command::ZCount { key, min, max } => self.cmd_zcount(&key, min, max),
 
+            Command::XAdd {
+                key,
+                id,
+                fields,
+                maxlen,
+            } => self.cmd_xadd(&key, &id, &fields, maxlen),
+            Command::XLen { key } => self.cmd_xlen(&key),
+            Command::XRange {
+                key,
+                start,
+                end,
+                count,
+            } => self.cmd_xrange(&key, &start, &end, count),
+            Command::XRevRange {
+                key,
+                start,
+                end,
+                count,
+            } => self.cmd_xrevrange(&key, &start, &end, count),
+            Command::XRead { keys, ids, count } => self.cmd_xread(&keys, &ids, count),
+            Command::XTrim { key, maxlen } => self.cmd_xtrim(&key, maxlen),
+
             // Server commands
             Command::Ping { message } => match message {
                 Some(msg) => CommandResponse::BulkString(msg),
@@ -381,13 +499,17 @@ impl ShardStore {
         }
 
         if let Some(old_entry) = self.entries.get(&compact) {
-            self.memory_used = self
-                .memory_used
-                .saturating_sub(Self::estimate_key_entry_size(key, &old_entry.value));
+            let old_size = Self::estimate_key_entry_size(key, &old_entry.value);
+            let old_tenant = old_entry.tenant_id;
+            self.memory_used = self.memory_used.saturating_sub(old_size);
+            let tm = self.tenant_memory.entry(old_tenant).or_insert(0);
+            *tm = tm.saturating_sub(old_size);
         }
         let new_value = Value::from_bytes(value);
-        self.memory_used += Self::estimate_key_entry_size(key, &new_value);
-        let mut entry = KeyEntry::new(compact.clone(), new_value);
+        let entry_size = Self::estimate_key_entry_size(key, &new_value);
+        self.memory_used += entry_size;
+        *self.tenant_memory.entry(self.current_tenant).or_insert(0) += entry_size;
+        let mut entry = KeyEntry::new_with_tenant(compact.clone(), new_value, self.current_tenant);
         if let Some(dur) = Command::ttl_duration(ex, px) {
             entry.set_ttl(dur);
         }
@@ -654,6 +776,7 @@ impl ShardStore {
                 }
                 let len = deque.len() as i64;
                 self.memory_used += mem_delta;
+                *self.tenant_memory.entry(self.current_tenant).or_insert(0) += mem_delta;
                 CommandResponse::Integer(len)
             }
             Err(e) => e,
@@ -685,6 +808,7 @@ impl ShardStore {
                 }
                 let len = deque.len() as i64;
                 self.memory_used += mem_delta;
+                *self.tenant_memory.entry(self.current_tenant).or_insert(0) += mem_delta;
                 CommandResponse::Integer(len)
             }
             Err(e) => e,
@@ -851,8 +975,12 @@ impl ShardStore {
                 }
                 if memory_delta >= 0 {
                     self.memory_used += memory_delta as usize;
+                    *self.tenant_memory.entry(self.current_tenant).or_insert(0) +=
+                        memory_delta as usize;
                 } else {
                     self.memory_used = self.memory_used.saturating_sub(memory_delta.unsigned_abs());
+                    let tm = self.tenant_memory.entry(self.current_tenant).or_insert(0);
+                    *tm = tm.saturating_sub(memory_delta.unsigned_abs());
                 }
                 CommandResponse::Integer(count)
             }
@@ -1025,6 +1153,7 @@ impl ShardStore {
                     }
                 }
                 self.memory_used += memory_delta;
+                *self.tenant_memory.entry(self.current_tenant).or_insert(0) += memory_delta;
                 CommandResponse::Integer(count as i64)
             }
             Err(e) => e,
@@ -1135,6 +1264,7 @@ impl ShardStore {
                     }
                 }
                 self.memory_used += memory_delta;
+                *self.tenant_memory.entry(self.current_tenant).or_insert(0) += memory_delta;
                 CommandResponse::Integer(added)
             }
             Err(e) => e,
@@ -1436,14 +1566,16 @@ impl ShardStore {
         }
     }
 
-    /// Evict keys using LFU sampling when memory pressure is detected.
+    /// Evict keys using tenant-scoped LFU sampling when memory pressure is detected.
     ///
-    /// Samples 5 random keys and evicts the one with the lowest LFU counter.
+    /// Only considers keys belonging to `current_tenant`, so one tenant's cold
+    /// data cannot evict another tenant's hot data.
     fn maybe_evict(&mut self) {
         if self.max_memory == 0 || self.memory_used < self.max_memory {
             return;
         }
 
+        let tenant_id = self.current_tenant;
         let sample_size = 5usize;
         let entry_count = self.entries.len();
         if entry_count == 0 {
@@ -1456,14 +1588,19 @@ impl ShardStore {
 
         let mut lowest_counter = u8::MAX;
         let mut lowest_key: Option<CompactKey> = None;
+        let mut sampled = 0usize;
 
         for (i, (key, entry)) in self.entries.iter().enumerate() {
             if i < start {
                 continue;
             }
-            if i >= start + sample_size {
+            if sampled >= sample_size {
                 break;
             }
+            if entry.tenant_id != tenant_id {
+                continue;
+            }
+            sampled += 1;
             if entry.lfu_counter < lowest_counter {
                 lowest_counter = entry.lfu_counter;
                 lowest_key = Some(key.clone());
@@ -1471,7 +1608,10 @@ impl ShardStore {
         }
 
         if lowest_key.is_none() {
-            for (key, entry) in self.entries.iter().take(sample_size) {
+            for (key, entry) in self.entries.iter().take(sample_size * 3) {
+                if entry.tenant_id != tenant_id {
+                    continue;
+                }
                 if entry.lfu_counter < lowest_counter {
                     lowest_counter = entry.lfu_counter;
                     lowest_key = Some(key.clone());
@@ -1481,6 +1621,11 @@ impl ShardStore {
 
         if let Some(key) = lowest_key {
             let removed_size = self.estimate_entry_size(&key);
+            if let Some(entry) = self.entries.get(&key) {
+                let evicted_tenant = entry.tenant_id;
+                let tenant_mem = self.tenant_memory.entry(evicted_tenant).or_insert(0);
+                *tenant_mem = tenant_mem.saturating_sub(removed_size);
+            }
             self.entries.remove(&key);
             self.memory_used = self.memory_used.saturating_sub(removed_size);
         }
@@ -1508,7 +1653,11 @@ impl ShardStore {
         key: &CompactKey,
     ) -> Result<&mut VecDeque<Value>, CommandResponse> {
         if !self.entries.contains_key(key) {
-            let entry = KeyEntry::new(key.clone(), Value::List(VecDeque::new()));
+            let entry = KeyEntry::new_with_tenant(
+                key.clone(),
+                Value::List(VecDeque::new()),
+                self.current_tenant,
+            );
             self.entries.insert(key.clone(), entry);
         }
         let entry = self.entries.get_mut(key).ok_or_else(|| {
@@ -1527,7 +1676,11 @@ impl ShardStore {
         key: &CompactKey,
     ) -> Result<&mut HashMap<CompactKey, Value>, CommandResponse> {
         if !self.entries.contains_key(key) {
-            let entry = KeyEntry::new(key.clone(), Value::Hash(HashMap::new()));
+            let entry = KeyEntry::new_with_tenant(
+                key.clone(),
+                Value::Hash(HashMap::new()),
+                self.current_tenant,
+            );
             self.entries.insert(key.clone(), entry);
         }
         let entry = self.entries.get_mut(key).ok_or_else(|| {
@@ -1546,7 +1699,11 @@ impl ShardStore {
         key: &CompactKey,
     ) -> Result<&mut BTreeMap<Vec<u8>, f64>, CommandResponse> {
         if !self.entries.contains_key(key) {
-            let entry = KeyEntry::new(key.clone(), Value::SortedSet(BTreeMap::new()));
+            let entry = KeyEntry::new_with_tenant(
+                key.clone(),
+                Value::SortedSet(BTreeMap::new()),
+                self.current_tenant,
+            );
             self.entries.insert(key.clone(), entry);
         }
         let entry = self.entries.get_mut(key).ok_or_else(|| {
@@ -1565,7 +1722,11 @@ impl ShardStore {
         key: &CompactKey,
     ) -> Result<&mut HashSet<Value>, CommandResponse> {
         if !self.entries.contains_key(key) {
-            let entry = KeyEntry::new(key.clone(), Value::Set(HashSet::new()));
+            let entry = KeyEntry::new_with_tenant(
+                key.clone(),
+                Value::Set(HashSet::new()),
+                self.current_tenant,
+            );
             self.entries.insert(key.clone(), entry);
         }
         let entry = self.entries.get_mut(key).ok_or_else(|| {
@@ -1576,6 +1737,293 @@ impl ShardStore {
             _ => Err(CommandResponse::Error(
                 "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
             )),
+        }
+    }
+
+    fn get_or_create_stream(
+        &mut self,
+        key: &CompactKey,
+    ) -> Result<&mut StreamLog, CommandResponse> {
+        if !self.entries.contains_key(key) {
+            let log = StreamLog {
+                entries: VecDeque::new(),
+                last_id: StreamId { ms: 0, seq: 0 },
+            };
+            let entry = KeyEntry::new_with_tenant(
+                key.clone(),
+                Value::Stream(Box::new(log)),
+                self.current_tenant,
+            );
+            self.entries.insert(key.clone(), entry);
+        }
+        let entry = self.entries.get_mut(key).ok_or_else(|| {
+            CommandResponse::Error("ERR internal: key not found after insert".into())
+        })?;
+        match &mut entry.value {
+            Value::Stream(log) => Ok(log),
+            _ => Err(CommandResponse::Error(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+            )),
+        }
+    }
+
+    fn cmd_xadd(
+        &mut self,
+        key: &[u8],
+        id_arg: &[u8],
+        fields: &[(Vec<u8>, Vec<u8>)],
+        maxlen: Option<usize>,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        let is_new = !self.entries.contains_key(&compact);
+
+        let log = match self.get_or_create_stream(&compact) {
+            Ok(log) => log,
+            Err(e) => return e,
+        };
+
+        let new_id = if id_arg == b"*" {
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if ms > log.last_id.ms {
+                StreamId { ms, seq: 0 }
+            } else {
+                StreamId {
+                    ms: log.last_id.ms,
+                    seq: log.last_id.seq + 1,
+                }
+            }
+        } else {
+            match StreamId::parse(id_arg) {
+                Some(parsed) => {
+                    if parsed <= log.last_id {
+                        return CommandResponse::Error(
+                            "ERR The ID specified in XADD is equal or smaller than the target stream top item".into(),
+                        );
+                    }
+                    parsed
+                }
+                None => {
+                    return CommandResponse::Error(
+                        "ERR Invalid stream ID specified as stream command argument".into(),
+                    );
+                }
+            }
+        };
+
+        let id_str = format!("{}", new_id).into_bytes();
+        log.last_id = new_id.clone();
+
+        let mut memory_delta: usize = 0;
+        if is_new {
+            memory_delta +=
+                key.len() + std::mem::size_of::<CompactKey>() + std::mem::size_of::<KeyEntry>();
+        }
+        memory_delta += std::mem::size_of::<StreamEntry>();
+        for (k, v) in fields {
+            memory_delta += k.len() + v.len();
+        }
+
+        log.entries.push_back(StreamEntry {
+            id: new_id,
+            fields: fields.to_vec(),
+        });
+
+        if let Some(max) = maxlen {
+            while log.entries.len() > max {
+                log.entries.pop_front();
+            }
+        }
+
+        self.memory_used += memory_delta;
+        CommandResponse::BulkString(id_str)
+    }
+
+    fn cmd_xlen(&mut self, key: &[u8]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::Stream(log) => CommandResponse::Integer(log.entries.len() as i64),
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Integer(0),
+        }
+    }
+
+    fn parse_range_id(id_bytes: &[u8], is_start: bool) -> StreamId {
+        if id_bytes == b"-" {
+            StreamId::min_id()
+        } else if id_bytes == b"+" {
+            StreamId::max_id()
+        } else {
+            StreamId::parse(id_bytes).unwrap_or(if is_start {
+                StreamId::min_id()
+            } else {
+                StreamId::max_id()
+            })
+        }
+    }
+
+    fn format_stream_entry(entry: &StreamEntry) -> CommandResponse {
+        let mut fields_resp: Vec<CommandResponse> = Vec::with_capacity(entry.fields.len() * 2);
+        for (k, v) in &entry.fields {
+            fields_resp.push(CommandResponse::BulkString(k.clone()));
+            fields_resp.push(CommandResponse::BulkString(v.clone()));
+        }
+        CommandResponse::Array(vec![
+            CommandResponse::BulkString(format!("{}", entry.id).into_bytes()),
+            CommandResponse::Array(fields_resp),
+        ])
+    }
+
+    fn cmd_xrange(
+        &mut self,
+        key: &[u8],
+        start: &[u8],
+        end: &[u8],
+        count: Option<usize>,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::Stream(log) => {
+                    let start_id = Self::parse_range_id(start, true);
+                    let end_id = Self::parse_range_id(end, false);
+                    let limit = count.unwrap_or(usize::MAX);
+
+                    let results: Vec<CommandResponse> = log
+                        .entries
+                        .iter()
+                        .filter(|e| e.id >= start_id && e.id <= end_id)
+                        .take(limit)
+                        .map(Self::format_stream_entry)
+                        .collect();
+
+                    CommandResponse::Array(results)
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Array(vec![]),
+        }
+    }
+
+    fn cmd_xrevrange(
+        &mut self,
+        key: &[u8],
+        start: &[u8],
+        end: &[u8],
+        count: Option<usize>,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::Stream(log) => {
+                    let start_id = Self::parse_range_id(start, false);
+                    let end_id = Self::parse_range_id(end, true);
+                    let limit = count.unwrap_or(usize::MAX);
+
+                    let results: Vec<CommandResponse> = log
+                        .entries
+                        .iter()
+                        .rev()
+                        .filter(|e| e.id >= end_id && e.id <= start_id)
+                        .take(limit)
+                        .map(Self::format_stream_entry)
+                        .collect();
+
+                    CommandResponse::Array(results)
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Array(vec![]),
+        }
+    }
+
+    fn cmd_xread(
+        &mut self,
+        keys: &[Vec<u8>],
+        ids: &[Vec<u8>],
+        count: Option<usize>,
+    ) -> CommandResponse {
+        if keys.len() != ids.len() {
+            return CommandResponse::Error(
+                "ERR Unbalanced XREAD list of streams: for each stream key an ID must be specified"
+                    .into(),
+            );
+        }
+
+        let limit = count.unwrap_or(usize::MAX);
+        let mut results: Vec<CommandResponse> = Vec::new();
+
+        for (key, id_bytes) in keys.iter().zip(ids.iter()) {
+            self.lazy_expire(key);
+            let compact = CompactKey::new(key);
+            if let Some(entry) = self.entries.get(&compact) {
+                if let Value::Stream(log) = &entry.value {
+                    let after_id = if id_bytes == b"$" {
+                        log.last_id.clone()
+                    } else {
+                        match StreamId::parse(id_bytes) {
+                            Some(id) => id,
+                            None => continue,
+                        }
+                    };
+
+                    let entries: Vec<CommandResponse> = log
+                        .entries
+                        .iter()
+                        .filter(|e| e.id > after_id)
+                        .take(limit)
+                        .map(Self::format_stream_entry)
+                        .collect();
+
+                    if !entries.is_empty() {
+                        results.push(CommandResponse::Array(vec![
+                            CommandResponse::BulkString(key.clone()),
+                            CommandResponse::Array(entries),
+                        ]));
+                    }
+                }
+            }
+        }
+
+        if results.is_empty() {
+            CommandResponse::Nil
+        } else {
+            CommandResponse::Array(results)
+        }
+    }
+
+    fn cmd_xtrim(&mut self, key: &[u8], maxlen: usize) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get_mut(&compact) {
+            Some(entry) => match &mut entry.value {
+                Value::Stream(log) => {
+                    let mut trimmed = 0i64;
+                    while log.entries.len() > maxlen {
+                        log.entries.pop_front();
+                        trimmed += 1;
+                    }
+                    CommandResponse::Integer(trimmed)
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Integer(0),
         }
     }
 }
@@ -2460,6 +2908,68 @@ mod tests {
                 key: b"zs".to_vec()
             }),
             CommandResponse::Integer(2)
+        );
+    }
+
+    #[test]
+    fn test_tenant_eviction_isolation() {
+        use crate::tenant::TenantId;
+
+        let mut store = ShardStore::new(0);
+        store.set_max_memory(2000);
+
+        store.set_current_tenant(TenantId(1));
+        for i in 0..5 {
+            store.execute(Command::Set {
+                key: format!("t1:key:{i}").into_bytes(),
+                value: b"value_for_tenant_one".to_vec(),
+                ex: None,
+                px: None,
+                nx: false,
+                xx: false,
+            });
+        }
+
+        let t1_keys_before: usize = store
+            .entries
+            .values()
+            .filter(|e| e.tenant_id == TenantId(1))
+            .count();
+        assert_eq!(t1_keys_before, 5);
+
+        store.set_current_tenant(TenantId(2));
+        for i in 0..5 {
+            store.execute(Command::Set {
+                key: format!("t2:key:{i}").into_bytes(),
+                value: b"value_for_tenant_two".to_vec(),
+                ex: None,
+                px: None,
+                nx: false,
+                xx: false,
+            });
+        }
+
+        let t1_remaining: usize = store
+            .entries
+            .values()
+            .filter(|e| e.tenant_id == TenantId(1))
+            .count();
+        assert_eq!(t1_remaining, 5);
+
+        let t2_remaining: usize = store
+            .entries
+            .values()
+            .filter(|e| e.tenant_id == TenantId(2))
+            .count();
+        assert!(
+            t2_remaining <= 5,
+            "tenant 2 should have had keys evicted or capped, got {t2_remaining}"
+        );
+
+        let total = store.entries.len();
+        assert!(
+            total < 10,
+            "total keys should be less than 10 due to memory pressure, got {total}"
         );
     }
 }

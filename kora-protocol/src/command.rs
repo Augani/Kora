@@ -646,6 +646,30 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             }
         }
 
+        // Stream commands
+        b"XADD" => parse_xadd(args),
+        b"XLEN" => {
+            check_arity("XLEN", args, 1)?;
+            Ok(Command::XLen {
+                key: extract_bytes(&args[0])?,
+            })
+        }
+        b"XRANGE" => parse_xrange(args),
+        b"XREVRANGE" => parse_xrevrange(args),
+        b"XREAD" => parse_xread(args),
+        b"XTRIM" => {
+            check_min_arity("XTRIM", args, 3)?;
+            let key = extract_bytes(&args[0])?;
+            let flag = extract_string(&args[1])?.to_ascii_uppercase();
+            if flag != b"MAXLEN" {
+                return Err(ProtocolError::InvalidData(
+                    "ERR XTRIM requires MAXLEN strategy".into(),
+                ));
+            }
+            let maxlen = parse_u64(&args[2])? as usize;
+            Ok(Command::XTrim { key, maxlen })
+        }
+
         _ => Err(ProtocolError::UnknownCommand(
             String::from_utf8_lossy(&cmd_name).into_owned(),
         )),
@@ -857,6 +881,132 @@ fn check_min_arity(cmd: &str, args: &[RespValue], min: usize) -> Result<(), Prot
     } else {
         Ok(())
     }
+}
+
+fn parse_xadd(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("XADD", args, 4)?;
+    let key = extract_bytes(&args[0])?;
+    let mut idx = 1;
+    let mut maxlen = None;
+
+    let flag = extract_string(&args[idx])?.to_ascii_uppercase();
+    if flag == b"MAXLEN" {
+        idx += 1;
+        if idx >= args.len() {
+            return Err(ProtocolError::WrongArity("XADD".into()));
+        }
+        maxlen = Some(parse_u64(&args[idx])? as usize);
+        idx += 1;
+    }
+
+    if idx >= args.len() {
+        return Err(ProtocolError::WrongArity("XADD".into()));
+    }
+    let id = extract_bytes(&args[idx])?;
+    idx += 1;
+
+    let field_args = &args[idx..];
+    if field_args.is_empty() || field_args.len() % 2 != 0 {
+        return Err(ProtocolError::WrongArity("XADD".into()));
+    }
+    let fields = field_args
+        .chunks(2)
+        .map(|chunk| Ok((extract_bytes(&chunk[0])?, extract_bytes(&chunk[1])?)))
+        .collect::<Result<Vec<(Vec<u8>, Vec<u8>)>, ProtocolError>>()?;
+
+    Ok(Command::XAdd {
+        key,
+        id,
+        fields,
+        maxlen,
+    })
+}
+
+fn parse_xrange(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("XRANGE", args, 3)?;
+    let key = extract_bytes(&args[0])?;
+    let start = extract_bytes(&args[1])?;
+    let end = extract_bytes(&args[2])?;
+    let mut count = None;
+    if args.len() >= 5 {
+        let flag = extract_string(&args[3])?.to_ascii_uppercase();
+        if flag == b"COUNT" {
+            count = Some(parse_u64(&args[4])? as usize);
+        }
+    }
+    Ok(Command::XRange {
+        key,
+        start,
+        end,
+        count,
+    })
+}
+
+fn parse_xrevrange(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("XREVRANGE", args, 3)?;
+    let key = extract_bytes(&args[0])?;
+    let start = extract_bytes(&args[1])?;
+    let end = extract_bytes(&args[2])?;
+    let mut count = None;
+    if args.len() >= 5 {
+        let flag = extract_string(&args[3])?.to_ascii_uppercase();
+        if flag == b"COUNT" {
+            count = Some(parse_u64(&args[4])? as usize);
+        }
+    }
+    Ok(Command::XRevRange {
+        key,
+        start,
+        end,
+        count,
+    })
+}
+
+fn parse_xread(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("XREAD", args, 3)?;
+    let mut idx = 0;
+    let mut count = None;
+
+    while idx < args.len() {
+        let token = extract_string(&args[idx])?.to_ascii_uppercase();
+        match token.as_slice() {
+            b"COUNT" => {
+                idx += 1;
+                if idx >= args.len() {
+                    return Err(ProtocolError::WrongArity("XREAD".into()));
+                }
+                count = Some(parse_u64(&args[idx])? as usize);
+                idx += 1;
+            }
+            b"STREAMS" => {
+                idx += 1;
+                break;
+            }
+            _ => {
+                return Err(ProtocolError::InvalidData(format!(
+                    "unsupported XREAD option: {}",
+                    String::from_utf8_lossy(&token)
+                )));
+            }
+        }
+    }
+
+    let remaining = &args[idx..];
+    if remaining.is_empty() || remaining.len() % 2 != 0 {
+        return Err(ProtocolError::WrongArity("XREAD".into()));
+    }
+
+    let half = remaining.len() / 2;
+    let keys = remaining[..half]
+        .iter()
+        .map(extract_bytes)
+        .collect::<Result<Vec<_>, _>>()?;
+    let ids = remaining[half..]
+        .iter()
+        .map(extract_bytes)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Command::XRead { keys, ids, count })
 }
 
 #[cfg(test)]
@@ -1178,6 +1328,167 @@ mod tests {
                 assert!(max.is_infinite() && max.is_sign_positive());
             }
             other => panic!("Expected ZCount, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_xadd() {
+        let cmd = parse_command(make_cmd(&[
+            b"XADD",
+            b"mystream",
+            b"*",
+            b"field1",
+            b"value1",
+            b"field2",
+            b"value2",
+        ]))
+        .unwrap();
+        match cmd {
+            Command::XAdd {
+                key,
+                id,
+                fields,
+                maxlen,
+            } => {
+                assert_eq!(key, b"mystream");
+                assert_eq!(id, b"*");
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0], (b"field1".to_vec(), b"value1".to_vec()));
+                assert!(maxlen.is_none());
+            }
+            other => panic!("Expected XAdd, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_xadd_with_maxlen() {
+        let cmd = parse_command(make_cmd(&[
+            b"XADD",
+            b"mystream",
+            b"MAXLEN",
+            b"1000",
+            b"*",
+            b"k",
+            b"v",
+        ]))
+        .unwrap();
+        match cmd {
+            Command::XAdd {
+                maxlen: Some(1000),
+                id,
+                fields,
+                ..
+            } => {
+                assert_eq!(id, b"*");
+                assert_eq!(fields.len(), 1);
+            }
+            other => panic!("Expected XAdd with MAXLEN, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_xlen() {
+        let cmd = parse_command(make_cmd(&[b"XLEN", b"mystream"])).unwrap();
+        assert!(matches!(cmd, Command::XLen { key } if key == b"mystream"));
+    }
+
+    #[test]
+    fn test_parse_xrange() {
+        let cmd = parse_command(make_cmd(&[b"XRANGE", b"mystream", b"-", b"+"])).unwrap();
+        match cmd {
+            Command::XRange {
+                key,
+                start,
+                end,
+                count,
+            } => {
+                assert_eq!(key, b"mystream");
+                assert_eq!(start, b"-");
+                assert_eq!(end, b"+");
+                assert!(count.is_none());
+            }
+            other => panic!("Expected XRange, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_xrange_with_count() {
+        let cmd = parse_command(make_cmd(&[
+            b"XRANGE",
+            b"mystream",
+            b"1000-0",
+            b"2000-0",
+            b"COUNT",
+            b"10",
+        ]))
+        .unwrap();
+        match cmd {
+            Command::XRange {
+                count: Some(10), ..
+            } => {}
+            other => panic!("Expected XRange with COUNT, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_xrevrange() {
+        let cmd = parse_command(make_cmd(&[b"XREVRANGE", b"mystream", b"+", b"-"])).unwrap();
+        match cmd {
+            Command::XRevRange {
+                key,
+                start,
+                end,
+                count,
+            } => {
+                assert_eq!(key, b"mystream");
+                assert_eq!(start, b"+");
+                assert_eq!(end, b"-");
+                assert!(count.is_none());
+            }
+            other => panic!("Expected XRevRange, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_xread() {
+        let cmd = parse_command(make_cmd(&[
+            b"XREAD", b"COUNT", b"5", b"STREAMS", b"stream1", b"stream2", b"0-0", b"0-0",
+        ]))
+        .unwrap();
+        match cmd {
+            Command::XRead { keys, ids, count } => {
+                assert_eq!(keys.len(), 2);
+                assert_eq!(keys[0], b"stream1");
+                assert_eq!(keys[1], b"stream2");
+                assert_eq!(ids.len(), 2);
+                assert_eq!(count, Some(5));
+            }
+            other => panic!("Expected XRead, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_xread_no_count() {
+        let cmd = parse_command(make_cmd(&[b"XREAD", b"STREAMS", b"mystream", b"0-0"])).unwrap();
+        match cmd {
+            Command::XRead { keys, ids, count } => {
+                assert_eq!(keys.len(), 1);
+                assert_eq!(ids.len(), 1);
+                assert!(count.is_none());
+            }
+            other => panic!("Expected XRead, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_xtrim() {
+        let cmd = parse_command(make_cmd(&[b"XTRIM", b"mystream", b"MAXLEN", b"100"])).unwrap();
+        match cmd {
+            Command::XTrim { key, maxlen } => {
+                assert_eq!(key, b"mystream");
+                assert_eq!(maxlen, 100);
+            }
+            other => panic!("Expected XTrim, got {:?}", other),
         }
     }
 }

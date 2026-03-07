@@ -20,6 +20,7 @@ kora-vector = { workspace = true, optional = true }
 default = ["observability", "vector"]
 observability = ["dep:kora-observability"]
 vector = ["dep:kora-vector"]
+simulation = []
 
 [dev-dependencies]
 criterion.workspace = true

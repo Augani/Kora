@@ -1,9 +1,67 @@
 //! The core `Value` enum representing all data types in Kōra.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::sync::Arc;
 
 use crate::types::CompactKey;
+
+/// A stream entry ID consisting of a millisecond timestamp and a sequence number.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StreamId {
+    /// Millisecond timestamp portion.
+    pub ms: u64,
+    /// Sequence number within the millisecond.
+    pub seq: u64,
+}
+
+impl fmt::Display for StreamId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{}", self.ms, self.seq)
+    }
+}
+
+impl StreamId {
+    /// Parse a stream ID from bytes. Supports "ms-seq" format.
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        let s = std::str::from_utf8(data).ok()?;
+        let (ms_str, seq_str) = s.split_once('-')?;
+        let ms = ms_str.parse::<u64>().ok()?;
+        let seq = seq_str.parse::<u64>().ok()?;
+        Some(StreamId { ms, seq })
+    }
+
+    /// Returns the minimum possible stream ID.
+    pub fn min_id() -> Self {
+        StreamId { ms: 0, seq: 0 }
+    }
+
+    /// Returns the maximum possible stream ID.
+    pub fn max_id() -> Self {
+        StreamId {
+            ms: u64::MAX,
+            seq: u64::MAX,
+        }
+    }
+}
+
+/// A single entry in a stream.
+#[derive(Clone, Debug)]
+pub struct StreamEntry {
+    /// The unique ID of this entry.
+    pub id: StreamId,
+    /// Field-value pairs stored in this entry.
+    pub fields: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// An append-only log of stream entries (Redis Streams equivalent).
+#[derive(Clone, Debug)]
+pub struct StreamLog {
+    /// The entries in the stream, ordered by ID.
+    pub entries: VecDeque<StreamEntry>,
+    /// The last assigned ID.
+    pub last_id: StreamId,
+}
 
 /// Represents a value stored in the cache.
 ///
@@ -39,6 +97,15 @@ pub enum Value {
 
     /// Sorted set with dual index: member→score and score→members for O(log N) operations.
     SortedSet(BTreeMap<Vec<u8>, f64>),
+
+    /// Append-only stream log (Redis Streams equivalent).
+    Stream(Box<StreamLog>),
+
+    /// Reference to a value stored in the warm (mmap) tier.
+    WarmRef(u64),
+
+    /// Reference to a value stored in the cold (LZ4 disk) tier.
+    ColdRef(u64),
 }
 
 impl Value {
@@ -71,6 +138,7 @@ impl Value {
             Value::InlineStr { data, len } => Some(data[..*len as usize].to_vec()),
             Value::HeapStr(arc) => Some(arc.to_vec()),
             Value::Int(i) => Some(i.to_string().into_bytes()),
+            Value::WarmRef(_) | Value::ColdRef(_) => None,
             _ => None,
         }
     }
@@ -130,6 +198,11 @@ impl Value {
                     .collect();
                 parts.join(",").into_bytes()
             }
+            Value::Stream(log) => {
+                let parts: Vec<String> = log.entries.iter().map(|e| format!("{}", e.id)).collect();
+                parts.join(",").into_bytes()
+            }
+            Value::WarmRef(h) | Value::ColdRef(h) => h.to_le_bytes().to_vec(),
         }
     }
 
@@ -161,6 +234,22 @@ impl Value {
                         .map(|member| member.len() + std::mem::size_of::<f64>())
                         .sum::<usize>()
             }
+            Value::Stream(log) => {
+                std::mem::size_of::<Self>()
+                    + std::mem::size_of::<StreamLog>()
+                    + log
+                        .entries
+                        .iter()
+                        .map(|e| {
+                            std::mem::size_of::<StreamEntry>()
+                                + e.fields
+                                    .iter()
+                                    .map(|(k, v)| k.len() + v.len())
+                                    .sum::<usize>()
+                        })
+                        .sum::<usize>()
+            }
+            Value::WarmRef(_) | Value::ColdRef(_) => std::mem::size_of::<Self>(),
         }
     }
 
@@ -173,6 +262,8 @@ impl Value {
             Value::Hash(_) => "hash",
             Value::Vector(_) => "vector",
             Value::SortedSet(_) => "zset",
+            Value::Stream(_) => "stream",
+            Value::WarmRef(_) | Value::ColdRef(_) => "string",
         }
     }
 }
@@ -190,6 +281,8 @@ impl PartialEq for Value {
             | (Value::HeapStr(arc), Value::InlineStr { data, len }) => {
                 &data[..*len as usize] == arc.as_ref()
             }
+            (Value::WarmRef(a), Value::WarmRef(b)) => a == b,
+            (Value::ColdRef(a), Value::ColdRef(b)) => a == b,
             _ => false,
         }
     }
@@ -214,6 +307,14 @@ impl std::hash::Hash for Value {
             }
             // Collection types are not hashable; hashing them is a no-op.
             // The command layer prevents using collections as hash keys.
+            Value::WarmRef(h) => {
+                state.write_u8(2);
+                state.write_u64(*h);
+            }
+            Value::ColdRef(h) => {
+                state.write_u8(3);
+                state.write_u64(*h);
+            }
             _ => {
                 state.write_u8(255);
             }

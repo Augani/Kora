@@ -23,6 +23,7 @@
 pub mod backend;
 pub mod compressor;
 pub mod error;
+pub mod iouring;
 pub mod manager;
 pub mod rdb;
 pub mod shard_storage;
