@@ -1,0 +1,18 @@
+[package]
+name = "kora-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Core data structures, shard engine, and memory management for Kōra"
+
+[dependencies]
+ahash.workspace = true
+bytes.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true

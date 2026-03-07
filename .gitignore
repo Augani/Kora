@@ -1,0 +1,31 @@
+# Build artifacts
+/target/
+**/target/
+
+# Cargo lock is committed for binaries, generated for libraries
+# Since this workspace includes a binary (kora-cli), we commit Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+
+# Profiling / benchmarks
+perf.data
+perf.data.old
+flamegraph.svg
+*.profraw
+
+# Fuzz artifacts
+fuzz/artifacts/
+fuzz/corpus/

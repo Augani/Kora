@@ -1,0 +1,87 @@
+[workspace]
+resolver = "2"
+members = [
+    "kora-core",
+    "kora-protocol",
+    "kora-server",
+    "kora-embedded",
+    "kora-storage",
+    "kora-vector",
+    "kora-cdc",
+    "kora-scripting",
+    "kora-observability",
+    "kora-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Buffers & bytes
+bytes = "1"
+
+# Concurrency
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+# Hashing
+ahash = "0.8"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization / config
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Storage
+lz4_flex = "0.11"
+crc32fast = "1"
+memmap2 = "0.9"
+
+# WASM
+wasmtime = "27"
+
+# Observability
+hdrhistogram = "7"
+
+# Vector math
+ordered-float = "4"
+
+# Testing
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# Workspace crates
+kora-core = { path = "kora-core" }
+kora-protocol = { path = "kora-protocol" }
+kora-server = { path = "kora-server" }
+kora-embedded = { path = "kora-embedded" }
+kora-storage = { path = "kora-storage" }
+kora-vector = { path = "kora-vector" }
+kora-cdc = { path = "kora-cdc" }
+kora-scripting = { path = "kora-scripting" }
+kora-observability = { path = "kora-observability" }
+kora-cli = { path = "kora-cli" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.bench]
+inherits = "release"
+debug = true

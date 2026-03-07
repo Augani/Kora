@@ -1,0 +1,21 @@
+[package]
+name = "kora-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Tiered storage, WAL, snapshots, and io_uring async I/O for Kōra"
+
+[dependencies]
+bytes.workspace = true
+crc32fast.workspace = true
+kora-core.workspace = true
+lz4_flex.workspace = true
+memmap2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[features]
+default = []
+io-uring = []

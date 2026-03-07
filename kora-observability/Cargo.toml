@@ -1,0 +1,14 @@
+[package]
+name = "kora-observability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Per-key stats, hot-key detection, and memory attribution for Kōra"
+
+[dependencies]
+hdrhistogram.workspace = true
+kora-core.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

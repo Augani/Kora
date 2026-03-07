@@ -1,0 +1,12 @@
+[package]
+name = "kora-embedded"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Embeddable library mode for Kōra — use as a direct API without a network layer"
+
+[dependencies]
+kora-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

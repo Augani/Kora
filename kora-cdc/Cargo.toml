@@ -1,0 +1,12 @@
+[package]
+name = "kora-cdc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Change Data Capture with per-shard ring buffers and subscriptions for Kōra"
+
+[dependencies]
+kora-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

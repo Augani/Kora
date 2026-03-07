@@ -1,0 +1,15 @@
+[package]
+name = "kora-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "TCP/Unix socket server, connection handling, and command dispatch for Kōra"
+
+[dependencies]
+bytes.workspace = true
+kora-core.workspace = true
+kora-protocol.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
