@@ -238,12 +238,49 @@
 
 ---
 
+## Phase 6 — Redis Compatibility & Multi-Tenancy ✅
+
+**Status: Complete**
+
+### 6.1 — SortedSet Data Structure ✅
+
+- BTreeMap-backed sorted set with dual member→score indexing
+- Full command surface: ZADD, ZREM, ZSCORE, ZRANK, ZREVRANK, ZCARD
+- Range queries: ZRANGE, ZREVRANGE, ZRANGEBYSCORE with WITHSCORES and LIMIT
+- ZINCRBY for atomic score increment, ZCOUNT for range counting
+- Supports -inf/+inf in score range queries
+
+### 6.2 — LFU Eviction & Memory Pressure ✅
+
+- Redis-compatible probabilistic LFU counter: P(increment) = 1/(counter * 10 + 1)
+- Counter decay over time (1 per minute)
+- Sampling-based eviction: samples 5 keys, evicts lowest LFU counter
+- Per-shard max_memory with automatic eviction on write pressure
+- OBJECT FREQ and OBJECT ENCODING commands
+- Memory estimation for all value types
+
+### 6.3 — Multi-Tenancy Integration ✅
+
+- TenantRegistry wired into server with per-connection tenant tracking
+- AUTH command sets tenant context (TenantId parsed from tenant field)
+- Rate limit check (check_limits + record_operation) before command dispatch
+- Default tenant (TenantId(0)) auto-registered on startup
+
+### 6.4 — Unix Socket Listener ✅
+
+- UnixListener alongside TCP via tokio::select!
+- Stale socket cleanup on startup
+- --unix-socket CLI arg and config file support
+- Identical connection handling for TCP and Unix paths
+
+---
+
 ## Test Summary
 
 | Crate | Unit Tests | Integration/Stress Tests | Benchmarks |
 |-------|-----------|-------------------------|------------|
-| kora-core | ✅ | 7 stress tests | 5 benchmarks |
-| kora-protocol | ✅ | 11 stress tests | 8 benchmarks |
+| kora-core | ✅ (80 tests) | 7 stress tests | 5 benchmarks |
+| kora-protocol | ✅ (71 tests) | 11 stress tests | 8 benchmarks |
 | kora-server | ✅ | 16 integration tests | — |
 | kora-embedded | ✅ | — | — |
 | kora-storage | ✅ (43 tests across modules) | — | — |
@@ -268,7 +305,10 @@
 10. **Per-shard WAL/RDB** over global storage — eliminates cross-shard I/O contention
 11. **WalWriter trait in kora-core** — breaks circular dependency between core and storage
 12. **Product quantization** for vectors — ~4x compression with controllable accuracy loss
+13. **BTreeMap dual-index** for SortedSet — simpler than skip list, correct first
+14. **Probabilistic LFU** (Redis-compatible) — 1 byte per key, O(1) updates
+15. **Sampling eviction** over full-scan — O(1) eviction cost regardless of keyspace size
 
 ---
 
-*All phases (0–5) delivered. 324 tests passing.*
+*All phases (0–6) delivered. 347 tests passing.*
