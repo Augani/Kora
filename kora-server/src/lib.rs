@@ -262,6 +262,17 @@ struct ConnectionState {
     tenant_id: TenantId,
 }
 
+use kora_core::shard::ResponseReceiver;
+
+enum PendingResponse {
+    Ready(CommandResponse),
+    Dispatched {
+        rx: ResponseReceiver,
+        cmd_id: usize,
+        key: Option<Vec<u8>>,
+    },
+}
+
 async fn handle_stream<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     mut stream: S,
     state: Arc<ServerState>,
@@ -282,20 +293,77 @@ async fn handle_stream<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 
         parser.feed(&read_buf[..n]);
 
+        let mut pending: Vec<PendingResponse> = Vec::new();
+        let mut has_dispatched = false;
+
         loop {
             match parser.try_parse() {
-                Ok(Some(frame)) => {
-                    let response = match parse_command(frame) {
-                        Ok(cmd) => handle_command(cmd, &state, &mut conn).await,
-                        Err(e) => CommandResponse::Error(e.to_string()),
-                    };
-                    serialize_response_versioned(&response, &mut write_buf, conn.resp3);
-                }
+                Ok(Some(frame)) => match parse_command(frame) {
+                    Ok(cmd) => {
+                        if let Some(resp) = try_handle_local(&cmd, &state, &mut conn) {
+                            pending.push(PendingResponse::Ready(resp));
+                        } else {
+                            match prepare_dispatch(&cmd, &state, &conn) {
+                                Ok((rx, cmd_id, key)) => {
+                                    has_dispatched = true;
+                                    pending.push(PendingResponse::Dispatched { rx, cmd_id, key });
+                                }
+                                Err(resp) => {
+                                    pending.push(PendingResponse::Ready(resp));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        pending.push(PendingResponse::Ready(CommandResponse::Error(
+                            e.to_string(),
+                        )));
+                    }
+                },
                 Ok(None) => break,
                 Err(e) => {
-                    let err_resp = CommandResponse::Error(e.to_string());
-                    serialize_response_versioned(&err_resp, &mut write_buf, conn.resp3);
+                    pending.push(PendingResponse::Ready(CommandResponse::Error(
+                        e.to_string(),
+                    )));
                     break;
+                }
+            }
+        }
+
+        if has_dispatched {
+            let histograms = state.histograms.clone();
+            let memory_trie = state.memory_trie.clone();
+            let resolved = tokio::task::spawn_blocking(move || {
+                let mut responses = Vec::with_capacity(pending.len());
+                for item in pending {
+                    match item {
+                        PendingResponse::Ready(resp) => responses.push(resp),
+                        PendingResponse::Dispatched { rx, cmd_id, key } => {
+                            let start = std::time::Instant::now();
+                            let resp = rx
+                                .recv()
+                                .unwrap_or(CommandResponse::Error("ERR internal error".into()));
+                            let duration_ns = start.elapsed().as_nanos() as u64;
+                            histograms.record(cmd_id, duration_ns);
+                            if let Some(k) = key {
+                                memory_trie.track(&k, 1);
+                            }
+                            responses.push(resp);
+                        }
+                    }
+                }
+                responses
+            })
+            .await
+            .unwrap_or_default();
+
+            for resp in &resolved {
+                serialize_response_versioned(resp, &mut write_buf, conn.resp3);
+            }
+        } else {
+            for item in &pending {
+                if let PendingResponse::Ready(resp) = item {
+                    serialize_response_versioned(resp, &mut write_buf, conn.resp3);
                 }
             }
         }
@@ -318,20 +386,18 @@ async fn handle_unix_connection(
     handle_stream(stream, state).await
 }
 
-async fn handle_command(
-    cmd: Command,
+fn try_handle_local(
+    cmd: &Command,
     state: &ServerState,
     conn: &mut ConnectionState,
-) -> CommandResponse {
-    match &cmd {
-        Command::Hello { version } => {
-            return handle_hello(version, conn);
-        }
+) -> Option<CommandResponse> {
+    match cmd {
+        Command::Hello { version } => Some(handle_hello(version, conn)),
         Command::Auth { tenant, password } => {
             if let Some(ref expected) = state.auth_password {
                 let provided = String::from_utf8_lossy(password);
                 if provided.as_ref() != expected.as_str() {
-                    return CommandResponse::Error("ERR invalid password".into());
+                    return Some(CommandResponse::Error("ERR invalid password".into()));
                 }
             }
             if let Some(ref tenant_bytes) = tenant {
@@ -341,97 +407,62 @@ async fn handle_command(
                     }
                 }
             }
-            return CommandResponse::Ok;
+            Some(CommandResponse::Ok)
         }
-        Command::BgSave => {
-            return handle_bgsave(state).await;
-        }
-        Command::BgRewriteAof => {
-            return CommandResponse::SimpleString("Background AOF rewrite started".into());
-        }
-        Command::CommandInfo => {
-            return CommandResponse::Array(vec![]);
-        }
-        Command::CdcPoll { cursor, count } => {
-            return handle_cdc_poll(state, *cursor, *count);
-        }
+        Command::BgSave => Some(handle_bgsave_sync(state)),
+        Command::BgRewriteAof => Some(CommandResponse::SimpleString(
+            "Background AOF rewrite started".into(),
+        )),
+        Command::CommandInfo => Some(CommandResponse::Array(vec![])),
+        Command::CdcPoll { cursor, count } => Some(handle_cdc_poll(state, *cursor, *count)),
         Command::CdcGroupCreate {
             group, start_seq, ..
-        } => {
-            return handle_cdc_group_create(state, group, *start_seq);
-        }
+        } => Some(handle_cdc_group_create(state, group, *start_seq)),
         Command::CdcGroupRead {
             group,
             consumer,
             count,
             ..
-        } => {
-            return handle_cdc_group_read(state, group, consumer, *count);
-        }
-        Command::CdcAck { group, seqs, .. } => {
-            return handle_cdc_ack(state, group, seqs);
-        }
-        Command::CdcPending { group, .. } => {
-            return handle_cdc_pending(state, group);
-        }
+        } => Some(handle_cdc_group_read(state, group, consumer, *count)),
+        Command::CdcAck { group, seqs, .. } => Some(handle_cdc_ack(state, group, seqs)),
+        Command::CdcPending { group, .. } => Some(handle_cdc_pending(state, group)),
         Command::ScriptLoad { name, wasm_bytes } => {
-            return handle_script_load(state, name, wasm_bytes);
+            Some(handle_script_load(state, name, wasm_bytes))
         }
         Command::ScriptCall {
             name,
             args,
             byte_args,
-        } => {
-            return handle_script_call(state, name, args, byte_args);
-        }
-        Command::ScriptDel { name } => {
-            return handle_script_del(state, name);
-        }
-        Command::StatsHotkeys { count } => {
-            return handle_stats_hotkeys(state, *count);
-        }
+        } => Some(handle_script_call(state, name, args, byte_args)),
+        Command::ScriptDel { name } => Some(handle_script_del(state, name)),
+        Command::StatsHotkeys { count } => Some(handle_stats_hotkeys(state, *count)),
         Command::StatsLatency {
             command,
             percentiles,
-        } => {
-            return handle_stats_latency(state, command, percentiles);
-        }
-        Command::StatsMemory { prefixes } => {
-            return handle_stats_memory(state, prefixes);
-        }
-        _ => {}
+        } => Some(handle_stats_latency(state, command, percentiles)),
+        Command::StatsMemory { prefixes } => Some(handle_stats_memory(state, prefixes)),
+        _ => None,
     }
+}
 
+fn prepare_dispatch(
+    cmd: &Command,
+    state: &ServerState,
+    conn: &ConnectionState,
+) -> Result<(ResponseReceiver, usize, Option<Vec<u8>>), CommandResponse> {
     {
         let registry = state.tenants.read();
         let key_count_delta = if cmd.is_mutation() { 1 } else { 0 };
         if let Err(e) = registry.check_limits(conn.tenant_id, key_count_delta, 0) {
-            return CommandResponse::Error(format!("ERR {}", e));
+            return Err(CommandResponse::Error(format!("ERR {}", e)));
         }
         registry.record_operation(conn.tenant_id);
     }
 
-    let engine = state.engine.clone();
-    let histograms = state.histograms.clone();
-    let memory_trie = state.memory_trie.clone();
     let cmd_id = cmd.cmd_type() as usize;
     let key_clone = cmd.key().map(|k| k.to_vec());
-    let rx = engine.dispatch(cmd);
-    match tokio::task::spawn_blocking(move || {
-        let start = std::time::Instant::now();
-        let resp = rx.recv();
-        let duration_ns = start.elapsed().as_nanos() as u64;
-        histograms.record(cmd_id, duration_ns);
-        if let Some(key) = key_clone {
-            memory_trie.track(&key, 1);
-        }
-        resp
-    })
-    .await
-    {
-        Ok(Ok(resp)) => resp,
-        _ => CommandResponse::Error("ERR internal error".into()),
-    }
+    let rx = state.engine.dispatch(cmd.clone());
+    Ok((rx, cmd_id, key_clone))
 }
 
 fn handle_hello(version: &Option<u8>, conn: &mut ConnectionState) -> CommandResponse {
@@ -468,8 +499,7 @@ fn handle_hello(version: &Option<u8>, conn: &mut ConnectionState) -> CommandResp
     CommandResponse::Map(info)
 }
 
-/// Handle BGSAVE — each shard saves its own RDB file independently.
-async fn handle_bgsave(state: &ServerState) -> CommandResponse {
+fn handle_bgsave_sync(state: &ServerState) -> CommandResponse {
     let sc = match state.storage_config {
         Some(ref s) => s.clone(),
         None => return CommandResponse::Error("ERR persistence not configured".into()),
@@ -478,69 +508,60 @@ async fn handle_bgsave(state: &ServerState) -> CommandResponse {
     let engine = state.engine.clone();
     let shard_count = engine.shard_count();
 
-    let result = tokio::task::spawn_blocking(move || {
-        let mut errors = Vec::new();
+    let mut errors = Vec::new();
+    let dump_resp = engine.dispatch_blocking(Command::Dump);
 
-        let dump_resp = engine.dispatch_blocking(Command::Dump);
+    let all_entries = match dump_resp {
+        CommandResponse::Array(entries) => entries,
+        _ => return CommandResponse::Error("ERR dump returned unexpected response".into()),
+    };
 
-        let all_entries = match dump_resp {
-            CommandResponse::Array(entries) => entries,
-            _ => return vec!["dump returned unexpected response".to_string()],
+    let mut rdb_entries = Vec::new();
+    for chunk in all_entries.chunks(2) {
+        if chunk.len() == 2 {
+            if let (CommandResponse::BulkString(key), CommandResponse::BulkString(value)) =
+                (&chunk[0], &chunk[1])
+            {
+                rdb_entries.push(kora_storage::rdb::RdbEntry {
+                    key: key.clone(),
+                    value: kora_storage::rdb::RdbValue::String(value.clone()),
+                    ttl_ms: None,
+                });
+            }
+        }
+    }
+
+    for shard_id in 0..shard_count {
+        let shard_entries: Vec<_> = rdb_entries
+            .iter()
+            .filter(|e| kora_core::hash::shard_for_key(&e.key, shard_count) as usize == shard_id)
+            .cloned()
+            .collect();
+
+        let mut shard_storage = match ShardStorage::open_with_config(
+            shard_id as u16,
+            &sc.data_dir,
+            sc.wal_sync_policy,
+            sc.wal_enabled,
+            sc.rdb_enabled,
+            sc.wal_max_bytes,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                errors.push(format!("shard {}: {}", shard_id, e));
+                continue;
+            }
         };
 
-        let mut rdb_entries = Vec::new();
-        for chunk in all_entries.chunks(2) {
-            if chunk.len() == 2 {
-                if let (CommandResponse::BulkString(key), CommandResponse::BulkString(value)) =
-                    (&chunk[0], &chunk[1])
-                {
-                    rdb_entries.push(kora_storage::rdb::RdbEntry {
-                        key: key.clone(),
-                        value: kora_storage::rdb::RdbValue::String(value.clone()),
-                        ttl_ms: None,
-                    });
-                }
-            }
+        if let Err(e) = shard_storage.rdb_save(&shard_entries) {
+            errors.push(format!("shard {}: {}", shard_id, e));
         }
+    }
 
-        for shard_id in 0..shard_count {
-            let shard_entries: Vec<_> = rdb_entries
-                .iter()
-                .filter(|e| {
-                    kora_core::hash::shard_for_key(&e.key, shard_count) as usize == shard_id
-                })
-                .cloned()
-                .collect();
-
-            let mut shard_storage = match ShardStorage::open_with_config(
-                shard_id as u16,
-                &sc.data_dir,
-                sc.wal_sync_policy,
-                sc.wal_enabled,
-                sc.rdb_enabled,
-                sc.wal_max_bytes,
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    errors.push(format!("shard {}: {}", shard_id, e));
-                    continue;
-                }
-            };
-
-            if let Err(e) = shard_storage.rdb_save(&shard_entries) {
-                errors.push(format!("shard {}: {}", shard_id, e));
-            }
-        }
-        errors
-    })
-    .await;
-
-    match result {
-        Ok(errors) if errors.is_empty() => {
-            CommandResponse::SimpleString("Background saving started".into())
-        }
-        Ok(errors) => CommandResponse::Error(format!("ERR partial save: {}", errors.join("; "))),
-        Err(_) => CommandResponse::Error("ERR bgsave task failed".into()),
+    if errors.is_empty() {
+        CommandResponse::SimpleString("Background saving started".into())
+    } else {
+        CommandResponse::Error(format!("ERR partial save: {}", errors.join("; ")))
     }
 }
 

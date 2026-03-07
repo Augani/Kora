@@ -10,7 +10,7 @@ mod store;
 mod wal_trait;
 
 pub use allocator::ShardAllocator;
-pub use engine::{ShardEngine, SharedEngine};
+pub use engine::{ResponseReceiver, ShardEngine, SharedEngine};
 pub use migration::{MigrationStats, TierConfig, TierMigrator};
 pub use store::ShardStore;
 pub use wal_trait::{WalRecord, WalWriter};
