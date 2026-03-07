@@ -13,6 +13,7 @@ kora-protocol.workspace = true
 kora-storage.workspace = true
 kora-cdc.workspace = true
 kora-scripting.workspace = true
+kora-vector.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

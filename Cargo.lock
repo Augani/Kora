@@ -942,6 +942,7 @@ dependencies = [
  "kora-protocol",
  "kora-scripting",
  "kora-storage",
+ "kora-vector",
  "parking_lot",
  "rand",
  "thiserror 2.0.18",

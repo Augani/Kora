@@ -7,6 +7,8 @@
 
 #![warn(clippy::all)]
 
+use std::collections::HashMap;
+use std::hash::Hasher;
 use std::sync::Arc;
 
 use bytes::BytesMut;
@@ -17,6 +19,8 @@ use kora_protocol::{parse_command, serialize_response_versioned, RespParser};
 use kora_scripting::{FunctionRegistry, WasmRuntime};
 use kora_storage::manager::{StorageConfig, StorageManager};
 use kora_storage::wal::WalEntry;
+use kora_vector::distance::DistanceMetric;
+use kora_vector::hnsw::HnswIndex;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -55,6 +59,7 @@ struct ServerState {
     storage: Option<StorageManager>,
     cdc_rings: Vec<Mutex<CdcRing>>,
     scripts: Mutex<Option<FunctionRegistry>>,
+    vectors: Mutex<HashMap<Vec<u8>, HnswIndex>>,
 }
 
 /// The Kōra TCP server.
@@ -110,6 +115,7 @@ impl KoraServer {
             storage,
             cdc_rings,
             scripts,
+            vectors: Mutex::new(HashMap::new()),
         });
 
         Self {
@@ -239,6 +245,19 @@ async fn handle_command(
         }
         Command::ScriptDel { name } => {
             return handle_script_del(state, name);
+        }
+        Command::VecSet {
+            key,
+            dimensions,
+            vector,
+        } => {
+            return handle_vec_set(state, key, *dimensions, vector);
+        }
+        Command::VecQuery { key, k, vector } => {
+            return handle_vec_query(state, key, *k, vector);
+        }
+        Command::VecDel { key } => {
+            return handle_vec_del(state, key);
         }
         _ => {}
     }
@@ -419,6 +438,69 @@ fn handle_script_del(state: &ServerState, name: &[u8]) -> CommandResponse {
 
     let name_str = String::from_utf8_lossy(name);
     if registry.remove(&name_str) {
+        CommandResponse::Integer(1)
+    } else {
+        CommandResponse::Integer(0)
+    }
+}
+
+/// Handle VECSET — insert a vector into a named index.
+fn handle_vec_set(
+    state: &ServerState,
+    key: &[u8],
+    dimensions: usize,
+    vector: &[f32],
+) -> CommandResponse {
+    let mut indexes = state.vectors.lock();
+    let index = indexes
+        .entry(key.to_vec())
+        .or_insert_with(|| HnswIndex::new(dimensions, DistanceMetric::L2, 16, 200));
+
+    if index.dim() != dimensions {
+        return CommandResponse::Error(format!(
+            "ERR dimension mismatch: index has {}, got {}",
+            index.dim(),
+            dimensions
+        ));
+    }
+
+    let id = {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for &v in vector {
+            hasher.write(&v.to_le_bytes());
+        }
+        hasher.finish()
+    };
+
+    index.insert(id, vector);
+    CommandResponse::Integer(id as i64)
+}
+
+/// Handle VECQUERY — search nearest neighbors in a named index.
+fn handle_vec_query(state: &ServerState, key: &[u8], k: usize, vector: &[f32]) -> CommandResponse {
+    let indexes = state.vectors.lock();
+    let index = match indexes.get(key) {
+        Some(idx) => idx,
+        None => return CommandResponse::Array(vec![]),
+    };
+
+    let results = index.search(vector, k, k.max(50));
+    let items: Vec<CommandResponse> = results
+        .into_iter()
+        .map(|r| {
+            CommandResponse::Array(vec![
+                CommandResponse::Integer(r.id as i64),
+                CommandResponse::BulkString(format!("{}", r.distance).into_bytes()),
+            ])
+        })
+        .collect();
+    CommandResponse::Array(items)
+}
+
+/// Handle VECDEL — delete a vector index.
+fn handle_vec_del(state: &ServerState, key: &[u8]) -> CommandResponse {
+    let mut indexes = state.vectors.lock();
+    if indexes.remove(key).is_some() {
         CommandResponse::Integer(1)
     } else {
         CommandResponse::Integer(0)

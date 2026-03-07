@@ -201,8 +201,8 @@ mod tests {
 
     #[test]
     fn test_serialize_double_resp3() {
-        let resp = CommandResponse::Double(3.14);
-        assert_eq!(serialize_v3(&resp), b",3.14\r\n");
+        let resp = CommandResponse::Double(3.25);
+        assert_eq!(serialize_v3(&resp), b",3.25\r\n");
     }
 
     #[test]

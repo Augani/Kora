@@ -937,7 +937,10 @@ impl ShardStore {
             let entry = KeyEntry::new(key.clone(), Value::List(VecDeque::new()));
             self.entries.insert(key.clone(), entry);
         }
-        match &mut self.entries.get_mut(key).unwrap().value {
+        let entry = self.entries.get_mut(key).ok_or_else(|| {
+            CommandResponse::Error("ERR internal: key not found after insert".into())
+        })?;
+        match &mut entry.value {
             Value::List(deque) => Ok(deque),
             _ => Err(CommandResponse::Error(
                 "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
@@ -953,7 +956,10 @@ impl ShardStore {
             let entry = KeyEntry::new(key.clone(), Value::Hash(HashMap::new()));
             self.entries.insert(key.clone(), entry);
         }
-        match &mut self.entries.get_mut(key).unwrap().value {
+        let entry = self.entries.get_mut(key).ok_or_else(|| {
+            CommandResponse::Error("ERR internal: key not found after insert".into())
+        })?;
+        match &mut entry.value {
             Value::Hash(map) => Ok(map),
             _ => Err(CommandResponse::Error(
                 "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
@@ -969,7 +975,10 @@ impl ShardStore {
             let entry = KeyEntry::new(key.clone(), Value::Set(HashSet::new()));
             self.entries.insert(key.clone(), entry);
         }
-        match &mut self.entries.get_mut(key).unwrap().value {
+        let entry = self.entries.get_mut(key).ok_or_else(|| {
+            CommandResponse::Error("ERR internal: key not found after insert".into())
+        })?;
+        match &mut entry.value {
             Value::Set(set) => Ok(set),
             _ => Err(CommandResponse::Error(
                 "WRONGTYPE Operation against a key holding the wrong kind of value".into(),

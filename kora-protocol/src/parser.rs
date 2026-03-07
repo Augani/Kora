@@ -532,9 +532,9 @@ mod tests {
     #[test]
     fn test_parse_double() {
         let mut parser = RespParser::new();
-        parser.feed(b",3.14\r\n");
+        parser.feed(b",3.25\r\n");
         let val = parser.try_parse().unwrap().unwrap();
-        assert_eq!(val, RespValue::Double(3.14));
+        assert_eq!(val, RespValue::Double(3.25));
     }
 
     #[test]

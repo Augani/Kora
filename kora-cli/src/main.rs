@@ -40,6 +40,14 @@ struct Args {
     /// Data directory for persistence.
     #[arg(long)]
     data_dir: Option<String>,
+
+    /// CDC ring buffer capacity per shard (0 = disabled).
+    #[arg(long)]
+    cdc_capacity: Option<usize>,
+
+    /// WASM scripting fuel budget (0 = disabled).
+    #[arg(long)]
+    script_max_fuel: Option<u64>,
 }
 
 #[tokio::main]
@@ -97,11 +105,18 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let cdc_capacity = args.cdc_capacity.or(file_config.cdc_capacity).unwrap_or(0);
+    let script_max_fuel = args
+        .script_max_fuel
+        .or(file_config.script_max_fuel)
+        .unwrap_or(0);
+
     let config = ServerConfig {
         bind_address: format!("{}:{}", bind, port),
         worker_count,
         storage,
-        ..Default::default()
+        cdc_capacity,
+        script_max_fuel,
     };
 
     tracing::info!(

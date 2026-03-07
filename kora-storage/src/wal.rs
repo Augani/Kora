@@ -345,7 +345,11 @@ fn decode_entry(data: &[u8]) -> Result<WalEntry> {
                 if cursor + 8 > data.len() {
                     return Err(StorageError::CorruptEntry("truncated TTL".into()));
                 }
-                let ms = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                let ms = u64::from_le_bytes(
+                    data[cursor..cursor + 8]
+                        .try_into()
+                        .map_err(|_| StorageError::CorruptEntry("invalid TTL bytes".into()))?,
+                );
                 cursor += 8;
                 Some(ms)
             } else {
@@ -367,7 +371,11 @@ fn decode_entry(data: &[u8]) -> Result<WalEntry> {
             if cursor + 8 > data.len() {
                 return Err(StorageError::CorruptEntry("truncated expire TTL".into()));
             }
-            let ttl_ms = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+            let ttl_ms = u64::from_le_bytes(
+                data[cursor..cursor + 8]
+                    .try_into()
+                    .map_err(|_| StorageError::CorruptEntry("invalid expire TTL bytes".into()))?,
+            );
             Ok(WalEntry::Expire { key, ttl_ms })
         }
         WAL_LPUSH => {
@@ -385,7 +393,11 @@ fn decode_entry(data: &[u8]) -> Result<WalEntry> {
             if cursor + 4 > data.len() {
                 return Err(StorageError::CorruptEntry("truncated hset count".into()));
             }
-            let count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+            let count = u32::from_le_bytes(
+                data[cursor..cursor + 4]
+                    .try_into()
+                    .map_err(|_| StorageError::CorruptEntry("invalid hset count bytes".into()))?,
+            ) as usize;
             cursor += 4;
             let mut fields = Vec::with_capacity(count);
             for _ in 0..count {
@@ -420,7 +432,11 @@ fn read_bytes(data: &[u8], cursor: &mut usize) -> Result<Vec<u8>> {
     if *cursor + 4 > data.len() {
         return Err(StorageError::CorruptEntry("truncated length".into()));
     }
-    let len = u32::from_le_bytes(data[*cursor..*cursor + 4].try_into().unwrap()) as usize;
+    let len = u32::from_le_bytes(
+        data[*cursor..*cursor + 4]
+            .try_into()
+            .map_err(|_| StorageError::CorruptEntry("invalid length bytes".into()))?,
+    ) as usize;
     *cursor += 4;
     if *cursor + len > data.len() {
         return Err(StorageError::CorruptEntry("truncated data".into()));
@@ -442,7 +458,11 @@ fn read_vec_of_bytes(data: &[u8], cursor: &mut usize) -> Result<Vec<Vec<u8>>> {
     if *cursor + 4 > data.len() {
         return Err(StorageError::CorruptEntry("truncated vec count".into()));
     }
-    let count = u32::from_le_bytes(data[*cursor..*cursor + 4].try_into().unwrap()) as usize;
+    let count = u32::from_le_bytes(
+        data[*cursor..*cursor + 4]
+            .try_into()
+            .map_err(|_| StorageError::CorruptEntry("invalid vec count bytes".into()))?,
+    ) as usize;
     *cursor += 4;
     let mut result = Vec::with_capacity(count);
     for _ in 0..count {

@@ -118,7 +118,11 @@ pub fn load(path: impl AsRef<Path>) -> Result<Vec<RdbEntry>> {
 
     // Verify checksum first
     let payload = &data[..data.len() - 4];
-    let stored_crc = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
+    let stored_crc = u32::from_le_bytes(
+        data[data.len() - 4..]
+            .try_into()
+            .map_err(|_| StorageError::InvalidRdb("invalid CRC bytes".into()))?,
+    );
     let computed_crc = crc32fast::hash(payload);
     if stored_crc != computed_crc {
         return Err(StorageError::CrcMismatch {
@@ -136,7 +140,11 @@ pub fn load(path: impl AsRef<Path>) -> Result<Vec<RdbEntry>> {
     cursor += 8;
 
     // Version
-    let version = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+    let version = u32::from_le_bytes(
+        data[cursor..cursor + 4]
+            .try_into()
+            .map_err(|_| StorageError::InvalidRdb("invalid version bytes".into()))?,
+    );
     if version != VERSION {
         return Err(StorageError::InvalidRdb(format!(
             "unsupported version: {}",
@@ -146,7 +154,11 @@ pub fn load(path: impl AsRef<Path>) -> Result<Vec<RdbEntry>> {
     cursor += 4;
 
     // Entry count
-    let num_entries = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap()) as usize;
+    let num_entries = u64::from_le_bytes(
+        data[cursor..cursor + 8]
+            .try_into()
+            .map_err(|_| StorageError::InvalidRdb("invalid entry count bytes".into()))?,
+    ) as usize;
     cursor += 8;
 
     let mut entries = Vec::with_capacity(num_entries);
@@ -309,7 +321,11 @@ fn read_u32(data: &[u8], cursor: &mut usize) -> Result<u32> {
     if *cursor + 4 > data.len() {
         return Err(StorageError::InvalidRdb("unexpected EOF".into()));
     }
-    let val = u32::from_le_bytes(data[*cursor..*cursor + 4].try_into().unwrap());
+    let val = u32::from_le_bytes(
+        data[*cursor..*cursor + 4]
+            .try_into()
+            .map_err(|_| StorageError::InvalidRdb("invalid u32 bytes".into()))?,
+    );
     *cursor += 4;
     Ok(val)
 }
@@ -318,7 +334,11 @@ fn read_u64(data: &[u8], cursor: &mut usize) -> Result<u64> {
     if *cursor + 8 > data.len() {
         return Err(StorageError::InvalidRdb("unexpected EOF".into()));
     }
-    let val = u64::from_le_bytes(data[*cursor..*cursor + 8].try_into().unwrap());
+    let val = u64::from_le_bytes(
+        data[*cursor..*cursor + 8]
+            .try_into()
+            .map_err(|_| StorageError::InvalidRdb("invalid u64 bytes".into()))?,
+    );
     *cursor += 8;
     Ok(val)
 }
@@ -327,7 +347,11 @@ fn read_i64(data: &[u8], cursor: &mut usize) -> Result<i64> {
     if *cursor + 8 > data.len() {
         return Err(StorageError::InvalidRdb("unexpected EOF".into()));
     }
-    let val = i64::from_le_bytes(data[*cursor..*cursor + 8].try_into().unwrap());
+    let val = i64::from_le_bytes(
+        data[*cursor..*cursor + 8]
+            .try_into()
+            .map_err(|_| StorageError::InvalidRdb("invalid i64 bytes".into()))?,
+    );
     *cursor += 8;
     Ok(val)
 }

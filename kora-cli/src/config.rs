@@ -33,6 +33,10 @@ pub struct FileConfig {
     pub log_level: Option<String>,
     /// Storage configuration.
     pub storage: StorageFileConfig,
+    /// CDC ring buffer capacity per shard (0 = disabled).
+    pub cdc_capacity: Option<usize>,
+    /// WASM scripting fuel budget (0 = disabled).
+    pub script_max_fuel: Option<u64>,
 }
 
 /// Storage section of the config file.

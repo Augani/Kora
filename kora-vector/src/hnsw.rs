@@ -163,7 +163,10 @@ impl HnswIndex {
             return;
         }
 
-        let ep = self.entry_point.unwrap();
+        let ep = match self.entry_point {
+            Some(ep) => ep,
+            None => return,
+        };
 
         // Phase 1: Greedily traverse layers above the new node's level
         let mut current_ep = ep;
@@ -185,13 +188,16 @@ impl HnswIndex {
             // Select M nearest neighbors
             let selected: Vec<u64> = candidates.iter().take(m_max).map(|&(_, nid)| nid).collect();
 
-            // Connect new node to selected neighbors
-            self.nodes.get_mut(&id).unwrap().neighbors[lc] = selected.clone();
+            if let Some(node) = self.nodes.get_mut(&id) {
+                node.neighbors[lc] = selected.clone();
+            }
 
             // Connect neighbors back to new node (bidirectional)
             for &neighbor_id in &selected {
                 let needs_prune = {
-                    let neighbor = self.nodes.get_mut(&neighbor_id).unwrap();
+                    let Some(neighbor) = self.nodes.get_mut(&neighbor_id) else {
+                        continue;
+                    };
                     if lc < neighbor.neighbors.len() {
                         neighbor.neighbors[lc].push(id);
                         neighbor.neighbors[lc].len() > m_max
@@ -211,10 +217,12 @@ impl HnswIndex {
                             (dist, nid)
                         })
                         .collect();
-                    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    scored
+                        .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
                     scored.truncate(m_max);
-                    self.nodes.get_mut(&neighbor_id).unwrap().neighbors[lc] =
-                        scored.into_iter().map(|(_, nid)| nid).collect();
+                    if let Some(neighbor) = self.nodes.get_mut(&neighbor_id) {
+                        neighbor.neighbors[lc] = scored.into_iter().map(|(_, nid)| nid).collect();
+                    }
                 }
             }
 
@@ -388,7 +396,7 @@ impl HnswIndex {
             .into_iter()
             .map(|MaxItem(d, id)| (d.0, id))
             .collect();
-        result.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        result.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         result
     }
 }
@@ -495,7 +503,7 @@ mod tests {
             .enumerate()
             .map(|(i, v)| (DistanceMetric::L2.distance(query, v), i as u64))
             .collect();
-        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         let ground_truth: HashSet<u64> = dists.iter().take(k).map(|&(_, id)| id).collect();
 
         let results = index.search(query, k, 100);
