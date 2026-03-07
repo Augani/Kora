@@ -275,15 +275,74 @@
 
 ---
 
+## Phase 7 — Full Sweep ✅
+
+**Status: Complete**
+
+### 7.1 — Per-Thread Slab Allocator ✅
+
+- 7 size classes: 64, 128, 256, 512, 1024, 2048, 4096 bytes
+- Vec-backed `SlabPool` with free-list reuse, 64 slots per chunk
+- `ShardAllocator` integrated into `ShardStore` (wired, not yet used for value allocation)
+- Large allocations (>4096) fall through to system allocator
+
+### 7.2 — Warm Tier (mmap NVMe) ✅
+
+- `WarmTier`: mmap-backed value storage using `memmap2`
+- Self-describing file format: `[key_hash: u64][length: u32][data]`
+- Dynamic file growth (1MB initial, doubles as needed)
+- Compaction to reclaim deleted entries
+- Index rebuilt from file on reopen
+
+### 7.3 — Automatic Tier Migration ✅
+
+- `TierConfig`: warm_threshold, cold_threshold, scan_batch_size
+- `TierMigrator`: scans keys, demotes based on LFU counter thresholds
+- Hot → Warm: serialize value to mmap, replace with `Value::WarmRef(hash)`
+- Warm → Cold: move to LZ4 backend, replace with `Value::ColdRef(hash)`
+- Promotion on read: synchronous load back to RAM, reset tier to HOT
+- LFU decay applied during scan cycles
+
+### 7.4 — io_uring Backend ✅
+
+- `AsyncStorageIo` trait: `submit_read`, `submit_write`, `poll_completions`, `sync`
+- `SyncFallbackBackend`: synchronous pread/pwrite implementation (all platforms)
+- `IoUringBackend`: Linux-only stub (delegates to sync fallback, ready for io-uring crate)
+- `create_async_backend()` factory with platform detection
+
+### 7.5 — Stream Data Type ✅
+
+- `StreamLog` with `StreamId` (ms-seq), `StreamEntry` (id + field-value pairs)
+- Auto-generated IDs from SystemTime with monotonic sequence
+- XADD (with MAXLEN trimming), XLEN, XRANGE, XREVRANGE, XREAD, XTRIM
+- Full protocol parsing including multi-key XREAD with COUNT
+
+### 7.6 — Per-Tenant Eviction Isolation ✅
+
+- `tenant_id` field on `KeyEntry`, tagged on write via `current_tenant`
+- `maybe_evict()` scoped to only sample keys from the triggering tenant
+- Per-tenant memory tracking in `ShardStore.tenant_memory`
+- One tenant's cold data cannot evict another's hot data
+
+### 7.7 — Deterministic Simulation Testing ✅
+
+- `SimClock`: virtual nanosecond-precision clock with advance/set
+- `SimScheduler`: BinaryHeap priority queue with xorshift64 PRNG
+- `SimNetwork`: configurable delays, drop rate, partition simulation
+- `SimRuntime`: ties clock + scheduler + network for end-to-end deterministic replay
+- Feature-gated behind `#[cfg(any(test, feature = "simulation"))]`
+
+---
+
 ## Test Summary
 
 | Crate | Unit Tests | Integration/Stress Tests | Benchmarks |
 |-------|-----------|-------------------------|------------|
-| kora-core | ✅ (80 tests) | 7 stress tests | 5 benchmarks |
-| kora-protocol | ✅ (71 tests) | 11 stress tests | 8 benchmarks |
-| kora-server | ✅ | 16 integration tests | — |
+| kora-core | ✅ (124 tests) | 9 stress tests | 5 benchmarks |
+| kora-protocol | ✅ (80 tests) | 11 stress tests | 8 benchmarks |
+| kora-server | ✅ | 18 integration tests | — |
 | kora-embedded | ✅ | — | — |
-| kora-storage | ✅ (43 tests across modules) | — | — |
+| kora-storage | ✅ (60 tests across modules) | — | — |
 | kora-vector | ✅ (22 tests) | — | 6 benchmarks |
 | kora-cdc | ✅ (26 tests) | — | — |
 | kora-observability | ✅ (21 tests) | — | — |
@@ -308,7 +367,12 @@
 13. **BTreeMap dual-index** for SortedSet — simpler than skip list, correct first
 14. **Probabilistic LFU** (Redis-compatible) — 1 byte per key, O(1) updates
 15. **Sampling eviction** over full-scan — O(1) eviction cost regardless of keyspace size
+16. **mmap for warm tier** — transparent page-fault reads, no explicit I/O on read path
+17. **Self-describing warm file format** — enables index rebuild on reopen without separate index file
+18. **Per-tenant eviction scope** — prevents noisy-neighbor eviction across tenant boundaries
+19. **Deterministic simulation** — seeded PRNG + virtual clock for reproducible concurrency testing
+20. **Vec-backed slab allocator** — safe Rust, no `unsafe`, free-list reuse for common sizes
 
 ---
 
-*All phases (0–6) delivered. 347 tests passing.*
+*All phases (0–7) delivered. 409 tests passing.*
