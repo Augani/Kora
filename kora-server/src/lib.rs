@@ -8,6 +8,7 @@
 #![warn(clippy::all)]
 
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::BytesMut;
@@ -24,8 +25,9 @@ use kora_core::shard::{ShardEngine, WalWriter};
 use kora_core::tenant::{TenantConfig, TenantId, TenantRegistry};
 use kora_observability::histogram::CommandHistograms;
 use kora_observability::prometheus::format_metrics;
-use kora_observability::trie::PrefixTrie;
+use kora_observability::stats::StatsSnapshot;
 use kora_protocol::{parse_command, serialize_response_versioned, RespParser};
+use kora_pubsub::{MessageSink, PubSubBroker, PubSubMessage};
 use kora_scripting::{FunctionRegistry, WasmRuntime};
 use kora_storage::manager::StorageConfig;
 use kora_storage::shard_storage::ShardStorage;
@@ -78,9 +80,12 @@ struct ServerState {
     cdc_groups: Mutex<ConsumerGroupManager>,
     scripts: Mutex<Option<FunctionRegistry>>,
     histograms: Arc<CommandHistograms>,
-    memory_trie: Arc<PrefixTrie>,
+    track_latency: AtomicBool,
+    latency_sums_ns: Arc<[AtomicU64; 32]>,
     tenants: RwLock<TenantRegistry>,
     auth_password: Option<String>,
+    pub_sub: PubSubBroker,
+    next_conn_id: AtomicU64,
 }
 
 /// The Kōra TCP server.
@@ -164,10 +169,12 @@ impl KoraServer {
         let auth_password = config.password.clone();
         let metrics_port = config.metrics_port;
         let histograms = Arc::new(CommandHistograms::new());
-        let memory_trie = Arc::new(PrefixTrie::new());
+        let latency_sums_ns = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
 
         let mut tenant_reg = TenantRegistry::new();
         tenant_reg.register(TenantId(0), TenantConfig::default());
+
+        let pub_sub = PubSubBroker::new(config.worker_count);
 
         let state = Arc::new(ServerState {
             engine,
@@ -176,9 +183,12 @@ impl KoraServer {
             cdc_groups: Mutex::new(ConsumerGroupManager::default()),
             scripts,
             histograms,
-            memory_trie,
+            track_latency: AtomicBool::new(metrics_port > 0),
+            latency_sums_ns,
             tenants: RwLock::new(tenant_reg),
             auth_password,
+            pub_sub,
+            next_conn_id: AtomicU64::new(1),
         });
 
         if metrics_port > 0 {
@@ -257,20 +267,265 @@ impl KoraServer {
     }
 }
 
+struct TokioSink {
+    tx: tokio::sync::mpsc::UnboundedSender<PubSubMessage>,
+}
+
+impl MessageSink for TokioSink {
+    fn send(&self, msg: PubSubMessage) -> bool {
+        self.tx.send(msg).is_ok()
+    }
+}
+
 struct ConnectionState {
     resp3: bool,
     tenant_id: TenantId,
+    conn_id: u64,
+    pubsub_tx: Option<Arc<TokioSink>>,
+    pubsub_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PubSubMessage>>,
+    subscription_count: usize,
+    pattern_count: usize,
 }
 
 use kora_core::shard::ResponseReceiver;
 
 enum PendingResponse {
     Ready(CommandResponse),
+    Deferred(Command),
     Dispatched {
         rx: ResponseReceiver,
-        cmd_id: usize,
-        key: Option<Vec<u8>>,
+        cmd_id: Option<usize>,
     },
+}
+
+type DispatchPrep = (ResponseReceiver, Option<usize>);
+
+fn resolve_pending(
+    pending: Vec<PendingResponse>,
+    histograms: Option<Arc<CommandHistograms>>,
+    latency_sums_ns: Option<Arc<[AtomicU64; 32]>>,
+) -> Vec<CommandResponse> {
+    let mut responses = Vec::with_capacity(pending.len());
+    for item in pending {
+        match item {
+            PendingResponse::Ready(resp) => responses.push(resp),
+            PendingResponse::Deferred(_) => {
+                responses.push(CommandResponse::Error("ERR internal error".into()))
+            }
+            PendingResponse::Dispatched { rx, cmd_id } => {
+                let start = if cmd_id.is_some() && histograms.is_some() {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+
+                let resp = rx
+                    .recv()
+                    .unwrap_or(CommandResponse::Error("ERR internal error".into()));
+
+                if let (Some(cmd_id), Some(histograms), Some(start)) =
+                    (cmd_id, histograms.as_ref(), start)
+                {
+                    let duration_ns = start.elapsed().as_nanos() as u64;
+                    histograms.record(cmd_id, duration_ns);
+                    if let Some(latency_sums_ns) = latency_sums_ns.as_ref() {
+                        if cmd_id < latency_sums_ns.len() {
+                            latency_sums_ns[cmd_id].fetch_add(duration_ns, Ordering::Relaxed);
+                        }
+                    }
+                }
+
+                responses.push(resp);
+            }
+        }
+    }
+    responses
+}
+
+fn resolve_pending_batched(
+    pending: Vec<PendingResponse>,
+    engine: Arc<ShardEngine>,
+) -> Vec<CommandResponse> {
+    let mut responses: Vec<Option<CommandResponse>> = vec![None; pending.len()];
+    let mut deferred_commands = Vec::new();
+    let mut deferred_positions = Vec::new();
+
+    for (idx, item) in pending.into_iter().enumerate() {
+        match item {
+            PendingResponse::Ready(resp) => responses[idx] = Some(resp),
+            PendingResponse::Deferred(cmd) => {
+                deferred_positions.push(idx);
+                deferred_commands.push(cmd);
+            }
+            PendingResponse::Dispatched { rx, .. } => {
+                responses[idx] = Some(
+                    rx.recv()
+                        .unwrap_or(CommandResponse::Error("ERR internal error".into())),
+                );
+            }
+        }
+    }
+
+    if !deferred_commands.is_empty() {
+        let deferred_responses = engine.dispatch_batch_blocking(deferred_commands);
+        for (idx, resp) in deferred_positions
+            .into_iter()
+            .zip(deferred_responses.into_iter())
+        {
+            responses[idx] = Some(resp);
+        }
+    }
+
+    responses
+        .into_iter()
+        .map(|resp| resp.unwrap_or(CommandResponse::Error("ERR internal error".into())))
+        .collect()
+}
+
+fn ensure_pubsub_channel(conn: &mut ConnectionState) -> Arc<TokioSink> {
+    if let Some(ref tx) = conn.pubsub_tx {
+        return tx.clone();
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let sink = Arc::new(TokioSink { tx });
+    conn.pubsub_tx = Some(sink.clone());
+    conn.pubsub_rx = Some(rx);
+    sink
+}
+
+fn write_usize(buf: &mut BytesMut, n: usize) {
+    let mut tmp = [0u8; 20];
+    let s = {
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(&mut tmp[..]);
+        let _ = write!(cursor, "{}", n);
+        cursor.position() as usize
+    };
+    buf.extend_from_slice(&tmp[..s]);
+}
+
+fn write_resp_bulk(buf: &mut BytesMut, data: &[u8]) {
+    buf.extend_from_slice(b"$");
+    write_usize(buf, data.len());
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(data);
+    buf.extend_from_slice(b"\r\n");
+}
+
+fn serialize_pubsub_reply(kind: &[u8], name: &[u8], count: usize, buf: &mut BytesMut) {
+    buf.extend_from_slice(b"*3\r\n");
+    write_resp_bulk(buf, kind);
+    write_resp_bulk(buf, name);
+    buf.extend_from_slice(b":");
+    write_usize(buf, count);
+    buf.extend_from_slice(b"\r\n");
+}
+
+fn serialize_pubsub_message(msg: &PubSubMessage, buf: &mut BytesMut) {
+    match msg {
+        PubSubMessage::Message { channel, data } => {
+            buf.extend_from_slice(b"*3\r\n");
+            buf.extend_from_slice(b"$7\r\nmessage\r\n");
+            write_resp_bulk(buf, channel);
+            write_resp_bulk(buf, data);
+        }
+        PubSubMessage::PatternMessage {
+            pattern,
+            channel,
+            data,
+        } => {
+            buf.extend_from_slice(b"*4\r\n");
+            buf.extend_from_slice(b"$8\r\npmessage\r\n");
+            write_resp_bulk(buf, pattern);
+            write_resp_bulk(buf, channel);
+            write_resp_bulk(buf, data);
+        }
+    }
+}
+
+fn handle_pubsub_command(
+    cmd: &Command,
+    state: &ServerState,
+    conn: &mut ConnectionState,
+    write_buf: &mut BytesMut,
+) -> bool {
+    match cmd {
+        Command::Subscribe { channels } => {
+            let sink = ensure_pubsub_channel(conn);
+            for ch in channels {
+                state.pub_sub.subscribe(ch, conn.conn_id, sink.clone());
+                conn.subscription_count += 1;
+                serialize_pubsub_reply(
+                    b"subscribe",
+                    ch,
+                    conn.subscription_count + conn.pattern_count,
+                    write_buf,
+                );
+            }
+            true
+        }
+        Command::Unsubscribe { channels } => {
+            for ch in channels {
+                if state.pub_sub.unsubscribe(ch, conn.conn_id) {
+                    conn.subscription_count = conn.subscription_count.saturating_sub(1);
+                }
+                serialize_pubsub_reply(
+                    b"unsubscribe",
+                    ch,
+                    conn.subscription_count + conn.pattern_count,
+                    write_buf,
+                );
+            }
+            true
+        }
+        Command::PSubscribe { patterns } => {
+            let sink = ensure_pubsub_channel(conn);
+            for pat in patterns {
+                state.pub_sub.psubscribe(pat, conn.conn_id, sink.clone());
+                conn.pattern_count += 1;
+                serialize_pubsub_reply(
+                    b"psubscribe",
+                    pat,
+                    conn.subscription_count + conn.pattern_count,
+                    write_buf,
+                );
+            }
+            true
+        }
+        Command::PUnsubscribe { patterns } => {
+            for pat in patterns {
+                if state.pub_sub.punsubscribe(pat, conn.conn_id) {
+                    conn.pattern_count = conn.pattern_count.saturating_sub(1);
+                }
+                serialize_pubsub_reply(
+                    b"punsubscribe",
+                    pat,
+                    conn.subscription_count + conn.pattern_count,
+                    write_buf,
+                );
+            }
+            true
+        }
+        Command::Publish { channel, message } => {
+            let count = state.pub_sub.publish(channel, message);
+            write_buf.extend_from_slice(b":");
+            write_usize(write_buf, count);
+            write_buf.extend_from_slice(b"\r\n");
+            true
+        }
+        _ => false,
+    }
+}
+
+fn is_pubsub_allowed_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Subscribe { .. }
+            | Command::Unsubscribe { .. }
+            | Command::PSubscribe { .. }
+            | Command::PUnsubscribe { .. }
+            | Command::Ping { .. }
+    )
 }
 
 async fn handle_stream<S: AsyncReadExt + AsyncWriteExt + Unpin>(
@@ -280,96 +535,206 @@ async fn handle_stream<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     let mut parser = RespParser::new();
     let mut write_buf = BytesMut::with_capacity(4096);
     let mut read_buf = vec![0u8; 8192];
+    let conn_id = state.next_conn_id.fetch_add(1, Ordering::Relaxed);
     let mut conn = ConnectionState {
         resp3: false,
         tenant_id: TenantId(0),
+        conn_id,
+        pubsub_tx: None,
+        pubsub_rx: None,
+        subscription_count: 0,
+        pattern_count: 0,
     };
 
+    let result = handle_stream_inner(
+        &mut stream,
+        &state,
+        &mut parser,
+        &mut write_buf,
+        &mut read_buf,
+        &mut conn,
+    )
+    .await;
+
+    if conn.subscription_count > 0 || conn.pattern_count > 0 {
+        state.pub_sub.remove_connection(conn.conn_id);
+    }
+
+    result
+}
+
+async fn handle_stream_inner<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    stream: &mut S,
+    state: &Arc<ServerState>,
+    parser: &mut RespParser,
+    write_buf: &mut BytesMut,
+    read_buf: &mut [u8],
+    conn: &mut ConnectionState,
+) -> std::io::Result<()> {
     loop {
-        let n = stream.read(&mut read_buf).await?;
-        if n == 0 {
-            return Ok(());
-        }
+        let in_pubsub_mode = conn.subscription_count > 0 || conn.pattern_count > 0;
 
-        parser.feed(&read_buf[..n]);
-
-        let mut pending: Vec<PendingResponse> = Vec::new();
-        let mut has_dispatched = false;
-
-        loop {
-            match parser.try_parse() {
-                Ok(Some(frame)) => match parse_command(frame) {
-                    Ok(cmd) => {
-                        if let Some(resp) = try_handle_local(&cmd, &state, &mut conn) {
-                            pending.push(PendingResponse::Ready(resp));
-                        } else {
-                            match prepare_dispatch(&cmd, &state, &conn) {
-                                Ok((rx, cmd_id, key)) => {
-                                    has_dispatched = true;
-                                    pending.push(PendingResponse::Dispatched { rx, cmd_id, key });
+        if in_pubsub_mode {
+            let rx = conn.pubsub_rx.as_mut().unwrap();
+            tokio::select! {
+                result = stream.read(read_buf) => {
+                    let n = result?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    parser.feed(&read_buf[..n]);
+                    loop {
+                        match parser.try_parse() {
+                            Ok(Some(frame)) => match parse_command(frame) {
+                                Ok(cmd) => {
+                                    if !is_pubsub_allowed_command(&cmd) {
+                                        let resp = CommandResponse::Error(
+                                            "ERR Can't execute in pub/sub mode".into(),
+                                        );
+                                        serialize_response_versioned(&resp, write_buf, conn.resp3);
+                                    } else if handle_pubsub_command(&cmd, state, conn, write_buf) {
+                                    } else if let Some(resp) = try_handle_local(&cmd, state, conn) {
+                                        serialize_response_versioned(&resp, write_buf, conn.resp3);
+                                    }
                                 }
-                                Err(resp) => {
-                                    pending.push(PendingResponse::Ready(resp));
+                                Err(e) => {
+                                    let resp = CommandResponse::Error(e.to_string());
+                                    serialize_response_versioned(&resp, write_buf, conn.resp3);
                                 }
+                            },
+                            Ok(None) => break,
+                            Err(e) => {
+                                let resp = CommandResponse::Error(e.to_string());
+                                serialize_response_versioned(&resp, write_buf, conn.resp3);
+                                break;
                             }
                         }
                     }
+                }
+                msg = rx.recv() => {
+                    match msg {
+                        Some(pubsub_msg) => {
+                            serialize_pubsub_message(&pubsub_msg, write_buf);
+                        }
+                        None => {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        } else {
+            let n = stream.read(read_buf).await?;
+            if n == 0 {
+                return Ok(());
+            }
+
+            parser.feed(&read_buf[..n]);
+
+            let track_latency = state.track_latency.load(Ordering::Relaxed);
+            let mut pending: Vec<PendingResponse> = Vec::new();
+            let mut has_dispatched = false;
+            let mut has_deferred = false;
+            loop {
+                match parser.try_parse() {
+                    Ok(Some(frame)) => match parse_command(frame) {
+                        Ok(cmd) => {
+                            if handle_pubsub_command(&cmd, state, conn, write_buf) {
+                                continue;
+                            }
+
+                            if !track_latency && has_deferred && is_local_command(&cmd) {
+                                let engine = state.engine.clone();
+                                let to_resolve = std::mem::take(&mut pending);
+                                let resolved = tokio::task::spawn_blocking(move || {
+                                    resolve_pending_batched(to_resolve, engine)
+                                })
+                                .await
+                                .unwrap_or_default();
+                                pending.extend(resolved.into_iter().map(PendingResponse::Ready));
+                                has_deferred = false;
+                            }
+
+                            if let Some(resp) = try_handle_local(&cmd, state, conn) {
+                                pending.push(PendingResponse::Ready(resp));
+                            } else if track_latency {
+                                match prepare_dispatch(cmd, state, conn, true) {
+                                    Ok((rx, cmd_id)) => {
+                                        has_dispatched = true;
+                                        pending.push(PendingResponse::Dispatched { rx, cmd_id });
+                                    }
+                                    Err(resp) => {
+                                        pending.push(PendingResponse::Ready(resp));
+                                    }
+                                }
+                            } else {
+                                match prepare_deferred(cmd, state, conn) {
+                                    Ok(cmd) => {
+                                        has_deferred = true;
+                                        pending.push(PendingResponse::Deferred(cmd));
+                                    }
+                                    Err(resp) => {
+                                        pending.push(PendingResponse::Ready(resp));
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            pending.push(PendingResponse::Ready(CommandResponse::Error(
+                                e.to_string(),
+                            )));
+                        }
+                    },
+                    Ok(None) => break,
                     Err(e) => {
                         pending.push(PendingResponse::Ready(CommandResponse::Error(
                             e.to_string(),
                         )));
-                    }
-                },
-                Ok(None) => break,
-                Err(e) => {
-                    pending.push(PendingResponse::Ready(CommandResponse::Error(
-                        e.to_string(),
-                    )));
-                    break;
-                }
-            }
-        }
-
-        if has_dispatched {
-            let histograms = state.histograms.clone();
-            let memory_trie = state.memory_trie.clone();
-            let resolved = tokio::task::spawn_blocking(move || {
-                let mut responses = Vec::with_capacity(pending.len());
-                for item in pending {
-                    match item {
-                        PendingResponse::Ready(resp) => responses.push(resp),
-                        PendingResponse::Dispatched { rx, cmd_id, key } => {
-                            let start = std::time::Instant::now();
-                            let resp = rx
-                                .recv()
-                                .unwrap_or(CommandResponse::Error("ERR internal error".into()));
-                            let duration_ns = start.elapsed().as_nanos() as u64;
-                            histograms.record(cmd_id, duration_ns);
-                            if let Some(k) = key {
-                                memory_trie.track(&k, 1);
-                            }
-                            responses.push(resp);
-                        }
+                        break;
                     }
                 }
-                responses
-            })
-            .await
-            .unwrap_or_default();
-
-            for resp in &resolved {
-                serialize_response_versioned(resp, &mut write_buf, conn.resp3);
             }
-        } else {
-            for item in &pending {
-                if let PendingResponse::Ready(resp) = item {
-                    serialize_response_versioned(resp, &mut write_buf, conn.resp3);
+
+            if has_dispatched {
+                let histograms = if track_latency {
+                    Some(state.histograms.clone())
+                } else {
+                    None
+                };
+                let latency_sums_ns = if track_latency {
+                    Some(state.latency_sums_ns.clone())
+                } else {
+                    None
+                };
+                let resolved = tokio::task::spawn_blocking(move || {
+                    resolve_pending(pending, histograms, latency_sums_ns)
+                })
+                .await
+                .unwrap_or_default();
+
+                for resp in &resolved {
+                    serialize_response_versioned(resp, write_buf, conn.resp3);
+                }
+            } else if has_deferred {
+                let engine = state.engine.clone();
+                let resolved =
+                    tokio::task::spawn_blocking(move || resolve_pending_batched(pending, engine))
+                        .await
+                        .unwrap_or_default();
+
+                for resp in &resolved {
+                    serialize_response_versioned(resp, write_buf, conn.resp3);
+                }
+            } else {
+                for item in &pending {
+                    if let PendingResponse::Ready(resp) = item {
+                        serialize_response_versioned(resp, write_buf, conn.resp3);
+                    }
                 }
             }
         }
 
         if !write_buf.is_empty() {
-            stream.write_all(&write_buf).await?;
+            stream.write_all(write_buf).await?;
             write_buf.clear();
         }
     }
@@ -439,17 +804,69 @@ fn try_handle_local(
         Command::StatsLatency {
             command,
             percentiles,
-        } => Some(handle_stats_latency(state, command, percentiles)),
+        } => {
+            state.track_latency.store(true, Ordering::Relaxed);
+            Some(handle_stats_latency(state, command, percentiles))
+        }
         Command::StatsMemory { prefixes } => Some(handle_stats_memory(state, prefixes)),
         _ => None,
     }
 }
 
+fn is_local_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Hello { .. }
+            | Command::Auth { .. }
+            | Command::BgSave
+            | Command::BgRewriteAof
+            | Command::CommandInfo
+            | Command::CdcPoll { .. }
+            | Command::CdcGroupCreate { .. }
+            | Command::CdcGroupRead { .. }
+            | Command::CdcAck { .. }
+            | Command::CdcPending { .. }
+            | Command::ScriptLoad { .. }
+            | Command::ScriptCall { .. }
+            | Command::ScriptDel { .. }
+            | Command::StatsHotkeys { .. }
+            | Command::StatsLatency { .. }
+            | Command::StatsMemory { .. }
+            | Command::Subscribe { .. }
+            | Command::Unsubscribe { .. }
+            | Command::PSubscribe { .. }
+            | Command::PUnsubscribe { .. }
+            | Command::Publish { .. }
+    )
+}
+
 fn prepare_dispatch(
+    cmd: Command,
+    state: &ServerState,
+    conn: &ConnectionState,
+    track_latency: bool,
+) -> Result<DispatchPrep, CommandResponse> {
+    authorize_dispatch(&cmd, state, conn)?;
+
+    let cmd_id = track_latency.then(|| cmd.cmd_type() as usize);
+    let rx = state.engine.dispatch(cmd);
+    Ok((rx, cmd_id))
+}
+
+fn prepare_deferred(
+    cmd: Command,
+    state: &ServerState,
+    conn: &ConnectionState,
+) -> Result<Command, CommandResponse> {
+    authorize_dispatch(&cmd, state, conn)?;
+    Ok(cmd)
+}
+
+fn authorize_dispatch(
     cmd: &Command,
     state: &ServerState,
     conn: &ConnectionState,
-) -> Result<(ResponseReceiver, usize, Option<Vec<u8>>), CommandResponse> {
+) -> Result<(), CommandResponse> {
     {
         let registry = state.tenants.read();
         let key_count_delta = if cmd.is_mutation() { 1 } else { 0 };
@@ -458,11 +875,7 @@ fn prepare_dispatch(
         }
         registry.record_operation(conn.tenant_id);
     }
-
-    let cmd_id = cmd.cmd_type() as usize;
-    let key_clone = cmd.key().map(|k| k.to_vec());
-    let rx = state.engine.dispatch(cmd.clone());
-    Ok((rx, cmd_id, key_clone))
+    Ok(())
 }
 
 fn handle_hello(version: &Option<u8>, conn: &mut ConnectionState) -> CommandResponse {
@@ -759,20 +1172,47 @@ fn command_name_to_id(name: &str) -> usize {
         "SET" => 1,
         "DEL" => 2,
         "INCR" | "INCRBY" => 3,
-        "MGET" => 4,
+        "DECR" | "DECRBY" => 4,
+        "MGET" => 5,
+        "MSET" => 6,
+        "EXISTS" => 7,
+        "EXPIRE" | "PEXPIRE" => 8,
+        "TTL" | "PTTL" => 9,
         _ => 255,
     }
 }
 
 fn handle_stats_memory(state: &ServerState, prefixes: &[Vec<u8>]) -> CommandResponse {
-    let items: Vec<CommandResponse> = prefixes
-        .iter()
-        .map(|prefix| {
-            let count = state.memory_trie.query(prefix);
-            CommandResponse::Integer(count)
-        })
-        .collect();
-    CommandResponse::Array(items)
+    state.engine.dispatch_blocking(Command::StatsMemory {
+        prefixes: prefixes.to_vec(),
+    })
+}
+
+fn build_metrics_snapshot(state: &ServerState) -> StatsSnapshot {
+    let mut cmd_counts = [0u64; 32];
+    let mut cmd_durations_ns = [0u64; 32];
+    let mut total_commands = 0u64;
+    for i in 0..32 {
+        let count = state.histograms.count(i);
+        cmd_counts[i] = count;
+        cmd_durations_ns[i] = state.latency_sums_ns[i].load(Ordering::Relaxed);
+        total_commands = total_commands.saturating_add(count);
+    }
+
+    let key_count = match state.engine.dispatch_blocking(Command::DbSize) {
+        CommandResponse::Integer(n) if n > 0 => n as u64,
+        _ => 0,
+    };
+
+    StatsSnapshot {
+        total_commands,
+        cmd_counts,
+        cmd_durations_ns,
+        key_count,
+        memory_used: 0,
+        bytes_in: 0,
+        bytes_out: 0,
+    }
 }
 
 async fn run_metrics_server(
@@ -792,7 +1232,7 @@ async fn run_metrics_server(
             let service = service_fn(move |_req: Request<hyper::body::Incoming>| {
                 let state = state.clone();
                 async move {
-                    let snapshot = kora_observability::stats::StatsSnapshot::merge(&[]);
+                    let snapshot = build_metrics_snapshot(&state);
                     let body = format_metrics(&snapshot, &state.histograms);
                     Ok::<_, Infallible>(
                         Response::builder()

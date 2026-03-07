@@ -10,6 +10,7 @@ description = "TCP/Unix socket server, connection handling, and command dispatch
 bytes.workspace = true
 kora-core.workspace = true
 kora-protocol.workspace = true
+kora-pubsub.workspace = true
 kora-storage.workspace = true
 kora-cdc.workspace = true
 kora-scripting.workspace = true
