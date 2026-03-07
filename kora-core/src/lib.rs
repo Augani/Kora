@@ -14,5 +14,11 @@ pub mod error;
 /// Key and value types for the cache engine.
 pub mod types;
 
+/// Command and response types.
+pub mod command;
+
+/// Key hashing and shard routing.
+pub mod hash;
+
 /// Per-thread shard storage and the coordinating engine.
 pub mod shard;
