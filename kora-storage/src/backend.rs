@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::compressor;
-use crate::error::Result;
+use crate::error::{Result, StorageError};
 
 /// A persistent storage backend for cold-tier data.
 ///
@@ -87,26 +87,35 @@ impl FileBackend {
     }
 
     /// Get the number of entries stored.
-    pub fn len(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
-        inner.index.len()
+    pub fn len(&self) -> Result<usize> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::LockPoisoned(e.to_string()))?;
+        Ok(inner.index.len())
     }
 
     /// Check if the backend is empty.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
     }
 
     /// Save the index to disk for fast recovery.
     pub fn save_index(&self) -> Result<()> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::LockPoisoned(e.to_string()))?;
         let index_path = self.data_path.with_extension("idx");
         save_index(&index_path, &inner.index)
     }
 
     /// Compact the data file, removing deleted entries.
     pub fn compact(&self) -> Result<usize> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::LockPoisoned(e.to_string()))?;
         if inner.deleted == 0 {
             return Ok(0);
         }
@@ -154,7 +163,10 @@ impl FileBackend {
 
 impl StorageBackend for FileBackend {
     fn read(&self, key_hash: u64) -> Result<Option<Vec<u8>>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::LockPoisoned(e.to_string()))?;
         let (offset, _length) = match inner.index.get(&key_hash) {
             Some(&entry) => entry,
             None => return Ok(None),
@@ -177,7 +189,10 @@ impl StorageBackend for FileBackend {
 
     fn write(&self, key_hash: u64, value: &[u8]) -> Result<()> {
         let compressed = compressor::compress(value);
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::LockPoisoned(e.to_string()))?;
 
         // If key already exists, mark old space as wasted
         if inner.index.contains_key(&key_hash) {
@@ -199,7 +214,10 @@ impl StorageBackend for FileBackend {
     }
 
     fn delete(&self, key_hash: u64) -> Result<bool> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::LockPoisoned(e.to_string()))?;
         if inner.index.remove(&key_hash).is_some() {
             inner.deleted += 1;
             Ok(true)
@@ -209,7 +227,10 @@ impl StorageBackend for FileBackend {
     }
 
     fn sync(&self) -> Result<()> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::LockPoisoned(e.to_string()))?;
         inner.file.sync_data()?;
         Ok(())
     }
@@ -242,19 +263,38 @@ fn load_index(path: &Path) -> Result<HashMap<u64, (u64, u32)>> {
     }
 
     let mut cursor = 0usize;
-    let count = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap()) as usize;
+    let count = u64::from_le_bytes(
+        data[cursor..cursor + 8]
+            .try_into()
+            .map_err(|_| StorageError::CorruptIndex("invalid entry count".into()))?,
+    ) as usize;
     cursor += 8;
 
     let mut index = HashMap::with_capacity(count);
     for _ in 0..count {
         if cursor + 20 > data.len() {
-            break;
+            return Err(StorageError::CorruptIndex(format!(
+                "truncated index at offset {cursor}, need 20 bytes but only {} remain",
+                data.len() - cursor
+            )));
         }
-        let key_hash = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+        let key_hash = u64::from_le_bytes(
+            data[cursor..cursor + 8]
+                .try_into()
+                .map_err(|_| StorageError::CorruptIndex("invalid key_hash".into()))?,
+        );
         cursor += 8;
-        let offset = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+        let offset = u64::from_le_bytes(
+            data[cursor..cursor + 8]
+                .try_into()
+                .map_err(|_| StorageError::CorruptIndex("invalid offset".into()))?,
+        );
         cursor += 8;
-        let length = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+        let length = u32::from_le_bytes(
+            data[cursor..cursor + 4]
+                .try_into()
+                .map_err(|_| StorageError::CorruptIndex("invalid length".into()))?,
+        );
         cursor += 4;
         index.insert(key_hash, (offset, length));
     }
@@ -325,7 +365,7 @@ mod tests {
             assert_eq!(result, expected.as_bytes());
         }
 
-        assert_eq!(backend.len(), 100);
+        assert_eq!(backend.len().unwrap(), 100);
     }
 
     #[test]
@@ -343,7 +383,7 @@ mod tests {
         // Reopen and verify data is still accessible
         {
             let backend = FileBackend::open(dir.path()).unwrap();
-            assert_eq!(backend.len(), 2);
+            assert_eq!(backend.len().unwrap(), 2);
             assert_eq!(backend.read(42).unwrap(), Some(b"persistent data".to_vec()));
             assert_eq!(backend.read(99).unwrap(), Some(b"more data".to_vec()));
         }

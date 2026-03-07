@@ -13,6 +13,7 @@
 //! - [`backend`] — Cold-tier storage backend (file-based with LZ4 compression)
 //! - [`compressor`] — LZ4 compression utilities
 //! - [`manager`] — Unified storage coordinator
+//! - [`warm_tier`] — Memory-mapped warm tier storage
 //! - [`error`] — Storage error types
 
 #![warn(clippy::all)]
@@ -23,4 +24,7 @@ pub mod compressor;
 pub mod error;
 pub mod manager;
 pub mod rdb;
+#[cfg(feature = "io-uring")]
+pub mod uring_backend;
 pub mod wal;
+pub mod warm_tier;

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::backend::FileBackend;
-use crate::error::Result;
+use crate::error::{Result, StorageError};
 use crate::rdb::{self, RdbEntry};
 use crate::wal::{SyncPolicy, WalEntry, WriteAheadLog};
 
@@ -80,7 +80,9 @@ impl StorageManager {
     /// Log a mutation to the WAL.
     pub fn wal_append(&self, entry: &WalEntry) -> Result<()> {
         if let Some(ref wal) = self.wal {
-            let mut wal = wal.lock().unwrap();
+            let mut wal = wal
+                .lock()
+                .map_err(|e| StorageError::LockPoisoned(e.to_string()))?;
             wal.append(entry)?;
 
             // Auto-rotate if WAL exceeds size limit
@@ -99,7 +101,9 @@ impl StorageManager {
     /// Fsync the WAL.
     pub fn wal_sync(&self) -> Result<()> {
         if let Some(ref wal) = self.wal {
-            wal.lock().unwrap().sync()?;
+            wal.lock()
+                .map_err(|e| StorageError::LockPoisoned(e.to_string()))?
+                .sync()?;
         }
         Ok(())
     }
@@ -119,7 +123,9 @@ impl StorageManager {
     /// Truncate the WAL (e.g., after a successful snapshot).
     pub fn wal_truncate(&self) -> Result<()> {
         if let Some(ref wal) = self.wal {
-            wal.lock().unwrap().truncate()?;
+            wal.lock()
+                .map_err(|e| StorageError::LockPoisoned(e.to_string()))?
+                .truncate()?;
         }
         Ok(())
     }

@@ -1,11 +1,13 @@
-//! Streaming incremental RESP2 parser.
+//! Streaming incremental RESP2/RESP3 parser.
 
 use bytes::BytesMut;
 
 use crate::error::ProtocolError;
 use crate::resp::RespValue;
 
-/// A streaming RESP2 parser that handles incremental data.
+/// A streaming RESP parser that handles incremental data.
+///
+/// Supports both RESP2 and RESP3 wire formats.
 pub struct RespParser {
     buffer: BytesMut,
 }
@@ -67,6 +69,15 @@ fn parse_value(data: &[u8]) -> Result<(RespValue, usize), ProtocolError> {
         b':' => parse_integer(data),
         b'$' => parse_bulk_string(data),
         b'*' => parse_array(data),
+        // RESP3 types
+        b'_' => parse_null(data),
+        b',' => parse_double(data),
+        b'#' => parse_boolean(data),
+        b'%' => parse_map(data),
+        b'~' => parse_set(data),
+        b'(' => parse_big_number(data),
+        b'=' => parse_verbatim_string(data),
+        b'>' => parse_push(data),
         _ => {
             // Try to parse as inline command (plain text like "PING\r\n")
             parse_inline(data)
@@ -173,6 +184,165 @@ fn parse_array(data: &[u8]) -> Result<(RespValue, usize), ProtocolError> {
     }
 
     Ok((RespValue::Array(Some(items)), offset))
+}
+
+// ─── RESP3 parsers ─────────────────────────────────────────────────────
+
+fn parse_null(data: &[u8]) -> Result<(RespValue, usize), ProtocolError> {
+    let crlf_pos = find_crlf(data).ok_or(ProtocolError::Incomplete)?;
+    Ok((RespValue::Null, crlf_pos + 2))
+}
+
+fn parse_double(data: &[u8]) -> Result<(RespValue, usize), ProtocolError> {
+    let crlf_pos = find_crlf(data).ok_or(ProtocolError::Incomplete)?;
+    let s = std::str::from_utf8(&data[1..crlf_pos])
+        .map_err(|_| ProtocolError::InvalidData("invalid double encoding".into()))?;
+
+    let val = match s {
+        "inf" => f64::INFINITY,
+        "-inf" => f64::NEG_INFINITY,
+        _ => s
+            .parse::<f64>()
+            .map_err(|_| ProtocolError::InvalidData(format!("invalid double: {}", s)))?,
+    };
+    Ok((RespValue::Double(val), crlf_pos + 2))
+}
+
+fn parse_boolean(data: &[u8]) -> Result<(RespValue, usize), ProtocolError> {
+    let crlf_pos = find_crlf(data).ok_or(ProtocolError::Incomplete)?;
+    if crlf_pos != 2 {
+        return Err(ProtocolError::InvalidData("invalid boolean".into()));
+    }
+    match data[1] {
+        b't' => Ok((RespValue::Boolean(true), crlf_pos + 2)),
+        b'f' => Ok((RespValue::Boolean(false), crlf_pos + 2)),
+        _ => Err(ProtocolError::InvalidData("invalid boolean value".into())),
+    }
+}
+
+fn parse_map(data: &[u8]) -> Result<(RespValue, usize), ProtocolError> {
+    let crlf_pos = find_crlf(data).ok_or(ProtocolError::Incomplete)?;
+    let len_str = std::str::from_utf8(&data[1..crlf_pos])
+        .map_err(|_| ProtocolError::InvalidData("invalid map length".into()))?;
+    let len: i64 = len_str
+        .parse()
+        .map_err(|_| ProtocolError::InvalidData(format!("invalid map length: {}", len_str)))?;
+
+    if len < 0 {
+        return Err(ProtocolError::InvalidData(format!(
+            "invalid map length: {}",
+            len
+        )));
+    }
+
+    let mut offset = crlf_pos + 2;
+    let mut pairs = Vec::with_capacity(len as usize);
+
+    for _ in 0..len {
+        let (key, consumed_key) = parse_value(&data[offset..])?;
+        offset += consumed_key;
+        let (value, consumed_val) = parse_value(&data[offset..])?;
+        offset += consumed_val;
+        pairs.push((key, value));
+    }
+
+    Ok((RespValue::Map(pairs), offset))
+}
+
+fn parse_set(data: &[u8]) -> Result<(RespValue, usize), ProtocolError> {
+    let crlf_pos = find_crlf(data).ok_or(ProtocolError::Incomplete)?;
+    let len_str = std::str::from_utf8(&data[1..crlf_pos])
+        .map_err(|_| ProtocolError::InvalidData("invalid set length".into()))?;
+    let len: i64 = len_str
+        .parse()
+        .map_err(|_| ProtocolError::InvalidData(format!("invalid set length: {}", len_str)))?;
+
+    if len < 0 {
+        return Err(ProtocolError::InvalidData(format!(
+            "invalid set length: {}",
+            len
+        )));
+    }
+
+    let mut offset = crlf_pos + 2;
+    let mut items = Vec::with_capacity(len as usize);
+
+    for _ in 0..len {
+        let (value, consumed) = parse_value(&data[offset..])?;
+        items.push(value);
+        offset += consumed;
+    }
+
+    Ok((RespValue::Set(items), offset))
+}
+
+fn parse_big_number(data: &[u8]) -> Result<(RespValue, usize), ProtocolError> {
+    let crlf_pos = find_crlf(data).ok_or(ProtocolError::Incomplete)?;
+    let content = data[1..crlf_pos].to_vec();
+    Ok((RespValue::BigNumber(content), crlf_pos + 2))
+}
+
+fn parse_verbatim_string(data: &[u8]) -> Result<(RespValue, usize), ProtocolError> {
+    let crlf_pos = find_crlf(data).ok_or(ProtocolError::Incomplete)?;
+    let len_str = std::str::from_utf8(&data[1..crlf_pos])
+        .map_err(|_| ProtocolError::InvalidData("invalid verbatim string length".into()))?;
+    let len: usize = len_str.parse().map_err(|_| {
+        ProtocolError::InvalidData(format!("invalid verbatim string length: {}", len_str))
+    })?;
+
+    let data_start = crlf_pos + 2;
+    let data_end = data_start + len;
+    let total = data_end + 2;
+
+    if data.len() < total {
+        return Err(ProtocolError::Incomplete);
+    }
+
+    let content = &data[data_start..data_end];
+    if content.len() < 4 || content[3] != b':' {
+        return Err(ProtocolError::InvalidData(
+            "verbatim string missing encoding prefix".into(),
+        ));
+    }
+
+    let mut encoding = [0u8; 3];
+    encoding.copy_from_slice(&content[..3]);
+    let string_data = content[4..].to_vec();
+
+    Ok((
+        RespValue::VerbatimString {
+            encoding,
+            data: string_data,
+        },
+        total,
+    ))
+}
+
+fn parse_push(data: &[u8]) -> Result<(RespValue, usize), ProtocolError> {
+    let crlf_pos = find_crlf(data).ok_or(ProtocolError::Incomplete)?;
+    let len_str = std::str::from_utf8(&data[1..crlf_pos])
+        .map_err(|_| ProtocolError::InvalidData("invalid push length".into()))?;
+    let len: i64 = len_str
+        .parse()
+        .map_err(|_| ProtocolError::InvalidData(format!("invalid push length: {}", len_str)))?;
+
+    if len < 0 {
+        return Err(ProtocolError::InvalidData(format!(
+            "invalid push length: {}",
+            len
+        )));
+    }
+
+    let mut offset = crlf_pos + 2;
+    let mut items = Vec::with_capacity(len as usize);
+
+    for _ in 0..len {
+        let (value, consumed) = parse_value(&data[offset..])?;
+        items.push(value);
+        offset += consumed;
+    }
+
+    Ok((RespValue::Push(items), offset))
 }
 
 fn parse_inline(data: &[u8]) -> Result<(RespValue, usize), ProtocolError> {
@@ -346,6 +516,119 @@ mod tests {
                 RespValue::Array(Some(vec![RespValue::Integer(1)])),
                 RespValue::Array(Some(vec![RespValue::Integer(2)])),
             ]))
+        );
+    }
+
+    // ─── RESP3 tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_null() {
+        let mut parser = RespParser::new();
+        parser.feed(b"_\r\n");
+        let val = parser.try_parse().unwrap().unwrap();
+        assert_eq!(val, RespValue::Null);
+    }
+
+    #[test]
+    fn test_parse_double() {
+        let mut parser = RespParser::new();
+        parser.feed(b",3.14\r\n");
+        let val = parser.try_parse().unwrap().unwrap();
+        assert_eq!(val, RespValue::Double(3.14));
+    }
+
+    #[test]
+    fn test_parse_double_inf() {
+        let mut parser = RespParser::new();
+        parser.feed(b",inf\r\n");
+        let val = parser.try_parse().unwrap().unwrap();
+        assert_eq!(val, RespValue::Double(f64::INFINITY));
+    }
+
+    #[test]
+    fn test_parse_boolean_true() {
+        let mut parser = RespParser::new();
+        parser.feed(b"#t\r\n");
+        let val = parser.try_parse().unwrap().unwrap();
+        assert_eq!(val, RespValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_parse_boolean_false() {
+        let mut parser = RespParser::new();
+        parser.feed(b"#f\r\n");
+        let val = parser.try_parse().unwrap().unwrap();
+        assert_eq!(val, RespValue::Boolean(false));
+    }
+
+    #[test]
+    fn test_parse_map() {
+        let mut parser = RespParser::new();
+        parser.feed(b"%2\r\n+key1\r\n:1\r\n+key2\r\n:2\r\n");
+        let val = parser.try_parse().unwrap().unwrap();
+        assert_eq!(
+            val,
+            RespValue::Map(vec![
+                (
+                    RespValue::SimpleString(b"key1".to_vec()),
+                    RespValue::Integer(1)
+                ),
+                (
+                    RespValue::SimpleString(b"key2".to_vec()),
+                    RespValue::Integer(2)
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_set() {
+        let mut parser = RespParser::new();
+        parser.feed(b"~3\r\n:1\r\n:2\r\n:3\r\n");
+        let val = parser.try_parse().unwrap().unwrap();
+        assert_eq!(
+            val,
+            RespValue::Set(vec![
+                RespValue::Integer(1),
+                RespValue::Integer(2),
+                RespValue::Integer(3),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_big_number() {
+        let mut parser = RespParser::new();
+        parser.feed(b"(12345678901234567890\r\n");
+        let val = parser.try_parse().unwrap().unwrap();
+        assert_eq!(val, RespValue::BigNumber(b"12345678901234567890".to_vec()));
+    }
+
+    #[test]
+    fn test_parse_verbatim_string() {
+        let mut parser = RespParser::new();
+        parser.feed(b"=9\r\ntxt:hello\r\n");
+        let val = parser.try_parse().unwrap().unwrap();
+        assert_eq!(
+            val,
+            RespValue::VerbatimString {
+                encoding: *b"txt",
+                data: b"hello".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_push() {
+        let mut parser = RespParser::new();
+        parser.feed(b">2\r\n+subscribe\r\n+channel\r\n");
+        let val = parser.try_parse().unwrap().unwrap();
+        assert_eq!(
+            val,
+            RespValue::Push(vec![
+                RespValue::SimpleString(b"subscribe".to_vec()),
+                RespValue::SimpleString(b"channel".to_vec()),
+            ])
         );
     }
 }

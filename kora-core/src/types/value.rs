@@ -72,6 +72,57 @@ impl Value {
         }
     }
 
+    /// Serialize this value to bytes for storage/dump purposes.
+    ///
+    /// For string/integer types, returns the raw bytes. For collection types,
+    /// returns a simple serialized representation.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Value::InlineStr { data, len } => data[..*len as usize].to_vec(),
+            Value::HeapStr(arc) => arc.to_vec(),
+            Value::Int(i) => i.to_string().into_bytes(),
+            Value::List(deque) => {
+                let parts: Vec<String> = deque
+                    .iter()
+                    .filter_map(|v| {
+                        v.as_bytes()
+                            .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    })
+                    .collect();
+                parts.join(",").into_bytes()
+            }
+            Value::Set(set) => {
+                let parts: Vec<String> = set
+                    .iter()
+                    .filter_map(|v| {
+                        v.as_bytes()
+                            .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    })
+                    .collect();
+                parts.join(",").into_bytes()
+            }
+            Value::Hash(map) => {
+                let parts: Vec<String> = map
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        v.as_bytes().map(|b| {
+                            format!(
+                                "{}={}",
+                                String::from_utf8_lossy(k.as_bytes()),
+                                String::from_utf8_lossy(&b)
+                            )
+                        })
+                    })
+                    .collect();
+                parts.join(",").into_bytes()
+            }
+            Value::Vector(v) => {
+                let parts: Vec<String> = v.iter().map(|f| f.to_string()).collect();
+                parts.join(",").into_bytes()
+            }
+        }
+    }
+
     /// Returns the type name as used by the Redis TYPE command.
     pub fn type_name(&self) -> &'static str {
         match self {

@@ -8,7 +8,6 @@ description = "Per-key stats, hot-key detection, and memory attribution for Kōr
 
 [dependencies]
 hdrhistogram.workspace = true
-kora-core.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

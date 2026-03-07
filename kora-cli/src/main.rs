@@ -8,6 +8,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use kora_server::{KoraServer, ServerConfig};
+use kora_storage::manager::StorageConfig;
+use kora_storage::wal::SyncPolicy;
 
 use crate::config::FileConfig;
 
@@ -34,6 +36,10 @@ struct Args {
     /// Log level (trace, debug, info, warn, error).
     #[arg(long)]
     log_level: Option<String>,
+
+    /// Data directory for persistence.
+    #[arg(long)]
+    data_dir: Option<String>,
 }
 
 #[tokio::main]
@@ -66,9 +72,36 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Build storage config from file + CLI
+    let data_dir = args.data_dir.or(file_config.storage.data_dir.clone());
+    let storage = data_dir.map(|dir| {
+        let wal_sync = match file_config
+            .storage
+            .wal_sync
+            .as_deref()
+            .unwrap_or("every_second")
+        {
+            "every_write" => SyncPolicy::EveryWrite,
+            "os_managed" => SyncPolicy::OsManaged,
+            _ => SyncPolicy::EverySecond,
+        };
+        StorageConfig {
+            data_dir: PathBuf::from(dir),
+            wal_sync_policy: wal_sync,
+            wal_enabled: file_config.storage.wal_enabled.unwrap_or(true),
+            rdb_enabled: file_config.storage.rdb_enabled.unwrap_or(true),
+            wal_max_bytes: file_config
+                .storage
+                .wal_max_bytes
+                .unwrap_or(64 * 1024 * 1024),
+        }
+    });
+
     let config = ServerConfig {
         bind_address: format!("{}:{}", bind, port),
         worker_count,
+        storage,
+        ..Default::default()
     };
 
     tracing::info!(

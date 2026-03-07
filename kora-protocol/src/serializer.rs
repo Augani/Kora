@@ -1,14 +1,23 @@
-//! RESP2 response serializer.
+//! RESP2/RESP3 response serializer.
 
 use bytes::BytesMut;
 use kora_core::command::CommandResponse;
 use std::fmt::Write;
 
-/// Serialize a CommandResponse into RESP2 wire format.
-pub fn serialize_response(resp: &CommandResponse, buf: &mut BytesMut) {
+/// Serialize a CommandResponse into RESP wire format.
+///
+/// When `resp3` is true, uses native RESP3 types for Map, Set, Double, Boolean.
+/// When `resp3` is false, these types are downgraded to RESP2 equivalents.
+pub fn serialize_response_versioned(resp: &CommandResponse, buf: &mut BytesMut, resp3: bool) {
     match resp {
         CommandResponse::Ok => buf.extend_from_slice(b"+OK\r\n"),
-        CommandResponse::Nil => buf.extend_from_slice(b"$-1\r\n"),
+        CommandResponse::Nil => {
+            if resp3 {
+                buf.extend_from_slice(b"_\r\n");
+            } else {
+                buf.extend_from_slice(b"$-1\r\n");
+            }
+        }
         CommandResponse::Integer(n) => {
             let _ = write!(buf, ":{}\r\n", n);
         }
@@ -25,7 +34,7 @@ pub fn serialize_response(resp: &CommandResponse, buf: &mut BytesMut) {
         CommandResponse::Array(items) => {
             let _ = write!(buf, "*{}\r\n", items.len());
             for item in items {
-                serialize_response(item, buf);
+                serialize_response_versioned(item, buf, resp3);
             }
         }
         CommandResponse::Error(msg) => {
@@ -33,7 +42,73 @@ pub fn serialize_response(resp: &CommandResponse, buf: &mut BytesMut) {
             buf.extend_from_slice(msg.as_bytes());
             buf.extend_from_slice(b"\r\n");
         }
+        CommandResponse::Map(pairs) => {
+            if resp3 {
+                let _ = write!(buf, "%{}\r\n", pairs.len());
+                for (k, v) in pairs {
+                    serialize_response_versioned(k, buf, resp3);
+                    serialize_response_versioned(v, buf, resp3);
+                }
+            } else {
+                // Downgrade to flat array for RESP2
+                let _ = write!(buf, "*{}\r\n", pairs.len() * 2);
+                for (k, v) in pairs {
+                    serialize_response_versioned(k, buf, false);
+                    serialize_response_versioned(v, buf, false);
+                }
+            }
+        }
+        CommandResponse::Set(items) => {
+            if resp3 {
+                let _ = write!(buf, "~{}\r\n", items.len());
+                for item in items {
+                    serialize_response_versioned(item, buf, resp3);
+                }
+            } else {
+                // Downgrade to array for RESP2
+                let _ = write!(buf, "*{}\r\n", items.len());
+                for item in items {
+                    serialize_response_versioned(item, buf, false);
+                }
+            }
+        }
+        CommandResponse::Double(val) => {
+            if resp3 {
+                if val.is_infinite() {
+                    if val.is_sign_positive() {
+                        buf.extend_from_slice(b",inf\r\n");
+                    } else {
+                        buf.extend_from_slice(b",-inf\r\n");
+                    }
+                } else {
+                    let _ = write!(buf, ",{}\r\n", val);
+                }
+            } else {
+                // Downgrade to bulk string for RESP2
+                let s = val.to_string();
+                let _ = write!(buf, "${}\r\n", s.len());
+                buf.extend_from_slice(s.as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            }
+        }
+        CommandResponse::Boolean(b) => {
+            if resp3 {
+                if *b {
+                    buf.extend_from_slice(b"#t\r\n");
+                } else {
+                    buf.extend_from_slice(b"#f\r\n");
+                }
+            } else {
+                // Downgrade to integer for RESP2
+                let _ = write!(buf, ":{}\r\n", if *b { 1 } else { 0 });
+            }
+        }
     }
+}
+
+/// Serialize a CommandResponse into RESP2 wire format (default).
+pub fn serialize_response(resp: &CommandResponse, buf: &mut BytesMut) {
+    serialize_response_versioned(resp, buf, false);
 }
 
 #[cfg(test)]
@@ -46,6 +121,12 @@ mod tests {
         buf.to_vec()
     }
 
+    fn serialize_v3(resp: &CommandResponse) -> Vec<u8> {
+        let mut buf = BytesMut::new();
+        serialize_response_versioned(resp, &mut buf, true);
+        buf.to_vec()
+    }
+
     #[test]
     fn test_serialize_ok() {
         assert_eq!(serialize(&CommandResponse::Ok), b"+OK\r\n");
@@ -54,6 +135,11 @@ mod tests {
     #[test]
     fn test_serialize_nil() {
         assert_eq!(serialize(&CommandResponse::Nil), b"$-1\r\n");
+    }
+
+    #[test]
+    fn test_serialize_nil_resp3() {
+        assert_eq!(serialize_v3(&CommandResponse::Nil), b"_\r\n");
     }
 
     #[test]
@@ -84,5 +170,50 @@ mod tests {
             CommandResponse::BulkString(b"b".to_vec()),
         ]);
         assert_eq!(serialize(&resp), b"*2\r\n$1\r\na\r\n$1\r\nb\r\n");
+    }
+
+    #[test]
+    fn test_serialize_map_resp3() {
+        let resp = CommandResponse::Map(vec![(
+            CommandResponse::SimpleString("key".into()),
+            CommandResponse::Integer(1),
+        )]);
+        assert_eq!(serialize_v3(&resp), b"%1\r\n+key\r\n:1\r\n");
+    }
+
+    #[test]
+    fn test_serialize_map_resp2_downgrade() {
+        let resp = CommandResponse::Map(vec![(
+            CommandResponse::SimpleString("key".into()),
+            CommandResponse::Integer(1),
+        )]);
+        assert_eq!(serialize(&resp), b"*2\r\n+key\r\n:1\r\n");
+    }
+
+    #[test]
+    fn test_serialize_set_resp3() {
+        let resp = CommandResponse::Set(vec![
+            CommandResponse::Integer(1),
+            CommandResponse::Integer(2),
+        ]);
+        assert_eq!(serialize_v3(&resp), b"~2\r\n:1\r\n:2\r\n");
+    }
+
+    #[test]
+    fn test_serialize_double_resp3() {
+        let resp = CommandResponse::Double(3.14);
+        assert_eq!(serialize_v3(&resp), b",3.14\r\n");
+    }
+
+    #[test]
+    fn test_serialize_boolean_resp3() {
+        assert_eq!(serialize_v3(&CommandResponse::Boolean(true)), b"#t\r\n");
+        assert_eq!(serialize_v3(&CommandResponse::Boolean(false)), b"#f\r\n");
+    }
+
+    #[test]
+    fn test_serialize_boolean_resp2_downgrade() {
+        assert_eq!(serialize(&CommandResponse::Boolean(true)), b":1\r\n");
+        assert_eq!(serialize(&CommandResponse::Boolean(false)), b":0\r\n");
     }
 }

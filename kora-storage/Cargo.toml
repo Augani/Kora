@@ -17,9 +17,12 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { workspace = true, optional = true }
+
 [dev-dependencies]
 tempfile = "3"
 
 [features]
 default = []
-io-uring = []
+io-uring = ["dep:io-uring"]

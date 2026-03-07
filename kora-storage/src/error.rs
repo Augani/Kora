@@ -29,6 +29,14 @@ pub enum StorageError {
     /// A compression/decompression error occurred.
     #[error("compression error: {0}")]
     Compression(String),
+
+    /// A mutex lock was poisoned (another thread panicked while holding it).
+    #[error("lock poisoned: {0}")]
+    LockPoisoned(String),
+
+    /// The index file has an invalid format.
+    #[error("corrupt index: {0}")]
+    CorruptIndex(String),
 }
 
 /// Convenience result type for storage operations.

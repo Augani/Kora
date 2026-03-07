@@ -40,6 +40,7 @@ async fn start_server(port: u16) -> tokio::sync::watch::Sender<bool> {
     let config = ServerConfig {
         bind_address: format!("127.0.0.1:{}", port),
         worker_count: 2,
+        ..Default::default()
     };
     let server = KoraServer::new(config);
     tokio::spawn(async move {

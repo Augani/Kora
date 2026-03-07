@@ -298,6 +298,83 @@ pub enum Command {
         /// Optional section filter.
         section: Option<String>,
     },
+    /// BGSAVE — trigger a background RDB snapshot.
+    BgSave,
+    /// BGREWRITEAOF — trigger a WAL rewrite.
+    BgRewriteAof,
+    /// FLUSHALL — flush all databases.
+    FlushAll,
+    /// COMMAND — returns info about commands (stub).
+    CommandInfo,
+    /// HELLO \[protover\] — protocol version negotiation (RESP3).
+    Hello {
+        /// Requested protocol version (2 or 3).
+        version: Option<u8>,
+    },
+    /// AUTH \[tenant\] password — authenticate / set tenant.
+    Auth {
+        /// Optional tenant identifier.
+        tenant: Option<Vec<u8>>,
+        /// Password.
+        password: Vec<u8>,
+    },
+    /// DUMP — extract all key-value entries from a shard (internal).
+    Dump,
+
+    // -- CDC commands --
+    /// CDCPOLL cursor count — poll CDC events from a shard.
+    CdcPoll {
+        /// Cursor position (sequence number).
+        cursor: u64,
+        /// Maximum events to return.
+        count: usize,
+    },
+
+    // -- Vector commands --
+    /// VECSET key dim v1 v2 ... — store a vector.
+    VecSet {
+        /// The key.
+        key: Vec<u8>,
+        /// Vector dimensions.
+        dimensions: usize,
+        /// The vector components.
+        vector: Vec<f32>,
+    },
+    /// VECQUERY key k v1 v2 ... — query nearest neighbors.
+    VecQuery {
+        /// The index key.
+        key: Vec<u8>,
+        /// Number of neighbors.
+        k: usize,
+        /// Query vector.
+        vector: Vec<f32>,
+    },
+    /// VECDEL key — delete a vector.
+    VecDel {
+        /// The key.
+        key: Vec<u8>,
+    },
+
+    // -- Scripting commands --
+    /// SCRIPTLOAD name wasm\_bytes — load a WASM module.
+    ScriptLoad {
+        /// Function name.
+        name: Vec<u8>,
+        /// WASM module bytes.
+        wasm_bytes: Vec<u8>,
+    },
+    /// SCRIPTCALL name \[args...\] — call a loaded WASM function.
+    ScriptCall {
+        /// Function name.
+        name: Vec<u8>,
+        /// Integer arguments.
+        args: Vec<i64>,
+    },
+    /// SCRIPTDEL name — unload a WASM module.
+    ScriptDel {
+        /// Function name.
+        name: Vec<u8>,
+    },
 }
 
 impl Command {
@@ -338,7 +415,10 @@ impl Command {
             | Command::SRem { key, .. }
             | Command::SMembers { key }
             | Command::SIsMember { key, .. }
-            | Command::SCard { key } => Some(key),
+            | Command::SCard { key }
+            | Command::VecSet { key, .. }
+            | Command::VecQuery { key, .. }
+            | Command::VecDel { key } => Some(key),
             _ => None,
         }
     }
@@ -363,9 +443,87 @@ impl Command {
                 | Command::Info { .. }
                 | Command::DbSize
                 | Command::FlushDb
+                | Command::FlushAll
                 | Command::Keys { .. }
                 | Command::Scan { .. }
+                | Command::BgSave
+                | Command::BgRewriteAof
+                | Command::CommandInfo
+                | Command::Hello { .. }
+                | Command::Auth { .. }
+                | Command::Dump
+                | Command::CdcPoll { .. }
+                | Command::ScriptLoad { .. }
+                | Command::ScriptCall { .. }
+                | Command::ScriptDel { .. }
         )
+    }
+
+    /// Returns true if this command mutates data (for WAL logging).
+    pub fn is_mutation(&self) -> bool {
+        matches!(
+            self,
+            Command::Set { .. }
+                | Command::GetSet { .. }
+                | Command::Append { .. }
+                | Command::Incr { .. }
+                | Command::Decr { .. }
+                | Command::IncrBy { .. }
+                | Command::DecrBy { .. }
+                | Command::MSet { .. }
+                | Command::SetNx { .. }
+                | Command::Del { .. }
+                | Command::Expire { .. }
+                | Command::PExpire { .. }
+                | Command::Persist { .. }
+                | Command::FlushDb
+                | Command::FlushAll
+                | Command::LPush { .. }
+                | Command::RPush { .. }
+                | Command::LPop { .. }
+                | Command::RPop { .. }
+                | Command::HSet { .. }
+                | Command::HDel { .. }
+                | Command::HIncrBy { .. }
+                | Command::SAdd { .. }
+                | Command::SRem { .. }
+                | Command::VecSet { .. }
+                | Command::VecDel { .. }
+        )
+    }
+
+    /// Return a numeric type index for stats tracking.
+    pub fn cmd_type(&self) -> u8 {
+        match self {
+            Command::Get { .. } => 0,
+            Command::Set { .. } => 1,
+            Command::Del { .. } => 2,
+            Command::Incr { .. } | Command::IncrBy { .. } => 3,
+            Command::Decr { .. } | Command::DecrBy { .. } => 4,
+            Command::MGet { .. } => 5,
+            Command::MSet { .. } => 6,
+            Command::Exists { .. } => 7,
+            Command::Expire { .. } | Command::PExpire { .. } => 8,
+            Command::Ttl { .. } | Command::PTtl { .. } => 9,
+            Command::LPush { .. } => 10,
+            Command::RPush { .. } => 11,
+            Command::LPop { .. } => 12,
+            Command::RPop { .. } => 13,
+            Command::HSet { .. } => 14,
+            Command::HGet { .. } => 15,
+            Command::HGetAll { .. } => 16,
+            Command::SAdd { .. } => 17,
+            Command::SRem { .. } => 18,
+            Command::Ping { .. } => 19,
+            Command::Info { .. } => 20,
+            Command::DbSize => 21,
+            Command::FlushDb | Command::FlushAll => 22,
+            Command::Keys { .. } | Command::Scan { .. } => 23,
+            Command::VecSet { .. } => 24,
+            Command::VecQuery { .. } => 25,
+            Command::ScriptCall { .. } => 26,
+            _ => 31,
+        }
     }
 
     /// Get the TTL duration from EX/PX options.
@@ -395,4 +553,12 @@ pub enum CommandResponse {
     Array(Vec<CommandResponse>),
     /// Error message
     Error(String),
+    /// RESP3 Map (key-value pairs)
+    Map(Vec<(CommandResponse, CommandResponse)>),
+    /// RESP3 Set (unique values)
+    Set(Vec<CommandResponse>),
+    /// RESP3 Double (floating-point)
+    Double(f64),
+    /// RESP3 Boolean
+    Boolean(bool),
 }
