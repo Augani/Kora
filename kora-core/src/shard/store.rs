@@ -245,7 +245,16 @@ impl ShardStore {
             Command::Decr { key } => self.cmd_incrby(&key, -1),
             Command::IncrBy { key, delta } => self.cmd_incrby(&key, delta),
             Command::DecrBy { key, delta } => self.cmd_incrby(&key, -delta),
-            Command::SetNx { key, value } => self.cmd_set(&key, &value, None, None, true, false),
+            Command::SetNx { key, value } => {
+                let compact = CompactKey::new(&key);
+                let key_exists = self.entries.contains_key(&compact) && !self.is_expired(&compact);
+                if key_exists {
+                    CommandResponse::Integer(0)
+                } else {
+                    self.cmd_set(&key, &value, None, None, false, false);
+                    CommandResponse::Integer(1)
+                }
+            }
 
             // Key commands
             Command::Del { keys } => {
@@ -2137,7 +2146,7 @@ mod tests {
             key: b"k".to_vec(),
             value: b"v2".to_vec(),
         });
-        assert!(matches!(resp, CommandResponse::Nil));
+        assert!(matches!(resp, CommandResponse::Integer(0)));
         // Original value unchanged
         match store.execute(Command::Get { key: b"k".to_vec() }) {
             CommandResponse::BulkString(v) => assert_eq!(v, b"v1"),
