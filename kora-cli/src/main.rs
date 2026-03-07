@@ -52,6 +52,10 @@ struct Args {
     /// Port for Prometheus metrics HTTP endpoint (0 = disabled).
     #[arg(long)]
     metrics_port: Option<u16>,
+
+    /// Unix socket path.
+    #[arg(long)]
+    unix_socket: Option<String>,
 }
 
 #[tokio::main]
@@ -116,6 +120,10 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(0);
 
     let metrics_port = args.metrics_port.or(file_config.metrics_port).unwrap_or(0);
+    let unix_socket = args
+        .unix_socket
+        .or(file_config.unix_socket)
+        .map(PathBuf::from);
 
     let config = ServerConfig {
         bind_address: format!("{}:{}", bind, port),
@@ -124,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
         cdc_capacity,
         script_max_fuel,
         metrics_port,
+        unix_socket,
     };
 
     tracing::info!(

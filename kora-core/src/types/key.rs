@@ -128,6 +128,32 @@ impl KeyEntry {
     pub fn clear_ttl(&mut self) {
         self.ttl = None;
     }
+
+    /// Update the LFU counter on access using Redis's probabilistic increment.
+    ///
+    /// P(increment) = 1 / (counter * LFU\_LOG\_FACTOR + 1), where LFU\_LOG\_FACTOR = 10.
+    pub fn touch_lfu(&mut self) {
+        let counter = self.lfu_counter;
+        if counter < 255 {
+            let p = 1.0 / ((counter as f64) * 10.0 + 1.0);
+            let r = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+                % 1000) as f64
+                / 1000.0;
+            if r < p {
+                self.lfu_counter = counter.saturating_add(1);
+            }
+        }
+    }
+
+    /// Decay the LFU counter based on elapsed time since last access.
+    ///
+    /// Decrements the counter by `elapsed_minutes` (like Redis lfu-decay-time=1).
+    pub fn decay_lfu(&mut self, elapsed_minutes: u32) {
+        self.lfu_counter = self.lfu_counter.saturating_sub(elapsed_minutes as u8);
+    }
 }
 
 #[cfg(test)]
@@ -180,5 +206,25 @@ mod tests {
         let mut entry = KeyEntry::new(CompactKey::new(b"k"), Value::Int(1));
         entry.ttl = Some(Instant::now() - Duration::from_secs(1));
         assert!(entry.is_expired());
+    }
+
+    #[test]
+    fn test_touch_lfu() {
+        let mut entry = KeyEntry::new(CompactKey::new(b"k"), Value::Int(1));
+        assert_eq!(entry.lfu_counter, 5);
+        for _ in 0..1000 {
+            entry.touch_lfu();
+        }
+        assert!(entry.lfu_counter >= 5);
+    }
+
+    #[test]
+    fn test_decay_lfu() {
+        let mut entry = KeyEntry::new(CompactKey::new(b"k"), Value::Int(1));
+        entry.lfu_counter = 20;
+        entry.decay_lfu(5);
+        assert_eq!(entry.lfu_counter, 15);
+        entry.decay_lfu(100);
+        assert_eq!(entry.lfu_counter, 0);
     }
 }

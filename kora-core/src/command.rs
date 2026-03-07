@@ -414,6 +414,115 @@ pub enum Command {
         name: Vec<u8>,
     },
 
+    // -- Sorted Set commands --
+    /// ZADD key score member \[score member ...\]
+    ZAdd {
+        /// The key.
+        key: Vec<u8>,
+        /// Score-member pairs.
+        members: Vec<(f64, Vec<u8>)>,
+    },
+    /// ZREM key member \[member ...\]
+    ZRem {
+        /// The key.
+        key: Vec<u8>,
+        /// Members to remove.
+        members: Vec<Vec<u8>>,
+    },
+    /// ZSCORE key member
+    ZScore {
+        /// The key.
+        key: Vec<u8>,
+        /// The member.
+        member: Vec<u8>,
+    },
+    /// ZRANK key member
+    ZRank {
+        /// The key.
+        key: Vec<u8>,
+        /// The member.
+        member: Vec<u8>,
+    },
+    /// ZREVRANK key member
+    ZRevRank {
+        /// The key.
+        key: Vec<u8>,
+        /// The member.
+        member: Vec<u8>,
+    },
+    /// ZCARD key
+    ZCard {
+        /// The key.
+        key: Vec<u8>,
+    },
+    /// ZRANGE key start stop \[WITHSCORES\]
+    ZRange {
+        /// The key.
+        key: Vec<u8>,
+        /// Start index (0-based, negative from end).
+        start: i64,
+        /// Stop index (inclusive, negative from end).
+        stop: i64,
+        /// Whether to include scores in output.
+        withscores: bool,
+    },
+    /// ZREVRANGE key start stop \[WITHSCORES\]
+    ZRevRange {
+        /// The key.
+        key: Vec<u8>,
+        /// Start index (0-based, negative from end).
+        start: i64,
+        /// Stop index (inclusive, negative from end).
+        stop: i64,
+        /// Whether to include scores in output.
+        withscores: bool,
+    },
+    /// ZRANGEBYSCORE key min max \[WITHSCORES\] \[LIMIT offset count\]
+    ZRangeByScore {
+        /// The key.
+        key: Vec<u8>,
+        /// Minimum score (inclusive).
+        min: f64,
+        /// Maximum score (inclusive).
+        max: f64,
+        /// Whether to include scores in output.
+        withscores: bool,
+        /// Optional offset for LIMIT.
+        offset: Option<usize>,
+        /// Optional count for LIMIT.
+        count: Option<usize>,
+    },
+    /// ZINCRBY key increment member
+    ZIncrBy {
+        /// The key.
+        key: Vec<u8>,
+        /// The increment amount.
+        delta: f64,
+        /// The member.
+        member: Vec<u8>,
+    },
+    /// ZCOUNT key min max
+    ZCount {
+        /// The key.
+        key: Vec<u8>,
+        /// Minimum score (inclusive).
+        min: f64,
+        /// Maximum score (inclusive).
+        max: f64,
+    },
+
+    // -- Object commands --
+    /// OBJECT FREQ key — return the LFU frequency counter.
+    ObjectFreq {
+        /// The key.
+        key: Vec<u8>,
+    },
+    /// OBJECT ENCODING key — return the encoding type.
+    ObjectEncoding {
+        /// The key.
+        key: Vec<u8>,
+    },
+
     // -- Stats commands --
     /// STATS.HOTKEYS count — return top hot keys.
     StatsHotkeys {
@@ -473,8 +582,21 @@ impl Command {
             | Command::SMembers { key }
             | Command::SIsMember { key, .. }
             | Command::SCard { key }
+            | Command::ZAdd { key, .. }
+            | Command::ZRem { key, .. }
+            | Command::ZScore { key, .. }
+            | Command::ZRank { key, .. }
+            | Command::ZRevRank { key, .. }
+            | Command::ZCard { key }
+            | Command::ZRange { key, .. }
+            | Command::ZRevRange { key, .. }
+            | Command::ZRangeByScore { key, .. }
+            | Command::ZIncrBy { key, .. }
+            | Command::ZCount { key, .. }
             | Command::VecSet { key, .. }
-            | Command::VecDel { key } => Some(key),
+            | Command::VecDel { key }
+            | Command::ObjectFreq { key }
+            | Command::ObjectEncoding { key } => Some(key),
             Command::VecQuery { .. } => None,
             _ => None,
         }
@@ -551,6 +673,9 @@ impl Command {
                 | Command::HIncrBy { .. }
                 | Command::SAdd { .. }
                 | Command::SRem { .. }
+                | Command::ZAdd { .. }
+                | Command::ZRem { .. }
+                | Command::ZIncrBy { .. }
                 | Command::VecSet { .. }
                 | Command::VecDel { .. }
         )
@@ -586,7 +711,18 @@ impl Command {
             Command::VecSet { .. } => 24,
             Command::VecQuery { .. } => 25,
             Command::ScriptCall { .. } => 26,
-            _ => 31,
+            Command::ZAdd { .. } => 27,
+            Command::ZRange { .. } | Command::ZRevRange { .. } | Command::ZRangeByScore { .. } => {
+                28
+            }
+            Command::ZScore { .. }
+            | Command::ZRank { .. }
+            | Command::ZRevRank { .. }
+            | Command::ZCard { .. }
+            | Command::ZCount { .. } => 29,
+            Command::ZRem { .. } | Command::ZIncrBy { .. } => 30,
+            Command::ObjectFreq { .. } | Command::ObjectEncoding { .. } => 31,
+            _ => 32,
         }
     }
 

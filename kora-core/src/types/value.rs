@@ -1,6 +1,6 @@
 //! The core `Value` enum representing all data types in Kōra.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::types::CompactKey;
@@ -36,6 +36,9 @@ pub enum Value {
 
     /// Dense float vector for similarity search.
     Vector(Box<[f32]>),
+
+    /// Sorted set with dual index: member→score and score→members for O(log N) operations.
+    SortedSet(BTreeMap<Vec<u8>, f64>),
 }
 
 impl Value {
@@ -120,6 +123,44 @@ impl Value {
                 let parts: Vec<String> = v.iter().map(|f| f.to_string()).collect();
                 parts.join(",").into_bytes()
             }
+            Value::SortedSet(map) => {
+                let parts: Vec<String> = map
+                    .iter()
+                    .map(|(member, score)| format!("{}={}", String::from_utf8_lossy(member), score))
+                    .collect();
+                parts.join(",").into_bytes()
+            }
+        }
+    }
+
+    /// Returns an estimate of the memory footprint of this value in bytes.
+    pub fn estimated_size(&self) -> usize {
+        match self {
+            Value::InlineStr { .. } => std::mem::size_of::<Self>(),
+            Value::HeapStr(arc) => std::mem::size_of::<Self>() + arc.len(),
+            Value::Int(_) => std::mem::size_of::<Self>(),
+            Value::List(deque) => {
+                std::mem::size_of::<Self>()
+                    + deque.iter().map(|v| v.estimated_size()).sum::<usize>()
+            }
+            Value::Set(set) => {
+                std::mem::size_of::<Self>() + set.iter().map(|v| v.estimated_size()).sum::<usize>()
+            }
+            Value::Hash(map) => {
+                std::mem::size_of::<Self>()
+                    + map
+                        .iter()
+                        .map(|(k, v)| k.as_bytes().len() + v.estimated_size())
+                        .sum::<usize>()
+            }
+            Value::Vector(v) => std::mem::size_of::<Self>() + v.len() * 4,
+            Value::SortedSet(map) => {
+                std::mem::size_of::<Self>()
+                    + map
+                        .keys()
+                        .map(|member| member.len() + std::mem::size_of::<f64>())
+                        .sum::<usize>()
+            }
         }
     }
 
@@ -131,6 +172,7 @@ impl Value {
             Value::Set(_) => "set",
             Value::Hash(_) => "hash",
             Value::Vector(_) => "vector",
+            Value::SortedSet(_) => "zset",
         }
     }
 }

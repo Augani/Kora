@@ -1,6 +1,6 @@
 //! Per-shard key-value store with full Redis command execution.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use crate::command::{Command, CommandResponse};
@@ -21,6 +21,9 @@ use kora_vector::hnsw::HnswIndex;
 pub struct ShardStore {
     entries: HashMap<CompactKey, KeyEntry>,
     shard_id: u16,
+    max_memory: usize,
+    memory_used: usize,
+    eviction_counter: u64,
     #[cfg(feature = "observability")]
     stats: ShardStats,
     #[cfg(feature = "vector")]
@@ -33,6 +36,9 @@ impl ShardStore {
         Self {
             entries: HashMap::new(),
             shard_id,
+            max_memory: 0,
+            memory_used: 0,
+            eviction_counter: 0,
             #[cfg(feature = "observability")]
             stats: ShardStats::new(),
             #[cfg(feature = "vector")]
@@ -61,6 +67,16 @@ impl ShardStore {
         self.entries.is_empty()
     }
 
+    /// Set the maximum memory limit for this shard (0 = unlimited).
+    pub fn set_max_memory(&mut self, bytes: usize) {
+        self.max_memory = bytes;
+    }
+
+    /// Get the maximum memory limit for this shard.
+    pub fn max_memory(&self) -> usize {
+        self.max_memory
+    }
+
     /// Remove all expired keys, returning the count removed.
     pub fn evict_expired(&mut self) -> usize {
         let before = self.entries.len();
@@ -86,7 +102,22 @@ impl ShardStore {
             self.stats.record_key_access(key);
         }
 
+        if cmd.is_mutation() {
+            self.maybe_evict();
+        }
+
+        let is_read = !cmd.is_mutation();
+        let cmd_key = if is_read {
+            cmd.key().map(|k| k.to_vec())
+        } else {
+            None
+        };
+
         let response = self.execute_inner(cmd);
+
+        if let Some(key) = cmd_key {
+            self.touch_key(&key);
+        }
 
         #[cfg(feature = "observability")]
         {
@@ -173,6 +204,36 @@ impl ShardStore {
             Command::SIsMember { key, member } => self.cmd_sismember(&key, &member),
             Command::SCard { key } => self.cmd_scard(&key),
 
+            // Sorted set commands
+            Command::ZAdd { key, members } => self.cmd_zadd(&key, &members),
+            Command::ZRem { key, members } => self.cmd_zrem(&key, &members),
+            Command::ZScore { key, member } => self.cmd_zscore(&key, &member),
+            Command::ZRank { key, member } => self.cmd_zrank(&key, &member, false),
+            Command::ZRevRank { key, member } => self.cmd_zrank(&key, &member, true),
+            Command::ZCard { key } => self.cmd_zcard(&key),
+            Command::ZRange {
+                key,
+                start,
+                stop,
+                withscores,
+            } => self.cmd_zrange(&key, start, stop, withscores, false),
+            Command::ZRevRange {
+                key,
+                start,
+                stop,
+                withscores,
+            } => self.cmd_zrange(&key, start, stop, withscores, true),
+            Command::ZRangeByScore {
+                key,
+                min,
+                max,
+                withscores,
+                offset,
+                count,
+            } => self.cmd_zrangebyscore(&key, min, max, withscores, offset, count),
+            Command::ZIncrBy { key, delta, member } => self.cmd_zincrby(&key, delta, &member),
+            Command::ZCount { key, min, max } => self.cmd_zcount(&key, min, max),
+
             // Server commands
             Command::Ping { message } => match message {
                 Some(msg) => CommandResponse::BulkString(msg),
@@ -227,6 +288,35 @@ impl ShardStore {
             Command::VecQuery { key, k, vector } => self.cmd_vec_query(&key, k, &vector),
             #[cfg(feature = "vector")]
             Command::VecDel { key } => self.cmd_vec_del(&key),
+
+            // Object commands
+            Command::ObjectFreq { ref key } => {
+                let compact = CompactKey::new(key);
+                match self.entries.get(&compact) {
+                    Some(entry) if !entry.is_expired() => {
+                        CommandResponse::Integer(entry.lfu_counter as i64)
+                    }
+                    _ => CommandResponse::Nil,
+                }
+            }
+            Command::ObjectEncoding { ref key } => {
+                let compact = CompactKey::new(key);
+                match self.entries.get(&compact) {
+                    Some(entry) if !entry.is_expired() => {
+                        let encoding = match &entry.value {
+                            Value::InlineStr { .. } => "embstr",
+                            Value::HeapStr(_) => "raw",
+                            Value::Int(_) => "int",
+                            Value::List(_) => "linkedlist",
+                            Value::Hash(_) => "hashtable",
+                            Value::Set(_) => "hashtable",
+                            _ => "unknown",
+                        };
+                        CommandResponse::BulkString(encoding.as_bytes().to_vec())
+                    }
+                    _ => CommandResponse::Nil,
+                }
+            }
 
             // Commands handled at server/engine level — should not reach here
             Command::BgSave
@@ -944,6 +1034,238 @@ impl ShardStore {
         }
     }
 
+    // ─── Sorted Set operations ────────────────────────────────────────
+
+    fn cmd_zadd(&mut self, key: &[u8], members: &[(f64, Vec<u8>)]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        let zset = self.get_or_create_sorted_set(&compact);
+        match zset {
+            Ok(map) => {
+                let mut added = 0i64;
+                for (score, member) in members {
+                    if map.insert(member.clone(), *score).is_none() {
+                        added += 1;
+                    }
+                }
+                CommandResponse::Integer(added)
+            }
+            Err(e) => e,
+        }
+    }
+
+    fn cmd_zrem(&mut self, key: &[u8], members: &[Vec<u8>]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        let (count, is_empty) = match self.entries.get_mut(&compact) {
+            Some(entry) => match &mut entry.value {
+                Value::SortedSet(map) => {
+                    let c = members.iter().filter(|m| map.remove(*m).is_some()).count();
+                    (c as i64, map.is_empty())
+                }
+                _ => {
+                    return CommandResponse::Error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                    )
+                }
+            },
+            None => return CommandResponse::Integer(0),
+        };
+        if is_empty {
+            self.entries.remove(&compact);
+        }
+        CommandResponse::Integer(count)
+    }
+
+    fn cmd_zscore(&mut self, key: &[u8], member: &[u8]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::SortedSet(map) => match map.get(member) {
+                    Some(score) => CommandResponse::BulkString(format!("{}", score).into_bytes()),
+                    None => CommandResponse::Nil,
+                },
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Nil,
+        }
+    }
+
+    fn cmd_zrank(&mut self, key: &[u8], member: &[u8], reverse: bool) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::SortedSet(map) => {
+                    if !map.contains_key(member) {
+                        return CommandResponse::Nil;
+                    }
+                    let mut sorted: Vec<(&Vec<u8>, &f64)> = map.iter().collect();
+                    sorted.sort_by(|a, b| {
+                        a.1.partial_cmp(b.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.0.cmp(b.0))
+                    });
+                    if reverse {
+                        sorted.reverse();
+                    }
+                    match sorted.iter().position(|(m, _)| m.as_slice() == member) {
+                        Some(pos) => CommandResponse::Integer(pos as i64),
+                        None => CommandResponse::Nil,
+                    }
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Nil,
+        }
+    }
+
+    fn cmd_zcard(&mut self, key: &[u8]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::SortedSet(map) => CommandResponse::Integer(map.len() as i64),
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Integer(0),
+        }
+    }
+
+    fn cmd_zrange(
+        &mut self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+        withscores: bool,
+        reverse: bool,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::SortedSet(map) => {
+                    let mut sorted: Vec<(&Vec<u8>, &f64)> = map.iter().collect();
+                    sorted.sort_by(|a, b| {
+                        a.1.partial_cmp(b.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.0.cmp(b.0))
+                    });
+                    if reverse {
+                        sorted.reverse();
+                    }
+                    let len = sorted.len() as i64;
+                    let s = normalize_index(start, len);
+                    let e = normalize_index(stop, len);
+                    if s > e || s >= len as usize {
+                        return CommandResponse::Array(vec![]);
+                    }
+                    let e = e.min(len as usize - 1);
+                    let mut results = Vec::new();
+                    for (member, score) in &sorted[s..=e] {
+                        results.push(CommandResponse::BulkString(member.to_vec()));
+                        if withscores {
+                            results.push(CommandResponse::BulkString(
+                                format!("{}", score).into_bytes(),
+                            ));
+                        }
+                    }
+                    CommandResponse::Array(results)
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Array(vec![]),
+        }
+    }
+
+    fn cmd_zrangebyscore(
+        &mut self,
+        key: &[u8],
+        min: f64,
+        max: f64,
+        withscores: bool,
+        offset: Option<usize>,
+        count: Option<usize>,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::SortedSet(map) => {
+                    let mut sorted: Vec<(&Vec<u8>, &f64)> = map
+                        .iter()
+                        .filter(|(_, s)| **s >= min && **s <= max)
+                        .collect();
+                    sorted.sort_by(|a, b| {
+                        a.1.partial_cmp(b.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.0.cmp(b.0))
+                    });
+                    let off = offset.unwrap_or(0);
+                    let iter: Box<dyn Iterator<Item = &(&Vec<u8>, &f64)>> = if let Some(c) = count {
+                        Box::new(sorted.iter().skip(off).take(c))
+                    } else {
+                        Box::new(sorted.iter().skip(off))
+                    };
+                    let mut results = Vec::new();
+                    for (member, score) in iter {
+                        results.push(CommandResponse::BulkString(member.to_vec()));
+                        if withscores {
+                            results.push(CommandResponse::BulkString(
+                                format!("{}", score).into_bytes(),
+                            ));
+                        }
+                    }
+                    CommandResponse::Array(results)
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Array(vec![]),
+        }
+    }
+
+    fn cmd_zincrby(&mut self, key: &[u8], delta: f64, member: &[u8]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        let zset = self.get_or_create_sorted_set(&compact);
+        match zset {
+            Ok(map) => {
+                let new_score = map.get(member).copied().unwrap_or(0.0) + delta;
+                map.insert(member.to_vec(), new_score);
+                CommandResponse::BulkString(format!("{}", new_score).into_bytes())
+            }
+            Err(e) => e,
+        }
+    }
+
+    fn cmd_zcount(&mut self, key: &[u8], min: f64, max: f64) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::SortedSet(map) => {
+                    let count = map.values().filter(|s| **s >= min && **s <= max).count();
+                    CommandResponse::Integer(count as i64)
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Integer(0),
+        }
+    }
+
     // ─── Vector operations ────────────────────────────────────────────
 
     #[cfg(feature = "vector")]
@@ -1020,6 +1342,93 @@ impl ShardStore {
             .is_some_and(|entry| entry.is_expired())
     }
 
+    /// Update the LFU counter for a key on read access.
+    fn touch_key(&mut self, key: &[u8]) {
+        if let Some(entry) = self.entries.get_mut(&CompactKey::new(key)) {
+            entry.touch_lfu();
+        }
+    }
+
+    /// Evict keys using LFU sampling when memory pressure is detected.
+    ///
+    /// Samples 5 random keys and evicts the one with the lowest LFU counter.
+    fn maybe_evict(&mut self) {
+        if self.max_memory == 0 || self.memory_used < self.max_memory {
+            return;
+        }
+
+        let sample_size = 5usize;
+        let entry_count = self.entries.len();
+        if entry_count == 0 {
+            return;
+        }
+
+        self.eviction_counter = self.eviction_counter.wrapping_add(1);
+        let start = (self.eviction_counter as usize).wrapping_mul(self.shard_id as usize + 1)
+            % entry_count.max(1);
+
+        let mut lowest_counter = u8::MAX;
+        let mut lowest_key: Option<CompactKey> = None;
+
+        for (i, (key, entry)) in self.entries.iter().enumerate() {
+            if i < start {
+                continue;
+            }
+            if i >= start + sample_size {
+                break;
+            }
+            if entry.lfu_counter < lowest_counter {
+                lowest_counter = entry.lfu_counter;
+                lowest_key = Some(key.clone());
+            }
+        }
+
+        if lowest_key.is_none() {
+            for (key, entry) in self.entries.iter().take(sample_size) {
+                if entry.lfu_counter < lowest_counter {
+                    lowest_counter = entry.lfu_counter;
+                    lowest_key = Some(key.clone());
+                }
+            }
+        }
+
+        if let Some(key) = lowest_key {
+            let removed_size = self.estimate_entry_size(&key);
+            self.entries.remove(&key);
+            self.memory_used = self.memory_used.saturating_sub(removed_size);
+        }
+    }
+
+    /// Estimate the memory footprint of a single entry.
+    fn estimate_entry_size(&self, key: &CompactKey) -> usize {
+        let key_size = key.as_bytes().len() + std::mem::size_of::<CompactKey>();
+        let value_size = self
+            .entries
+            .get(key)
+            .map(|e| Self::estimate_value_size(&e.value))
+            .unwrap_or(0);
+        key_size + value_size + std::mem::size_of::<KeyEntry>()
+    }
+
+    /// Rough estimate of value memory usage.
+    fn estimate_value_size(value: &Value) -> usize {
+        match value {
+            Value::InlineStr { .. } | Value::Int(_) => std::mem::size_of::<Value>(),
+            Value::HeapStr(arc) => std::mem::size_of::<Value>() + arc.len(),
+            Value::List(deque) => {
+                std::mem::size_of::<VecDeque<Value>>() + deque.len() * std::mem::size_of::<Value>()
+            }
+            Value::Hash(map) => {
+                std::mem::size_of::<HashMap<CompactKey, Value>>()
+                    + map.len() * (std::mem::size_of::<CompactKey>() + std::mem::size_of::<Value>())
+            }
+            Value::Set(set) => {
+                std::mem::size_of::<HashSet<Value>>() + set.len() * std::mem::size_of::<Value>()
+            }
+            _ => std::mem::size_of::<Value>(),
+        }
+    }
+
     fn get_or_create_list(
         &mut self,
         key: &CompactKey,
@@ -1052,6 +1461,25 @@ impl ShardStore {
         })?;
         match &mut entry.value {
             Value::Hash(map) => Ok(map),
+            _ => Err(CommandResponse::Error(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+            )),
+        }
+    }
+
+    fn get_or_create_sorted_set(
+        &mut self,
+        key: &CompactKey,
+    ) -> Result<&mut BTreeMap<Vec<u8>, f64>, CommandResponse> {
+        if !self.entries.contains_key(key) {
+            let entry = KeyEntry::new(key.clone(), Value::SortedSet(BTreeMap::new()));
+            self.entries.insert(key.clone(), entry);
+        }
+        let entry = self.entries.get_mut(key).ok_or_else(|| {
+            CommandResponse::Error("ERR internal: key not found after insert".into())
+        })?;
+        match &mut entry.value {
+            Value::SortedSet(map) => Ok(map),
             _ => Err(CommandResponse::Error(
                 "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
             )),
@@ -1551,5 +1979,413 @@ mod tests {
             store.execute(Command::DbSize),
             CommandResponse::Integer(0)
         ));
+    }
+
+    #[test]
+    fn test_lfu_counter_starts_at_5() {
+        let mut store = ShardStore::new(0);
+        store.execute(Command::Set {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            ex: None,
+            px: None,
+            nx: false,
+            xx: false,
+        });
+        match store.execute(Command::ObjectFreq { key: b"k".to_vec() }) {
+            CommandResponse::Integer(n) => assert_eq!(n, 5),
+            other => panic!("Expected Integer(5), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_lfu_counter_increments_on_access() {
+        let mut store = ShardStore::new(0);
+        store.execute(Command::Set {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            ex: None,
+            px: None,
+            nx: false,
+            xx: false,
+        });
+        for _ in 0..100 {
+            store.execute(Command::Get { key: b"k".to_vec() });
+        }
+        match store.execute(Command::ObjectFreq { key: b"k".to_vec() }) {
+            CommandResponse::Integer(n) => assert!(n >= 5, "LFU counter should be >= 5, got {}", n),
+            other => panic!("Expected Integer, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_eviction_removes_least_frequent_key() {
+        let mut store = ShardStore::new(0);
+        store.set_max_memory(1);
+
+        store.execute(Command::Set {
+            key: b"cold".to_vec(),
+            value: b"val".to_vec(),
+            ex: None,
+            px: None,
+            nx: false,
+            xx: false,
+        });
+
+        for _ in 0..50 {
+            store.execute(Command::Get {
+                key: b"cold".to_vec(),
+            });
+        }
+
+        store.execute(Command::Set {
+            key: b"hot".to_vec(),
+            value: b"val".to_vec(),
+            ex: None,
+            px: None,
+            nx: false,
+            xx: false,
+        });
+
+        for _ in 0..200 {
+            store.execute(Command::Get {
+                key: b"hot".to_vec(),
+            });
+        }
+
+        store.execute(Command::Set {
+            key: b"trigger".to_vec(),
+            value: b"val".to_vec(),
+            ex: None,
+            px: None,
+            nx: false,
+            xx: false,
+        });
+
+        assert!(
+            store.len() < 4,
+            "Eviction should have removed at least one key"
+        );
+    }
+
+    #[test]
+    fn test_object_freq_command() {
+        let mut store = ShardStore::new(0);
+        assert!(matches!(
+            store.execute(Command::ObjectFreq {
+                key: b"missing".to_vec()
+            }),
+            CommandResponse::Nil
+        ));
+        store.execute(Command::Set {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            ex: None,
+            px: None,
+            nx: false,
+            xx: false,
+        });
+        match store.execute(Command::ObjectFreq { key: b"k".to_vec() }) {
+            CommandResponse::Integer(n) => assert!(n >= 0),
+            other => panic!("Expected Integer, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_object_encoding_command() {
+        let mut store = ShardStore::new(0);
+        store.execute(Command::Set {
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+            ex: None,
+            px: None,
+            nx: false,
+            xx: false,
+        });
+        match store.execute(Command::ObjectEncoding { key: b"k".to_vec() }) {
+            CommandResponse::BulkString(v) => {
+                let encoding = String::from_utf8(v).unwrap_or_default();
+                assert!(
+                    encoding == "embstr" || encoding == "raw" || encoding == "int",
+                    "Unexpected encoding: {}",
+                    encoding
+                );
+            }
+            other => panic!("Expected BulkString, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_zadd_and_zscore() {
+        let mut store = ShardStore::new(0);
+        let resp = store.execute(Command::ZAdd {
+            key: b"zs".to_vec(),
+            members: vec![
+                (1.0, b"alice".to_vec()),
+                (2.0, b"bob".to_vec()),
+                (3.0, b"charlie".to_vec()),
+            ],
+        });
+        assert_eq!(resp, CommandResponse::Integer(3));
+        match store.execute(Command::ZScore {
+            key: b"zs".to_vec(),
+            member: b"bob".to_vec(),
+        }) {
+            CommandResponse::BulkString(v) => assert_eq!(v, b"2"),
+            other => panic!("Expected BulkString, got {:?}", other),
+        }
+        assert!(matches!(
+            store.execute(Command::ZScore {
+                key: b"zs".to_vec(),
+                member: b"unknown".to_vec(),
+            }),
+            CommandResponse::Nil
+        ));
+    }
+
+    #[test]
+    fn test_zadd_update_score() {
+        let mut store = ShardStore::new(0);
+        store.execute(Command::ZAdd {
+            key: b"zs".to_vec(),
+            members: vec![(1.0, b"alice".to_vec())],
+        });
+        let resp = store.execute(Command::ZAdd {
+            key: b"zs".to_vec(),
+            members: vec![(5.0, b"alice".to_vec())],
+        });
+        assert_eq!(resp, CommandResponse::Integer(0));
+        match store.execute(Command::ZScore {
+            key: b"zs".to_vec(),
+            member: b"alice".to_vec(),
+        }) {
+            CommandResponse::BulkString(v) => assert_eq!(v, b"5"),
+            other => panic!("Expected BulkString(5), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_zrem() {
+        let mut store = ShardStore::new(0);
+        store.execute(Command::ZAdd {
+            key: b"zs".to_vec(),
+            members: vec![
+                (1.0, b"a".to_vec()),
+                (2.0, b"b".to_vec()),
+                (3.0, b"c".to_vec()),
+            ],
+        });
+        let resp = store.execute(Command::ZRem {
+            key: b"zs".to_vec(),
+            members: vec![b"a".to_vec(), b"c".to_vec(), b"nonexistent".to_vec()],
+        });
+        assert_eq!(resp, CommandResponse::Integer(2));
+        assert_eq!(
+            store.execute(Command::ZCard {
+                key: b"zs".to_vec()
+            }),
+            CommandResponse::Integer(1)
+        );
+    }
+
+    #[test]
+    fn test_zrank_and_zrevrank() {
+        let mut store = ShardStore::new(0);
+        store.execute(Command::ZAdd {
+            key: b"zs".to_vec(),
+            members: vec![
+                (10.0, b"a".to_vec()),
+                (20.0, b"b".to_vec()),
+                (30.0, b"c".to_vec()),
+            ],
+        });
+        assert_eq!(
+            store.execute(Command::ZRank {
+                key: b"zs".to_vec(),
+                member: b"a".to_vec(),
+            }),
+            CommandResponse::Integer(0)
+        );
+        assert_eq!(
+            store.execute(Command::ZRank {
+                key: b"zs".to_vec(),
+                member: b"c".to_vec(),
+            }),
+            CommandResponse::Integer(2)
+        );
+        assert_eq!(
+            store.execute(Command::ZRevRank {
+                key: b"zs".to_vec(),
+                member: b"c".to_vec(),
+            }),
+            CommandResponse::Integer(0)
+        );
+        assert!(matches!(
+            store.execute(Command::ZRank {
+                key: b"zs".to_vec(),
+                member: b"missing".to_vec(),
+            }),
+            CommandResponse::Nil
+        ));
+    }
+
+    #[test]
+    fn test_zrange_and_zrevrange() {
+        let mut store = ShardStore::new(0);
+        store.execute(Command::ZAdd {
+            key: b"zs".to_vec(),
+            members: vec![
+                (1.0, b"a".to_vec()),
+                (2.0, b"b".to_vec()),
+                (3.0, b"c".to_vec()),
+            ],
+        });
+        match store.execute(Command::ZRange {
+            key: b"zs".to_vec(),
+            start: 0,
+            stop: -1,
+            withscores: false,
+        }) {
+            CommandResponse::Array(items) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0], CommandResponse::BulkString(b"a".to_vec()));
+                assert_eq!(items[2], CommandResponse::BulkString(b"c".to_vec()));
+            }
+            other => panic!("Expected Array, got {:?}", other),
+        }
+        match store.execute(Command::ZRevRange {
+            key: b"zs".to_vec(),
+            start: 0,
+            stop: 1,
+            withscores: true,
+        }) {
+            CommandResponse::Array(items) => {
+                assert_eq!(items.len(), 4);
+                assert_eq!(items[0], CommandResponse::BulkString(b"c".to_vec()));
+                assert_eq!(items[1], CommandResponse::BulkString(b"3".to_vec()));
+                assert_eq!(items[2], CommandResponse::BulkString(b"b".to_vec()));
+            }
+            other => panic!("Expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_zrangebyscore() {
+        let mut store = ShardStore::new(0);
+        store.execute(Command::ZAdd {
+            key: b"zs".to_vec(),
+            members: vec![
+                (1.0, b"a".to_vec()),
+                (2.0, b"b".to_vec()),
+                (3.0, b"c".to_vec()),
+                (4.0, b"d".to_vec()),
+            ],
+        });
+        match store.execute(Command::ZRangeByScore {
+            key: b"zs".to_vec(),
+            min: 2.0,
+            max: 3.0,
+            withscores: false,
+            offset: None,
+            count: None,
+        }) {
+            CommandResponse::Array(items) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0], CommandResponse::BulkString(b"b".to_vec()));
+                assert_eq!(items[1], CommandResponse::BulkString(b"c".to_vec()));
+            }
+            other => panic!("Expected Array, got {:?}", other),
+        }
+        match store.execute(Command::ZRangeByScore {
+            key: b"zs".to_vec(),
+            min: 1.0,
+            max: 4.0,
+            withscores: false,
+            offset: Some(1),
+            count: Some(2),
+        }) {
+            CommandResponse::Array(items) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0], CommandResponse::BulkString(b"b".to_vec()));
+                assert_eq!(items[1], CommandResponse::BulkString(b"c".to_vec()));
+            }
+            other => panic!("Expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_zincrby() {
+        let mut store = ShardStore::new(0);
+        store.execute(Command::ZAdd {
+            key: b"zs".to_vec(),
+            members: vec![(10.0, b"a".to_vec())],
+        });
+        match store.execute(Command::ZIncrBy {
+            key: b"zs".to_vec(),
+            delta: 5.0,
+            member: b"a".to_vec(),
+        }) {
+            CommandResponse::BulkString(v) => assert_eq!(v, b"15"),
+            other => panic!("Expected BulkString, got {:?}", other),
+        }
+        match store.execute(Command::ZIncrBy {
+            key: b"zs".to_vec(),
+            delta: 3.0,
+            member: b"newmember".to_vec(),
+        }) {
+            CommandResponse::BulkString(v) => assert_eq!(v, b"3"),
+            other => panic!("Expected BulkString, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_zcount() {
+        let mut store = ShardStore::new(0);
+        store.execute(Command::ZAdd {
+            key: b"zs".to_vec(),
+            members: vec![
+                (1.0, b"a".to_vec()),
+                (2.0, b"b".to_vec()),
+                (3.0, b"c".to_vec()),
+                (4.0, b"d".to_vec()),
+            ],
+        });
+        assert_eq!(
+            store.execute(Command::ZCount {
+                key: b"zs".to_vec(),
+                min: 2.0,
+                max: 3.0,
+            }),
+            CommandResponse::Integer(2)
+        );
+        assert_eq!(
+            store.execute(Command::ZCount {
+                key: b"zs".to_vec(),
+                min: f64::NEG_INFINITY,
+                max: f64::INFINITY,
+            }),
+            CommandResponse::Integer(4)
+        );
+    }
+
+    #[test]
+    fn test_zcard() {
+        let mut store = ShardStore::new(0);
+        assert_eq!(
+            store.execute(Command::ZCard {
+                key: b"zs".to_vec()
+            }),
+            CommandResponse::Integer(0)
+        );
+        store.execute(Command::ZAdd {
+            key: b"zs".to_vec(),
+            members: vec![(1.0, b"a".to_vec()), (2.0, b"b".to_vec())],
+        });
+        assert_eq!(
+            store.execute(Command::ZCard {
+                key: b"zs".to_vec()
+            }),
+            CommandResponse::Integer(2)
+        );
     }
 }

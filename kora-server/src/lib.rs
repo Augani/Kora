@@ -21,6 +21,7 @@ use kora_cdc::consumer::ConsumerGroupManager;
 use kora_cdc::ring::CdcRing;
 use kora_core::command::{Command, CommandResponse};
 use kora_core::shard::{ShardEngine, WalWriter};
+use kora_core::tenant::{TenantConfig, TenantId, TenantRegistry};
 use kora_observability::histogram::CommandHistograms;
 use kora_observability::prometheus::format_metrics;
 use kora_observability::trie::PrefixTrie;
@@ -28,9 +29,9 @@ use kora_protocol::{parse_command, serialize_response_versioned, RespParser};
 use kora_scripting::{FunctionRegistry, WasmRuntime};
 use kora_storage::manager::StorageConfig;
 use kora_storage::shard_storage::ShardStorage;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UnixListener};
 
 /// Configuration for the Kōra server.
 pub struct ServerConfig {
@@ -46,6 +47,8 @@ pub struct ServerConfig {
     pub script_max_fuel: u64,
     /// Port for Prometheus metrics HTTP endpoint (0 = disabled).
     pub metrics_port: u16,
+    /// Optional Unix socket path.
+    pub unix_socket: Option<std::path::PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -59,6 +62,7 @@ impl Default for ServerConfig {
             cdc_capacity: 0,
             script_max_fuel: 0,
             metrics_port: 0,
+            unix_socket: None,
         }
     }
 }
@@ -72,12 +76,14 @@ struct ServerState {
     scripts: Mutex<Option<FunctionRegistry>>,
     histograms: Arc<CommandHistograms>,
     memory_trie: Arc<PrefixTrie>,
+    tenants: RwLock<TenantRegistry>,
 }
 
 /// The Kōra TCP server.
 pub struct KoraServer {
     state: Arc<ServerState>,
     bind_address: String,
+    unix_socket: Option<std::path::PathBuf>,
 }
 
 /// Create per-shard WAL writers from server configuration.
@@ -150,9 +156,13 @@ impl KoraServer {
         };
 
         let bind_address = config.bind_address.clone();
+        let unix_socket = config.unix_socket.clone();
         let metrics_port = config.metrics_port;
         let histograms = Arc::new(CommandHistograms::new());
         let memory_trie = Arc::new(PrefixTrie::new());
+
+        let mut tenant_reg = TenantRegistry::new();
+        tenant_reg.register(TenantId(0), TenantConfig::default());
 
         let state = Arc::new(ServerState {
             engine,
@@ -162,6 +172,7 @@ impl KoraServer {
             scripts,
             histograms,
             memory_trie,
+            tenants: RwLock::new(tenant_reg),
         });
 
         if metrics_port > 0 {
@@ -176,6 +187,7 @@ impl KoraServer {
         Self {
             state,
             bind_address,
+            unix_socket,
         }
     }
 
@@ -192,15 +204,39 @@ impl KoraServer {
         let listener = TcpListener::bind(&self.bind_address).await?;
         tracing::info!("Kōra listening on {}", self.bind_address);
 
+        let unix_listener = if let Some(ref path) = self.unix_socket {
+            let _ = std::fs::remove_file(path);
+            let ul = UnixListener::bind(path)?;
+            tracing::info!("Kōra listening on unix:{}", path.display());
+            Some(ul)
+        } else {
+            None
+        };
+
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     let (stream, addr) = result?;
                     let state = self.state.clone();
-                    tracing::debug!("New connection from {}", addr);
+                    tracing::debug!("New TCP connection from {}", addr);
                     tokio::spawn(async move {
                         if let Err(e) = handle_connection(stream, state).await {
                             tracing::debug!("Connection {} error: {}", addr, e);
+                        }
+                    });
+                }
+                result = async {
+                    match &unix_listener {
+                        Some(ul) => ul.accept().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let (stream, _addr) = result?;
+                    let state = self.state.clone();
+                    tracing::debug!("New Unix socket connection");
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_unix_connection(stream, state).await {
+                            tracing::debug!("Unix connection error: {}", e);
                         }
                     });
                 }
@@ -217,13 +253,62 @@ impl KoraServer {
 
 struct ConnectionState {
     resp3: bool,
+    tenant_id: TenantId,
 }
 
 async fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> std::io::Result<()> {
     let mut parser = RespParser::new();
     let mut write_buf = BytesMut::with_capacity(4096);
     let mut read_buf = vec![0u8; 8192];
-    let mut conn = ConnectionState { resp3: false };
+    let mut conn = ConnectionState {
+        resp3: false,
+        tenant_id: TenantId(0),
+    };
+
+    loop {
+        let n = stream.read(&mut read_buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
+
+        parser.feed(&read_buf[..n]);
+
+        loop {
+            match parser.try_parse() {
+                Ok(Some(frame)) => {
+                    let response = match parse_command(frame) {
+                        Ok(cmd) => handle_command(cmd, &state, &mut conn).await,
+                        Err(e) => CommandResponse::Error(e.to_string()),
+                    };
+                    serialize_response_versioned(&response, &mut write_buf, conn.resp3);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let err_resp = CommandResponse::Error(e.to_string());
+                    serialize_response_versioned(&err_resp, &mut write_buf, conn.resp3);
+                    break;
+                }
+            }
+        }
+
+        if !write_buf.is_empty() {
+            stream.write_all(&write_buf).await?;
+            write_buf.clear();
+        }
+    }
+}
+
+async fn handle_unix_connection(
+    mut stream: tokio::net::UnixStream,
+    state: Arc<ServerState>,
+) -> std::io::Result<()> {
+    let mut parser = RespParser::new();
+    let mut write_buf = BytesMut::with_capacity(4096);
+    let mut read_buf = vec![0u8; 8192];
+    let mut conn = ConnectionState {
+        resp3: false,
+        tenant_id: TenantId(0),
+    };
 
     loop {
         let n = stream.read(&mut read_buf).await?;
@@ -267,7 +352,14 @@ async fn handle_command(
         Command::Hello { version } => {
             return handle_hello(version, conn);
         }
-        Command::Auth { .. } => {
+        Command::Auth { tenant, .. } => {
+            if let Some(ref tenant_bytes) = tenant {
+                if let Ok(s) = std::str::from_utf8(tenant_bytes) {
+                    if let Ok(id) = s.parse::<u32>() {
+                        conn.tenant_id = TenantId(id);
+                    }
+                }
+            }
             return CommandResponse::Ok;
         }
         Command::BgSave => {
@@ -327,6 +419,14 @@ async fn handle_command(
             return handle_stats_memory(state, prefixes);
         }
         _ => {}
+    }
+
+    {
+        let registry = state.tenants.read();
+        if let Err(e) = registry.check_limits(conn.tenant_id, 0, 0) {
+            return CommandResponse::Error(format!("ERR {}", e));
+        }
+        registry.record_operation(conn.tenant_id);
     }
 
     let engine = state.engine.clone();

@@ -312,6 +312,154 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             })
         }
 
+        // Sorted set commands
+        b"ZADD" => {
+            check_min_arity("ZADD", args, 3)?;
+            let key = extract_bytes(&args[0])?;
+            let pair_args = &args[1..];
+            if pair_args.len() % 2 != 0 {
+                return Err(ProtocolError::WrongArity("ZADD".into()));
+            }
+            let members = pair_args
+                .chunks(2)
+                .map(|chunk| Ok((parse_f64(&chunk[0])?, extract_bytes(&chunk[1])?)))
+                .collect::<Result<Vec<(f64, Vec<u8>)>, ProtocolError>>()?;
+            Ok(Command::ZAdd { key, members })
+        }
+        b"ZREM" => {
+            check_min_arity("ZREM", args, 2)?;
+            Ok(Command::ZRem {
+                key: extract_bytes(&args[0])?,
+                members: args[1..]
+                    .iter()
+                    .map(extract_bytes)
+                    .collect::<Result<_, _>>()?,
+            })
+        }
+        b"ZSCORE" => {
+            check_arity("ZSCORE", args, 2)?;
+            Ok(Command::ZScore {
+                key: extract_bytes(&args[0])?,
+                member: extract_bytes(&args[1])?,
+            })
+        }
+        b"ZRANK" => {
+            check_arity("ZRANK", args, 2)?;
+            Ok(Command::ZRank {
+                key: extract_bytes(&args[0])?,
+                member: extract_bytes(&args[1])?,
+            })
+        }
+        b"ZREVRANK" => {
+            check_arity("ZREVRANK", args, 2)?;
+            Ok(Command::ZRevRank {
+                key: extract_bytes(&args[0])?,
+                member: extract_bytes(&args[1])?,
+            })
+        }
+        b"ZCARD" => {
+            check_arity("ZCARD", args, 1)?;
+            Ok(Command::ZCard {
+                key: extract_bytes(&args[0])?,
+            })
+        }
+        b"ZRANGE" => {
+            if args.len() < 3 || args.len() > 4 {
+                return Err(ProtocolError::WrongArity("ZRANGE".into()));
+            }
+            let withscores = if args.len() == 4 {
+                let flag = extract_string(&args[3])?.to_ascii_uppercase();
+                if flag != b"WITHSCORES" {
+                    return Err(ProtocolError::InvalidData("unsupported ZRANGE flag".into()));
+                }
+                true
+            } else {
+                false
+            };
+            Ok(Command::ZRange {
+                key: extract_bytes(&args[0])?,
+                start: parse_i64(&args[1])?,
+                stop: parse_i64(&args[2])?,
+                withscores,
+            })
+        }
+        b"ZREVRANGE" => {
+            if args.len() < 3 || args.len() > 4 {
+                return Err(ProtocolError::WrongArity("ZREVRANGE".into()));
+            }
+            let withscores = if args.len() == 4 {
+                let flag = extract_string(&args[3])?.to_ascii_uppercase();
+                if flag != b"WITHSCORES" {
+                    return Err(ProtocolError::InvalidData(
+                        "unsupported ZREVRANGE flag".into(),
+                    ));
+                }
+                true
+            } else {
+                false
+            };
+            Ok(Command::ZRevRange {
+                key: extract_bytes(&args[0])?,
+                start: parse_i64(&args[1])?,
+                stop: parse_i64(&args[2])?,
+                withscores,
+            })
+        }
+        b"ZRANGEBYSCORE" => {
+            check_min_arity("ZRANGEBYSCORE", args, 3)?;
+            let key = extract_bytes(&args[0])?;
+            let min = parse_score(&args[1])?;
+            let max = parse_score(&args[2])?;
+            let mut withscores = false;
+            let mut offset = None;
+            let mut count = None;
+            let mut i = 3;
+            while i < args.len() {
+                let flag = extract_string(&args[i])?.to_ascii_uppercase();
+                match flag.as_slice() {
+                    b"WITHSCORES" => withscores = true,
+                    b"LIMIT" => {
+                        if i + 2 >= args.len() {
+                            return Err(ProtocolError::WrongArity("ZRANGEBYSCORE".into()));
+                        }
+                        offset = Some(parse_u64(&args[i + 1])? as usize);
+                        count = Some(parse_u64(&args[i + 2])? as usize);
+                        i += 2;
+                    }
+                    _ => {
+                        return Err(ProtocolError::InvalidData(
+                            "unsupported ZRANGEBYSCORE flag".into(),
+                        ))
+                    }
+                }
+                i += 1;
+            }
+            Ok(Command::ZRangeByScore {
+                key,
+                min,
+                max,
+                withscores,
+                offset,
+                count,
+            })
+        }
+        b"ZINCRBY" => {
+            check_arity("ZINCRBY", args, 3)?;
+            Ok(Command::ZIncrBy {
+                key: extract_bytes(&args[0])?,
+                delta: parse_f64(&args[1])?,
+                member: extract_bytes(&args[2])?,
+            })
+        }
+        b"ZCOUNT" => {
+            check_arity("ZCOUNT", args, 3)?;
+            Ok(Command::ZCount {
+                key: extract_bytes(&args[0])?,
+                min: parse_score(&args[1])?,
+                max: parse_score(&args[2])?,
+            })
+        }
+
         // Server commands
         b"PING" => Ok(Command::Ping {
             message: args.first().and_then(|a| extract_bytes(a).ok()),
@@ -478,6 +626,24 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             check_min_arity("STATS.MEMORY", args, 1)?;
             let prefixes = args.iter().map(extract_bytes).collect::<Result<_, _>>()?;
             Ok(Command::StatsMemory { prefixes })
+        }
+
+        // Object commands
+        b"OBJECT" => {
+            check_min_arity("OBJECT", args, 2)?;
+            let subcmd = extract_string(&args[0])?.to_ascii_uppercase();
+            match subcmd.as_slice() {
+                b"FREQ" => Ok(Command::ObjectFreq {
+                    key: extract_bytes(&args[1])?,
+                }),
+                b"ENCODING" => Ok(Command::ObjectEncoding {
+                    key: extract_bytes(&args[1])?,
+                }),
+                _ => Err(ProtocolError::InvalidData(format!(
+                    "unknown OBJECT subcommand: {}",
+                    String::from_utf8_lossy(&subcmd)
+                ))),
+            }
         }
 
         _ => Err(ProtocolError::UnknownCommand(
@@ -668,6 +834,20 @@ fn parse_f64(val: &RespValue) -> Result<f64, ProtocolError> {
         RespValue::Integer(n) => Ok(*n as f64),
         RespValue::Double(d) => Ok(*d),
         _ => Err(ProtocolError::InvalidData("expected float".into())),
+    }
+}
+
+/// Parse a score value, supporting "-inf" and "+inf" in addition to normal floats.
+fn parse_score(val: &RespValue) -> Result<f64, ProtocolError> {
+    let data = extract_bytes(val)?;
+    let s = std::str::from_utf8(&data)
+        .map_err(|_| ProtocolError::InvalidData("expected score".into()))?;
+    match s.to_lowercase().as_str() {
+        "-inf" => Ok(f64::NEG_INFINITY),
+        "+inf" | "inf" => Ok(f64::INFINITY),
+        _ => s
+            .parse::<f64>()
+            .map_err(|_| ProtocolError::InvalidData("expected score".into())),
     }
 }
 
@@ -923,5 +1103,81 @@ mod tests {
     fn test_parse_dump() {
         let cmd = parse_command(make_cmd(&[b"DUMP"])).unwrap();
         assert!(matches!(cmd, Command::Dump));
+    }
+
+    #[test]
+    fn test_parse_object_freq() {
+        let cmd = parse_command(make_cmd(&[b"OBJECT", b"FREQ", b"mykey"])).unwrap();
+        assert!(matches!(cmd, Command::ObjectFreq { key } if key == b"mykey"));
+    }
+
+    #[test]
+    fn test_parse_object_encoding() {
+        let cmd = parse_command(make_cmd(&[b"OBJECT", b"ENCODING", b"mykey"])).unwrap();
+        assert!(matches!(cmd, Command::ObjectEncoding { key } if key == b"mykey"));
+    }
+
+    #[test]
+    fn test_parse_object_unknown_subcmd() {
+        let result = parse_command(make_cmd(&[b"OBJECT", b"HELP", b"mykey"]));
+        assert!(matches!(result, Err(ProtocolError::InvalidData(_))));
+    }
+
+    #[test]
+    fn test_parse_zadd() {
+        let cmd =
+            parse_command(make_cmd(&[b"ZADD", b"myset", b"1.5", b"a", b"2.5", b"b"])).unwrap();
+        match cmd {
+            Command::ZAdd { key, members } => {
+                assert_eq!(key, b"myset");
+                assert_eq!(members.len(), 2);
+                assert!((members[0].0 - 1.5).abs() < f64::EPSILON);
+                assert_eq!(members[0].1, b"a");
+                assert!((members[1].0 - 2.5).abs() < f64::EPSILON);
+                assert_eq!(members[1].1, b"b");
+            }
+            other => panic!("Expected ZAdd, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_zscore() {
+        let cmd = parse_command(make_cmd(&[b"ZSCORE", b"myset", b"member1"])).unwrap();
+        assert!(
+            matches!(cmd, Command::ZScore { key, member } if key == b"myset" && member == b"member1")
+        );
+    }
+
+    #[test]
+    fn test_parse_zrange_withscores() {
+        let cmd =
+            parse_command(make_cmd(&[b"ZRANGE", b"myset", b"0", b"-1", b"WITHSCORES"])).unwrap();
+        match cmd {
+            Command::ZRange {
+                key,
+                start,
+                stop,
+                withscores,
+            } => {
+                assert_eq!(key, b"myset");
+                assert_eq!(start, 0);
+                assert_eq!(stop, -1);
+                assert!(withscores);
+            }
+            other => panic!("Expected ZRange, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_zcount_inf() {
+        let cmd = parse_command(make_cmd(&[b"ZCOUNT", b"myset", b"-inf", b"+inf"])).unwrap();
+        match cmd {
+            Command::ZCount { key, min, max } => {
+                assert_eq!(key, b"myset");
+                assert!(min.is_infinite() && min.is_sign_negative());
+                assert!(max.is_infinite() && max.is_sign_positive());
+            }
+            other => panic!("Expected ZCount, got {:?}", other),
+        }
     }
 }

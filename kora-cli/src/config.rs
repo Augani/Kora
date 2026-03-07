@@ -39,6 +39,8 @@ pub struct FileConfig {
     pub script_max_fuel: Option<u64>,
     /// Port for Prometheus metrics HTTP endpoint (0 = disabled).
     pub metrics_port: Option<u16>,
+    /// Optional Unix socket path.
+    pub unix_socket: Option<String>,
 }
 
 /// Storage section of the config file.
