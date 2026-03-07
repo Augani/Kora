@@ -90,6 +90,28 @@ fn resp_to_command_response(val: &RespValue) -> CommandResponse {
                 items.iter().map(resp_to_command_response).collect();
             CommandResponse::Array(converted)
         }
+        RespValue::Null => CommandResponse::Nil,
+        RespValue::Double(d) => CommandResponse::Double(*d),
+        RespValue::Boolean(b) => CommandResponse::Boolean(*b),
+        RespValue::Map(pairs) => {
+            let converted: Vec<(CommandResponse, CommandResponse)> = pairs
+                .iter()
+                .map(|(k, v)| (resp_to_command_response(k), resp_to_command_response(v)))
+                .collect();
+            CommandResponse::Map(converted)
+        }
+        RespValue::Set(items) => {
+            let converted: Vec<CommandResponse> =
+                items.iter().map(resp_to_command_response).collect();
+            CommandResponse::Set(converted)
+        }
+        RespValue::BigNumber(data) => CommandResponse::BulkString(data.clone()),
+        RespValue::VerbatimString { data, .. } => CommandResponse::BulkString(data.clone()),
+        RespValue::Push(items) => {
+            let converted: Vec<CommandResponse> =
+                items.iter().map(resp_to_command_response).collect();
+            CommandResponse::Array(converted)
+        }
     }
 }
 

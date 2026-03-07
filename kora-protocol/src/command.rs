@@ -157,7 +157,7 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             check_arity("DBSIZE", args, 0)?;
             Ok(Command::DbSize)
         }
-        b"FLUSHDB" | b"FLUSHALL" => Ok(Command::FlushDb),
+        b"FLUSHDB" => Ok(Command::FlushDb),
 
         // List commands
         b"LPUSH" => {
@@ -328,9 +328,112 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
                 .and_then(|a| extract_bytes(a).ok())
                 .map(|b| String::from_utf8_lossy(&b).into_owned()),
         }),
-        b"COMMAND" => {
-            // Minimal COMMAND support — just return OK
-            Ok(Command::Ping { message: None })
+        b"COMMAND" => Ok(Command::CommandInfo),
+
+        // Server / admin commands
+        b"BGSAVE" => {
+            check_arity("BGSAVE", args, 0)?;
+            Ok(Command::BgSave)
+        }
+        b"BGREWRITEAOF" => {
+            check_arity("BGREWRITEAOF", args, 0)?;
+            Ok(Command::BgRewriteAof)
+        }
+        b"FLUSHALL" => Ok(Command::FlushAll),
+        b"DUMP" => {
+            check_arity("DUMP", args, 0)?;
+            Ok(Command::Dump)
+        }
+        b"HELLO" => {
+            let version = if args.is_empty() {
+                None
+            } else {
+                let v = parse_u64(&args[0])? as u8;
+                Some(v)
+            };
+            Ok(Command::Hello { version })
+        }
+        b"AUTH" => {
+            if args.is_empty() {
+                return Err(ProtocolError::WrongArity("AUTH".into()));
+            }
+            if args.len() == 1 {
+                Ok(Command::Auth {
+                    tenant: None,
+                    password: extract_bytes(&args[0])?,
+                })
+            } else {
+                Ok(Command::Auth {
+                    tenant: Some(extract_bytes(&args[0])?),
+                    password: extract_bytes(&args[1])?,
+                })
+            }
+        }
+
+        // CDC commands
+        b"CDCPOLL" => {
+            check_arity("CDCPOLL", args, 2)?;
+            Ok(Command::CdcPoll {
+                cursor: parse_u64(&args[0])?,
+                count: parse_u64(&args[1])? as usize,
+            })
+        }
+
+        // Vector commands
+        b"VECSET" => {
+            check_min_arity("VECSET", args, 3)?;
+            let key = extract_bytes(&args[0])?;
+            let dimensions = parse_u64(&args[1])? as usize;
+            if args.len() != 2 + dimensions {
+                return Err(ProtocolError::InvalidData(format!(
+                    "VECSET expected {} vector components, got {}",
+                    dimensions,
+                    args.len() - 2
+                )));
+            }
+            let vector = args[2..].iter().map(parse_f32).collect::<Result<_, _>>()?;
+            Ok(Command::VecSet {
+                key,
+                dimensions,
+                vector,
+            })
+        }
+        b"VECQUERY" => {
+            check_min_arity("VECQUERY", args, 3)?;
+            let key = extract_bytes(&args[0])?;
+            let k = parse_u64(&args[1])? as usize;
+            let vector = args[2..].iter().map(parse_f32).collect::<Result<_, _>>()?;
+            Ok(Command::VecQuery { key, k, vector })
+        }
+        b"VECDEL" => {
+            check_arity("VECDEL", args, 1)?;
+            Ok(Command::VecDel {
+                key: extract_bytes(&args[0])?,
+            })
+        }
+
+        // Scripting commands
+        b"SCRIPTLOAD" => {
+            check_arity("SCRIPTLOAD", args, 2)?;
+            Ok(Command::ScriptLoad {
+                name: extract_bytes(&args[0])?,
+                wasm_bytes: extract_bytes(&args[1])?,
+            })
+        }
+        b"SCRIPTCALL" => {
+            check_min_arity("SCRIPTCALL", args, 1)?;
+            let name = extract_bytes(&args[0])?;
+            let call_args = args[1..].iter().map(parse_i64).collect::<Result<_, _>>()?;
+            Ok(Command::ScriptCall {
+                name,
+                args: call_args,
+            })
+        }
+        b"SCRIPTDEL" => {
+            check_arity("SCRIPTDEL", args, 1)?;
+            Ok(Command::ScriptDel {
+                name: extract_bytes(&args[0])?,
+            })
         }
 
         _ => Err(ProtocolError::UnknownCommand(
@@ -459,6 +562,20 @@ fn check_arity(cmd: &str, args: &[RespValue], expected: usize) -> Result<(), Pro
     }
 }
 
+fn parse_f32(val: &RespValue) -> Result<f32, ProtocolError> {
+    match val {
+        RespValue::BulkString(Some(data)) | RespValue::SimpleString(data) => {
+            std::str::from_utf8(data)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| ProtocolError::InvalidData("expected float".into()))
+        }
+        RespValue::Integer(n) => Ok(*n as f32),
+        RespValue::Double(d) => Ok(*d as f32),
+        _ => Err(ProtocolError::InvalidData("expected float".into())),
+    }
+}
+
 fn check_min_arity(cmd: &str, args: &[RespValue], min: usize) -> Result<(), ProtocolError> {
     if args.len() < min {
         Err(ProtocolError::WrongArity(cmd.into()))
@@ -559,5 +676,152 @@ mod tests {
     fn test_case_insensitive() {
         let cmd = parse_command(make_cmd(&[b"get", b"mykey"])).unwrap();
         assert!(matches!(cmd, Command::Get { .. }));
+    }
+
+    #[test]
+    fn test_parse_bgsave() {
+        let cmd = parse_command(make_cmd(&[b"BGSAVE"])).unwrap();
+        assert!(matches!(cmd, Command::BgSave));
+    }
+
+    #[test]
+    fn test_parse_bgrewriteaof() {
+        let cmd = parse_command(make_cmd(&[b"BGREWRITEAOF"])).unwrap();
+        assert!(matches!(cmd, Command::BgRewriteAof));
+    }
+
+    #[test]
+    fn test_parse_flushall() {
+        let cmd = parse_command(make_cmd(&[b"FLUSHALL"])).unwrap();
+        assert!(matches!(cmd, Command::FlushAll));
+    }
+
+    #[test]
+    fn test_parse_hello() {
+        let cmd = parse_command(make_cmd(&[b"HELLO", b"3"])).unwrap();
+        assert!(matches!(cmd, Command::Hello { version: Some(3) }));
+    }
+
+    #[test]
+    fn test_parse_hello_no_version() {
+        let cmd = parse_command(make_cmd(&[b"HELLO"])).unwrap();
+        assert!(matches!(cmd, Command::Hello { version: None }));
+    }
+
+    #[test]
+    fn test_parse_auth_password_only() {
+        let cmd = parse_command(make_cmd(&[b"AUTH", b"secret"])).unwrap();
+        match cmd {
+            Command::Auth { tenant, password } => {
+                assert!(tenant.is_none());
+                assert_eq!(password, b"secret");
+            }
+            other => panic!("Expected Auth, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_auth_with_tenant() {
+        let cmd = parse_command(make_cmd(&[b"AUTH", b"tenant1", b"secret"])).unwrap();
+        match cmd {
+            Command::Auth { tenant, password } => {
+                assert_eq!(tenant.unwrap(), b"tenant1");
+                assert_eq!(password, b"secret");
+            }
+            other => panic!("Expected Auth, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_cdcpoll() {
+        let cmd = parse_command(make_cmd(&[b"CDCPOLL", b"0", b"100"])).unwrap();
+        match cmd {
+            Command::CdcPoll { cursor, count } => {
+                assert_eq!(cursor, 0);
+                assert_eq!(count, 100);
+            }
+            other => panic!("Expected CdcPoll, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_vecset() {
+        let cmd = parse_command(make_cmd(&[
+            b"VECSET", b"mykey", b"3", b"1.0", b"2.0", b"3.0",
+        ]))
+        .unwrap();
+        match cmd {
+            Command::VecSet {
+                key,
+                dimensions,
+                vector,
+            } => {
+                assert_eq!(key, b"mykey");
+                assert_eq!(dimensions, 3);
+                assert_eq!(vector, vec![1.0, 2.0, 3.0]);
+            }
+            other => panic!("Expected VecSet, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_vecquery() {
+        let cmd = parse_command(make_cmd(&[b"VECQUERY", b"mykey", b"5", b"1.0", b"2.0"])).unwrap();
+        match cmd {
+            Command::VecQuery { key, k, vector } => {
+                assert_eq!(key, b"mykey");
+                assert_eq!(k, 5);
+                assert_eq!(vector, vec![1.0, 2.0]);
+            }
+            other => panic!("Expected VecQuery, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_vecdel() {
+        let cmd = parse_command(make_cmd(&[b"VECDEL", b"mykey"])).unwrap();
+        assert!(matches!(cmd, Command::VecDel { key } if key == b"mykey"));
+    }
+
+    #[test]
+    fn test_parse_scriptload() {
+        let cmd = parse_command(make_cmd(&[b"SCRIPTLOAD", b"myfn", b"wasmdata"])).unwrap();
+        match cmd {
+            Command::ScriptLoad { name, wasm_bytes } => {
+                assert_eq!(name, b"myfn");
+                assert_eq!(wasm_bytes, b"wasmdata");
+            }
+            other => panic!("Expected ScriptLoad, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_scriptcall() {
+        let cmd = parse_command(make_cmd(&[b"SCRIPTCALL", b"myfn", b"42", b"7"])).unwrap();
+        match cmd {
+            Command::ScriptCall { name, args } => {
+                assert_eq!(name, b"myfn");
+                assert_eq!(args, vec![42, 7]);
+            }
+            other => panic!("Expected ScriptCall, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_scriptdel() {
+        let cmd = parse_command(make_cmd(&[b"SCRIPTDEL", b"myfn"])).unwrap();
+        assert!(matches!(cmd, Command::ScriptDel { name } if name == b"myfn"));
+    }
+
+    #[test]
+    fn test_parse_command_info() {
+        let cmd = parse_command(make_cmd(&[b"COMMAND"])).unwrap();
+        assert!(matches!(cmd, Command::CommandInfo));
+    }
+
+    #[test]
+    fn test_parse_dump() {
+        let cmd = parse_command(make_cmd(&[b"DUMP"])).unwrap();
+        assert!(matches!(cmd, Command::Dump));
     }
 }

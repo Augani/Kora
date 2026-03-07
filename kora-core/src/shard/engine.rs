@@ -247,7 +247,7 @@ impl ShardEngine {
                 }
                 let _ = tx.send(CommandResponse::Integer(total));
             }
-            Command::FlushDb => {
+            Command::FlushDb | Command::FlushAll => {
                 let mut receivers = Vec::new();
                 for worker in &self.workers {
                     let (resp_tx, resp_rx) = response_channel();
@@ -261,6 +261,25 @@ impl ShardEngine {
                     let _ = rx.recv();
                 }
                 let _ = tx.send(CommandResponse::Ok);
+            }
+            Command::Dump => {
+                // Broadcast to all shards, collect and merge results
+                let mut all_entries = Vec::new();
+                let mut receivers = Vec::new();
+                for worker in &self.workers {
+                    let (resp_tx, resp_rx) = response_channel();
+                    let _ = worker.tx.send(ShardMessage {
+                        command: Command::Dump,
+                        response_tx: resp_tx,
+                    });
+                    receivers.push(resp_rx);
+                }
+                for rx in receivers {
+                    if let Ok(CommandResponse::Array(entries)) = rx.recv() {
+                        all_entries.extend(entries);
+                    }
+                }
+                let _ = tx.send(CommandResponse::Array(all_entries));
             }
             Command::Keys { .. } | Command::Scan { .. } => {
                 // Broadcast to all shards, collect and merge results

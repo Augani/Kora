@@ -22,3 +22,9 @@ pub mod hash;
 
 /// Per-thread shard storage and the coordinating engine.
 pub mod shard;
+
+/// Per-thread slab allocator with fixed size classes.
+pub mod slab;
+
+/// Multi-tenancy support: tenant isolation, resource limits, and accounting.
+pub mod tenant;

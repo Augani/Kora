@@ -6,6 +6,9 @@ use std::time::Duration;
 use crate::command::{Command, CommandResponse};
 use crate::types::{CompactKey, KeyEntry, Value};
 
+#[cfg(feature = "observability")]
+use kora_observability::stats::ShardStats;
+
 /// A single shard's key-value store.
 ///
 /// Each worker thread owns exactly one `ShardStore`. All operations on it
@@ -13,6 +16,8 @@ use crate::types::{CompactKey, KeyEntry, Value};
 pub struct ShardStore {
     entries: HashMap<CompactKey, KeyEntry>,
     shard_id: u16,
+    #[cfg(feature = "observability")]
+    stats: ShardStats,
 }
 
 impl ShardStore {
@@ -21,7 +26,15 @@ impl ShardStore {
         Self {
             entries: HashMap::new(),
             shard_id,
+            #[cfg(feature = "observability")]
+            stats: ShardStats::new(),
         }
+    }
+
+    /// Get a reference to the shard stats (observability feature).
+    #[cfg(feature = "observability")]
+    pub fn stats(&self) -> &ShardStats {
+        &self.stats
     }
 
     /// Get the shard ID.
@@ -53,6 +66,30 @@ impl ShardStore {
 
     /// Execute a command on this shard and return the response.
     pub fn execute(&mut self, cmd: Command) -> CommandResponse {
+        #[cfg(feature = "observability")]
+        let start = std::time::Instant::now();
+
+        #[cfg(feature = "observability")]
+        let cmd_type = cmd.cmd_type() as usize;
+
+        #[cfg(feature = "observability")]
+        if let Some(key) = cmd.key() {
+            self.stats.record_key_access(key);
+        }
+
+        let response = self.execute_inner(cmd);
+
+        #[cfg(feature = "observability")]
+        {
+            let duration_ns = start.elapsed().as_nanos() as u64;
+            self.stats.record_command(cmd_type, duration_ns);
+            self.stats.set_key_count(self.entries.len() as u64);
+        }
+
+        response
+    }
+
+    fn execute_inner(&mut self, cmd: Command) -> CommandResponse {
         match cmd {
             // String commands
             Command::Get { key } => self.cmd_get(&key),
@@ -97,7 +134,7 @@ impl ShardStore {
                 count,
             } => self.cmd_scan(cursor, pattern.as_deref(), count.unwrap_or(10)),
             Command::DbSize => CommandResponse::Integer(self.entries.len() as i64),
-            Command::FlushDb => {
+            Command::FlushDb | Command::FlushAll => {
                 self.flush();
                 CommandResponse::Ok
             }
@@ -140,6 +177,23 @@ impl ShardStore {
                 )
                 .into_bytes(),
             ),
+            Command::CommandInfo => CommandResponse::Array(vec![]),
+
+            // Dump: return all entries for RDB snapshot
+            Command::Dump => {
+                let entries: Vec<CommandResponse> = self
+                    .entries
+                    .iter()
+                    .filter(|(_, entry)| !entry.is_expired())
+                    .flat_map(|(key, entry)| {
+                        vec![
+                            CommandResponse::BulkString(key.as_bytes().to_vec()),
+                            CommandResponse::BulkString(entry.value.to_bytes()),
+                        ]
+                    })
+                    .collect();
+                CommandResponse::Array(entries)
+            }
 
             // Multi-key commands handled at engine level, but provide per-shard fallback
             Command::MGet { keys } => {
@@ -151,6 +205,21 @@ impl ShardStore {
                     self.cmd_set(k, v, None, None, false, false);
                 }
                 CommandResponse::Ok
+            }
+
+            // Commands handled at server/engine level — should not reach here
+            Command::BgSave
+            | Command::BgRewriteAof
+            | Command::Hello { .. }
+            | Command::Auth { .. }
+            | Command::CdcPoll { .. }
+            | Command::VecSet { .. }
+            | Command::VecQuery { .. }
+            | Command::VecDel { .. }
+            | Command::ScriptLoad { .. }
+            | Command::ScriptCall { .. }
+            | Command::ScriptDel { .. } => {
+                CommandResponse::Error("ERR command handled at server level".into())
             }
         }
     }
