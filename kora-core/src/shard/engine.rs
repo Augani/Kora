@@ -8,6 +8,7 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::command::{Command, CommandResponse};
 use crate::hash::shard_for_key;
 use crate::shard::store::ShardStore;
+use crate::shard::wal_trait::{WalRecord, WalWriter};
 
 /// Message sent from the dispatcher to a shard worker.
 pub struct ShardMessage {
@@ -43,15 +44,33 @@ pub struct ShardEngine {
 impl ShardEngine {
     /// Create a new ShardEngine with the given number of worker threads.
     pub fn new(shard_count: usize) -> Self {
+        let wal_writers: Vec<Option<Box<dyn WalWriter>>> = (0..shard_count).map(|_| None).collect();
+        Self::new_with_storage(shard_count, wal_writers)
+    }
+
+    /// Create a new ShardEngine with per-shard WAL writers.
+    ///
+    /// Each element in `wal_writers` corresponds to one shard. The WAL writer
+    /// is moved into the shard's worker thread and called after every mutation.
+    pub fn new_with_storage(
+        shard_count: usize,
+        wal_writers: Vec<Option<Box<dyn WalWriter>>>,
+    ) -> Self {
+        assert_eq!(
+            wal_writers.len(),
+            shard_count,
+            "wal_writers length must match shard_count"
+        );
+
         let mut workers = Vec::with_capacity(shard_count);
 
-        for i in 0..shard_count {
+        for (i, wal_writer) in wal_writers.into_iter().enumerate() {
             let (tx, rx) = crossbeam_channel::unbounded::<ShardMessage>();
             let handle = thread::Builder::new()
                 .name(format!("kora-shard-{}", i))
                 .spawn(move || {
                     let mut store = ShardStore::new(i as u16);
-                    worker_loop(&mut store, &rx);
+                    worker_loop(&mut store, &rx, wal_writer);
                 })
                 .expect("failed to spawn shard worker thread");
 
@@ -226,7 +245,75 @@ impl ShardEngine {
         }
     }
 
+    fn dispatch_vec_query(&self, cmd: Command, tx: ResponseSender) {
+        let (key, k, vector) = match cmd {
+            Command::VecQuery { key, k, vector } => (key, k, vector),
+            _ => {
+                let _ = tx.send(CommandResponse::Error(
+                    "ERR internal: not a VecQuery".into(),
+                ));
+                return;
+            }
+        };
+
+        let mut receivers = Vec::with_capacity(self.shard_count);
+        for worker in &self.workers {
+            let (resp_tx, resp_rx) = response_channel();
+            let _ = worker.tx.send(ShardMessage {
+                command: Command::VecQuery {
+                    key: key.clone(),
+                    k,
+                    vector: vector.clone(),
+                },
+                response_tx: resp_tx,
+            });
+            receivers.push(resp_rx);
+        }
+
+        let mut all_results: Vec<(i64, Vec<u8>)> = Vec::new();
+        for rx in receivers {
+            if let Ok(CommandResponse::Array(items)) = rx.recv() {
+                for item in items {
+                    if let CommandResponse::Array(pair) = item {
+                        if pair.len() == 2 {
+                            if let (
+                                CommandResponse::Integer(id),
+                                CommandResponse::BulkString(dist),
+                            ) = (&pair[0], &pair[1])
+                            {
+                                all_results.push((*id, dist.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        all_results.sort_by(|a, b| {
+            let da: f64 = String::from_utf8_lossy(&a.1).parse().unwrap_or(f64::MAX);
+            let db: f64 = String::from_utf8_lossy(&b.1).parse().unwrap_or(f64::MAX);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        all_results.truncate(k);
+
+        let items: Vec<CommandResponse> = all_results
+            .into_iter()
+            .map(|(id, dist)| {
+                CommandResponse::Array(vec![
+                    CommandResponse::Integer(id),
+                    CommandResponse::BulkString(dist),
+                ])
+            })
+            .collect();
+        let _ = tx.send(CommandResponse::Array(items));
+    }
+
     fn dispatch_keyless(&self, cmd: Command, tx: ResponseSender) {
+        if matches!(&cmd, Command::VecQuery { .. }) {
+            self.dispatch_vec_query(cmd, tx);
+            return;
+        }
+
         match &cmd {
             Command::DbSize => {
                 // Sum up db sizes from all shards
@@ -330,18 +417,91 @@ impl Drop for ShardEngine {
 }
 
 /// Worker thread event loop.
-fn worker_loop(store: &mut ShardStore, rx: &Receiver<ShardMessage>) {
+fn worker_loop(
+    store: &mut ShardStore,
+    rx: &Receiver<ShardMessage>,
+    mut wal_writer: Option<Box<dyn WalWriter>>,
+) {
     let mut ops_since_expire = 0u32;
     while let Ok(msg) = rx.recv() {
-        // Periodic lazy expiry
         ops_since_expire += 1;
         if ops_since_expire >= 100 {
             store.evict_expired();
             ops_since_expire = 0;
         }
 
+        if let Some(ref mut writer) = wal_writer {
+            if msg.command.is_mutation() {
+                if let Some(record) = command_to_wal_record(&msg.command) {
+                    writer.append(&record);
+                }
+            }
+        }
+
         let response = store.execute(msg.command);
         let _ = msg.response_tx.send(response);
+    }
+}
+
+/// Convert a `Command` to a `WalRecord` for WAL logging.
+fn command_to_wal_record(cmd: &Command) -> Option<WalRecord> {
+    match cmd {
+        Command::Set {
+            key, value, ex, px, ..
+        } => {
+            let ttl_ms = if let Some(s) = ex {
+                Some(s * 1000)
+            } else {
+                *px
+            };
+            Some(WalRecord::Set {
+                key: key.clone(),
+                value: value.clone(),
+                ttl_ms,
+            })
+        }
+        Command::SetNx { key, value } => Some(WalRecord::Set {
+            key: key.clone(),
+            value: value.clone(),
+            ttl_ms: None,
+        }),
+        Command::GetSet { key, value } => Some(WalRecord::Set {
+            key: key.clone(),
+            value: value.clone(),
+            ttl_ms: None,
+        }),
+        Command::Append { key, value } => Some(WalRecord::Set {
+            key: key.clone(),
+            value: value.clone(),
+            ttl_ms: None,
+        }),
+        Command::Del { keys } => keys.first().map(|key| WalRecord::Del { key: key.clone() }),
+        Command::Expire { key, seconds } => Some(WalRecord::Expire {
+            key: key.clone(),
+            ttl_ms: seconds * 1000,
+        }),
+        Command::PExpire { key, millis } => Some(WalRecord::Expire {
+            key: key.clone(),
+            ttl_ms: *millis,
+        }),
+        Command::LPush { key, values } => Some(WalRecord::LPush {
+            key: key.clone(),
+            values: values.clone(),
+        }),
+        Command::RPush { key, values } => Some(WalRecord::RPush {
+            key: key.clone(),
+            values: values.clone(),
+        }),
+        Command::HSet { key, fields } => Some(WalRecord::HSet {
+            key: key.clone(),
+            fields: fields.clone(),
+        }),
+        Command::SAdd { key, members } => Some(WalRecord::SAdd {
+            key: key.clone(),
+            members: members.clone(),
+        }),
+        Command::FlushDb | Command::FlushAll => Some(WalRecord::FlushDb),
+        _ => None,
     }
 }
 
@@ -473,5 +633,106 @@ mod tests {
             xx: false,
         });
         drop(engine); // should not hang
+    }
+
+    #[test]
+    fn test_vec_set_and_query_per_shard() {
+        let engine = ShardEngine::new(4);
+
+        let vector1 = vec![1.0f32, 0.0, 0.0, 0.0];
+        let vector2 = vec![0.0f32, 1.0, 0.0, 0.0];
+        let vector3 = vec![1.0f32, 1.0, 0.0, 0.0];
+
+        let resp1 = engine.dispatch_blocking(Command::VecSet {
+            key: b"idx".to_vec(),
+            dimensions: 4,
+            vector: vector1.clone(),
+        });
+        assert!(matches!(resp1, CommandResponse::Integer(_)));
+
+        let resp2 = engine.dispatch_blocking(Command::VecSet {
+            key: b"idx".to_vec(),
+            dimensions: 4,
+            vector: vector2,
+        });
+        assert!(matches!(resp2, CommandResponse::Integer(_)));
+
+        let resp3 = engine.dispatch_blocking(Command::VecSet {
+            key: b"idx".to_vec(),
+            dimensions: 4,
+            vector: vector3,
+        });
+        assert!(matches!(resp3, CommandResponse::Integer(_)));
+
+        let query_resp = engine.dispatch_blocking(Command::VecQuery {
+            key: b"idx".to_vec(),
+            k: 3,
+            vector: vector1,
+        });
+        match query_resp {
+            CommandResponse::Array(results) => {
+                assert!(!results.is_empty(), "VecQuery should return results");
+                assert!(results.len() <= 3);
+            }
+            other => panic!("Expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_vec_del() {
+        let engine = ShardEngine::new(2);
+
+        engine.dispatch_blocking(Command::VecSet {
+            key: b"myidx".to_vec(),
+            dimensions: 3,
+            vector: vec![1.0, 2.0, 3.0],
+        });
+
+        let del_resp = engine.dispatch_blocking(Command::VecDel {
+            key: b"myidx".to_vec(),
+        });
+        assert!(matches!(del_resp, CommandResponse::Integer(1)));
+
+        let del_again = engine.dispatch_blocking(Command::VecDel {
+            key: b"myidx".to_vec(),
+        });
+        assert!(matches!(del_again, CommandResponse::Integer(0)));
+
+        let query_resp = engine.dispatch_blocking(Command::VecQuery {
+            key: b"myidx".to_vec(),
+            k: 5,
+            vector: vec![1.0, 2.0, 3.0],
+        });
+        match query_resp {
+            CommandResponse::Array(results) => assert!(results.is_empty()),
+            other => panic!("Expected empty Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_vec_query_fan_out() {
+        let engine = ShardEngine::new(4);
+
+        for i in 0..10 {
+            let v: Vec<f32> = (0..8).map(|d| (i * 8 + d) as f32 * 0.1).collect();
+            engine.dispatch_blocking(Command::VecSet {
+                key: b"fanout-idx".to_vec(),
+                dimensions: 8,
+                vector: v,
+            });
+        }
+
+        let query = vec![0.0f32; 8];
+        let resp = engine.dispatch_blocking(Command::VecQuery {
+            key: b"fanout-idx".to_vec(),
+            k: 5,
+            vector: query,
+        });
+        match resp {
+            CommandResponse::Array(results) => {
+                assert!(results.len() <= 5);
+            }
+            other => panic!("Expected Array, got {:?}", other),
+        }
     }
 }

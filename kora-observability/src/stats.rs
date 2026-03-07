@@ -6,6 +6,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use crate::histogram::CommandHistograms;
 use crate::sketch::CountMinSketch;
 
 /// Number of command types tracked.
@@ -29,6 +30,8 @@ pub struct ShardStats {
     bytes_out: AtomicU64,
     /// Total bytes written (requests).
     bytes_in: AtomicU64,
+    /// Per-command latency histograms.
+    histograms: CommandHistograms,
 }
 
 impl ShardStats {
@@ -43,16 +46,23 @@ impl ShardStats {
             memory_used: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
             bytes_in: AtomicU64::new(0),
+            histograms: CommandHistograms::new(),
         }
     }
 
-    /// Record a command execution.
+    /// Record a command execution (counter + histogram).
     pub fn record_command(&self, cmd_type: usize, duration_ns: u64) {
         self.total_commands.fetch_add(1, Ordering::Relaxed);
         if cmd_type < NUM_COMMANDS {
             self.cmd_counts[cmd_type].fetch_add(1, Ordering::Relaxed);
             self.cmd_durations_ns[cmd_type].fetch_add(duration_ns, Ordering::Relaxed);
         }
+        self.histograms.record(cmd_type, duration_ns);
+    }
+
+    /// Get a reference to the command histograms.
+    pub fn histograms(&self) -> &CommandHistograms {
+        &self.histograms
     }
 
     /// Record a key access for hot key tracking.

@@ -10,3 +10,12 @@ description = "Embeddable library mode for Kōra — use as a direct API without
 kora-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tokio = { workspace = true, optional = true }
+kora-server = { workspace = true, optional = true }
+
+[features]
+default = []
+server = ["dep:kora-server", "dep:tokio"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

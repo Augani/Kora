@@ -60,6 +60,11 @@ wasmtime = "27"
 # Observability
 hdrhistogram = "7"
 
+# HTTP (metrics endpoint)
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+
 # Vector math
 ordered-float = "4"
 

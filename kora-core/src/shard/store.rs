@@ -9,6 +9,11 @@ use crate::types::{CompactKey, KeyEntry, Value};
 #[cfg(feature = "observability")]
 use kora_observability::stats::ShardStats;
 
+#[cfg(feature = "vector")]
+use kora_vector::distance::DistanceMetric;
+#[cfg(feature = "vector")]
+use kora_vector::hnsw::HnswIndex;
+
 /// A single shard's key-value store.
 ///
 /// Each worker thread owns exactly one `ShardStore`. All operations on it
@@ -18,6 +23,8 @@ pub struct ShardStore {
     shard_id: u16,
     #[cfg(feature = "observability")]
     stats: ShardStats,
+    #[cfg(feature = "vector")]
+    vector_indexes: HashMap<CompactKey, HnswIndex>,
 }
 
 impl ShardStore {
@@ -28,6 +35,8 @@ impl ShardStore {
             shard_id,
             #[cfg(feature = "observability")]
             stats: ShardStats::new(),
+            #[cfg(feature = "vector")]
+            vector_indexes: HashMap::new(),
         }
     }
 
@@ -207,19 +216,40 @@ impl ShardStore {
                 CommandResponse::Ok
             }
 
+            // Vector commands — handled per-shard when vector feature is enabled
+            #[cfg(feature = "vector")]
+            Command::VecSet {
+                key,
+                dimensions,
+                vector,
+            } => self.cmd_vec_set(&key, dimensions, &vector),
+            #[cfg(feature = "vector")]
+            Command::VecQuery { key, k, vector } => self.cmd_vec_query(&key, k, &vector),
+            #[cfg(feature = "vector")]
+            Command::VecDel { key } => self.cmd_vec_del(&key),
+
             // Commands handled at server/engine level — should not reach here
             Command::BgSave
             | Command::BgRewriteAof
             | Command::Hello { .. }
             | Command::Auth { .. }
             | Command::CdcPoll { .. }
-            | Command::VecSet { .. }
-            | Command::VecQuery { .. }
-            | Command::VecDel { .. }
+            | Command::CdcGroupCreate { .. }
+            | Command::CdcGroupRead { .. }
+            | Command::CdcAck { .. }
+            | Command::CdcPending { .. }
             | Command::ScriptLoad { .. }
             | Command::ScriptCall { .. }
-            | Command::ScriptDel { .. } => {
+            | Command::ScriptDel { .. }
+            | Command::StatsHotkeys { .. }
+            | Command::StatsLatency { .. }
+            | Command::StatsMemory { .. } => {
                 CommandResponse::Error("ERR command handled at server level".into())
+            }
+
+            #[cfg(not(feature = "vector"))]
+            Command::VecSet { .. } | Command::VecQuery { .. } | Command::VecDel { .. } => {
+                CommandResponse::Error("ERR vector feature not enabled".into())
             }
         }
     }
@@ -911,6 +941,67 @@ impl ShardStore {
                 ),
             },
             None => CommandResponse::Integer(0),
+        }
+    }
+
+    // ─── Vector operations ────────────────────────────────────────────
+
+    #[cfg(feature = "vector")]
+    fn cmd_vec_set(&mut self, key: &[u8], dimensions: usize, vector: &[f32]) -> CommandResponse {
+        let compact = CompactKey::new(key);
+        let index = self
+            .vector_indexes
+            .entry(compact)
+            .or_insert_with(|| HnswIndex::new(dimensions, DistanceMetric::L2, 16, 200));
+
+        if index.dim() != dimensions {
+            return CommandResponse::Error(format!(
+                "ERR dimension mismatch: index has {}, got {}",
+                index.dim(),
+                dimensions
+            ));
+        }
+
+        let id = {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for &v in vector {
+                std::hash::Hasher::write(&mut hasher, &v.to_le_bytes());
+            }
+            std::hash::Hasher::finish(&hasher)
+        };
+
+        index.insert(id, vector);
+        CommandResponse::Integer(id as i64)
+    }
+
+    #[cfg(feature = "vector")]
+    fn cmd_vec_query(&self, key: &[u8], k: usize, vector: &[f32]) -> CommandResponse {
+        let compact = CompactKey::new(key);
+        let index = match self.vector_indexes.get(&compact) {
+            Some(idx) => idx,
+            None => return CommandResponse::Array(vec![]),
+        };
+
+        let results = index.search(vector, k, k.max(50));
+        let items: Vec<CommandResponse> = results
+            .into_iter()
+            .map(|r| {
+                CommandResponse::Array(vec![
+                    CommandResponse::Integer(r.id as i64),
+                    CommandResponse::BulkString(format!("{}", r.distance).into_bytes()),
+                ])
+            })
+            .collect();
+        CommandResponse::Array(items)
+    }
+
+    #[cfg(feature = "vector")]
+    fn cmd_vec_del(&mut self, key: &[u8]) -> CommandResponse {
+        let compact = CompactKey::new(key);
+        if self.vector_indexes.remove(&compact).is_some() {
+            CommandResponse::Integer(1)
+        } else {
+            CommandResponse::Integer(0)
         }
     }
 

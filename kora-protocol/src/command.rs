@@ -378,6 +378,20 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
                 count: parse_u64(&args[1])? as usize,
             })
         }
+        b"CDC.GROUP" => parse_cdc_group(args),
+        b"CDC.ACK" => {
+            check_min_arity("CDC.ACK", args, 3)?;
+            let key = extract_bytes(&args[0])?;
+            let group = String::from_utf8_lossy(&extract_bytes(&args[1])?).into_owned();
+            let seqs = args[2..].iter().map(parse_u64).collect::<Result<_, _>>()?;
+            Ok(Command::CdcAck { key, group, seqs })
+        }
+        b"CDC.PENDING" => {
+            check_arity("CDC.PENDING", args, 2)?;
+            let key = extract_bytes(&args[0])?;
+            let group = String::from_utf8_lossy(&extract_bytes(&args[1])?).into_owned();
+            Ok(Command::CdcPending { key, group })
+        }
 
         // Vector commands
         b"VECSET" => {
@@ -423,10 +437,18 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
         b"SCRIPTCALL" => {
             check_min_arity("SCRIPTCALL", args, 1)?;
             let name = extract_bytes(&args[0])?;
-            let call_args = args[1..].iter().map(parse_i64).collect::<Result<_, _>>()?;
+            let byte_args: Vec<Vec<u8>> = args[1..]
+                .iter()
+                .map(extract_bytes)
+                .collect::<Result<_, _>>()?;
+            let int_args: Vec<i64> = byte_args
+                .iter()
+                .filter_map(|b| std::str::from_utf8(b).ok().and_then(|s| s.parse().ok()))
+                .collect();
             Ok(Command::ScriptCall {
                 name,
-                args: call_args,
+                args: int_args,
+                byte_args,
             })
         }
         b"SCRIPTDEL" => {
@@ -436,9 +458,68 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             })
         }
 
+        // Stats commands
+        b"STATS.HOTKEYS" => {
+            check_arity("STATS.HOTKEYS", args, 1)?;
+            Ok(Command::StatsHotkeys {
+                count: parse_u64(&args[0])? as usize,
+            })
+        }
+        b"STATS.LATENCY" => {
+            check_min_arity("STATS.LATENCY", args, 2)?;
+            let command = extract_bytes(&args[0])?;
+            let percentiles = args[1..].iter().map(parse_f64).collect::<Result<_, _>>()?;
+            Ok(Command::StatsLatency {
+                command,
+                percentiles,
+            })
+        }
+        b"STATS.MEMORY" => {
+            check_min_arity("STATS.MEMORY", args, 1)?;
+            let prefixes = args.iter().map(extract_bytes).collect::<Result<_, _>>()?;
+            Ok(Command::StatsMemory { prefixes })
+        }
+
         _ => Err(ProtocolError::UnknownCommand(
             String::from_utf8_lossy(&cmd_name).into_owned(),
         )),
+    }
+}
+
+fn parse_cdc_group(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    if args.is_empty() {
+        return Err(ProtocolError::WrongArity("CDC.GROUP".into()));
+    }
+    let subcmd = extract_string(&args[0])?.to_ascii_uppercase();
+    match subcmd.as_slice() {
+        b"CREATE" => {
+            check_arity("CDC.GROUP CREATE", &args[1..], 3)?;
+            let key = extract_bytes(&args[1])?;
+            let group = String::from_utf8_lossy(&extract_bytes(&args[2])?).into_owned();
+            let start_seq = parse_u64(&args[3])?;
+            Ok(Command::CdcGroupCreate {
+                key,
+                group,
+                start_seq,
+            })
+        }
+        b"READ" => {
+            check_arity("CDC.GROUP READ", &args[1..], 4)?;
+            let key = extract_bytes(&args[1])?;
+            let group = String::from_utf8_lossy(&extract_bytes(&args[2])?).into_owned();
+            let consumer = String::from_utf8_lossy(&extract_bytes(&args[3])?).into_owned();
+            let count = parse_u64(&args[4])? as usize;
+            Ok(Command::CdcGroupRead {
+                key,
+                group,
+                consumer,
+                count,
+            })
+        }
+        _ => Err(ProtocolError::InvalidData(format!(
+            "unknown CDC.GROUP subcommand: {}",
+            String::from_utf8_lossy(&subcmd)
+        ))),
     }
 }
 
@@ -572,6 +653,20 @@ fn parse_f32(val: &RespValue) -> Result<f32, ProtocolError> {
         }
         RespValue::Integer(n) => Ok(*n as f32),
         RespValue::Double(d) => Ok(*d as f32),
+        _ => Err(ProtocolError::InvalidData("expected float".into())),
+    }
+}
+
+fn parse_f64(val: &RespValue) -> Result<f64, ProtocolError> {
+    match val {
+        RespValue::BulkString(Some(data)) | RespValue::SimpleString(data) => {
+            std::str::from_utf8(data)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| ProtocolError::InvalidData("expected float".into()))
+        }
+        RespValue::Integer(n) => Ok(*n as f64),
+        RespValue::Double(d) => Ok(*d),
         _ => Err(ProtocolError::InvalidData("expected float".into())),
     }
 }
@@ -799,9 +894,14 @@ mod tests {
     fn test_parse_scriptcall() {
         let cmd = parse_command(make_cmd(&[b"SCRIPTCALL", b"myfn", b"42", b"7"])).unwrap();
         match cmd {
-            Command::ScriptCall { name, args } => {
+            Command::ScriptCall {
+                name,
+                args,
+                byte_args,
+            } => {
                 assert_eq!(name, b"myfn");
                 assert_eq!(args, vec![42, 7]);
+                assert_eq!(byte_args, vec![b"42".to_vec(), b"7".to_vec()]);
             }
             other => panic!("Expected ScriptCall, got {:?}", other),
         }

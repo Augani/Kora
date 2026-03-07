@@ -14,6 +14,7 @@
 //! - [`compressor`] — LZ4 compression utilities
 //! - [`manager`] — Unified storage coordinator
 //! - [`warm_tier`] — Memory-mapped warm tier storage
+//! - [`shard_storage`] — Per-shard WAL and RDB isolation
 //! - [`error`] — Storage error types
 
 #![warn(clippy::all)]
@@ -24,6 +25,7 @@ pub mod compressor;
 pub mod error;
 pub mod manager;
 pub mod rdb;
+pub mod shard_storage;
 #[cfg(feature = "io-uring")]
 pub mod uring_backend;
 pub mod wal;

@@ -7,7 +7,6 @@ rust-version.workspace = true
 description = "HNSW vector index and similarity search for Kōra"
 
 [dependencies]
-kora-core.workspace = true
 ordered-float.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true

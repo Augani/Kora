@@ -9,9 +9,11 @@
 //!
 //! - [`distance`] — Distance metric implementations
 //! - [`hnsw`] — HNSW graph index
+//! - [`quantizer`] — Product quantizer for vector compression
 
 #![warn(clippy::all)]
 #![warn(missing_docs)]
 
 pub mod distance;
 pub mod hnsw;
+pub mod quantizer;

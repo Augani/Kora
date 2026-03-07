@@ -329,6 +329,42 @@ pub enum Command {
         /// Maximum events to return.
         count: usize,
     },
+    /// CDC.GROUP CREATE key group start\_seq — create a consumer group.
+    CdcGroupCreate {
+        /// The CDC stream key.
+        key: Vec<u8>,
+        /// Consumer group name.
+        group: String,
+        /// Starting sequence number.
+        start_seq: u64,
+    },
+    /// CDC.GROUP READ key group consumer count — read from a consumer group.
+    CdcGroupRead {
+        /// The CDC stream key.
+        key: Vec<u8>,
+        /// Consumer group name.
+        group: String,
+        /// Consumer name within the group.
+        consumer: String,
+        /// Maximum events to return.
+        count: usize,
+    },
+    /// CDC.ACK key group seq \[seq ...\] — acknowledge events.
+    CdcAck {
+        /// The CDC stream key.
+        key: Vec<u8>,
+        /// Consumer group name.
+        group: String,
+        /// Sequence numbers to acknowledge.
+        seqs: Vec<u64>,
+    },
+    /// CDC.PENDING key group — list pending entries.
+    CdcPending {
+        /// The CDC stream key.
+        key: Vec<u8>,
+        /// Consumer group name.
+        group: String,
+    },
 
     // -- Vector commands --
     /// VECSET key dim v1 v2 ... — store a vector.
@@ -367,13 +403,34 @@ pub enum Command {
     ScriptCall {
         /// Function name.
         name: Vec<u8>,
-        /// Integer arguments.
+        /// Integer arguments (for numeric-only calls).
         args: Vec<i64>,
+        /// Byte arguments (for calls that pass binary data via WASM linear memory).
+        byte_args: Vec<Vec<u8>>,
     },
     /// SCRIPTDEL name — unload a WASM module.
     ScriptDel {
         /// Function name.
         name: Vec<u8>,
+    },
+
+    // -- Stats commands --
+    /// STATS.HOTKEYS count — return top hot keys.
+    StatsHotkeys {
+        /// Number of hot keys to return.
+        count: usize,
+    },
+    /// STATS.LATENCY command p1 p2 ... — return latency percentiles.
+    StatsLatency {
+        /// Command name (e.g. "GET").
+        command: Vec<u8>,
+        /// Percentile values to return (e.g. \[50.0, 99.0, 99.9\]).
+        percentiles: Vec<f64>,
+    },
+    /// STATS.MEMORY prefix ... — return memory usage for key prefixes.
+    StatsMemory {
+        /// Key prefixes to query.
+        prefixes: Vec<Vec<u8>>,
     },
 }
 
@@ -417,8 +474,8 @@ impl Command {
             | Command::SIsMember { key, .. }
             | Command::SCard { key }
             | Command::VecSet { key, .. }
-            | Command::VecQuery { key, .. }
             | Command::VecDel { key } => Some(key),
+            Command::VecQuery { .. } => None,
             _ => None,
         }
     }
@@ -453,9 +510,16 @@ impl Command {
                 | Command::Auth { .. }
                 | Command::Dump
                 | Command::CdcPoll { .. }
+                | Command::CdcGroupCreate { .. }
+                | Command::CdcGroupRead { .. }
+                | Command::CdcAck { .. }
+                | Command::CdcPending { .. }
                 | Command::ScriptLoad { .. }
                 | Command::ScriptCall { .. }
                 | Command::ScriptDel { .. }
+                | Command::StatsHotkeys { .. }
+                | Command::StatsLatency { .. }
+                | Command::StatsMemory { .. }
         )
     }
 

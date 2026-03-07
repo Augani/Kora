@@ -7,10 +7,14 @@
 
 #![warn(clippy::all)]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use kora_core::command::{Command, CommandResponse};
 use kora_core::shard::ShardEngine;
+
+#[cfg(feature = "server")]
+use tokio::task::JoinHandle;
 
 /// Configuration for the embedded database.
 pub struct Config {
@@ -33,19 +37,24 @@ impl Default for Config {
 /// Uses the same multi-threaded shard engine as the server, but accessed
 /// via direct function calls instead of TCP.
 pub struct Database {
-    engine: ShardEngine,
+    engine: Arc<ShardEngine>,
 }
 
 impl Database {
     /// Open a new database with the given configuration.
     pub fn open(config: Config) -> Self {
-        let engine = ShardEngine::new(config.shard_count);
+        let engine = Arc::new(ShardEngine::new(config.shard_count));
         Self { engine }
     }
 
     /// Get a reference to the underlying engine.
     pub fn engine(&self) -> &ShardEngine {
         &self.engine
+    }
+
+    /// Get a shared reference to the engine (for hybrid mode).
+    pub fn shared_engine(&self) -> Arc<ShardEngine> {
+        self.engine.clone()
     }
 
     // ─── String operations ───────────────────────────────────────
@@ -524,6 +533,104 @@ impl Database {
     pub fn flush_db(&self) {
         self.engine.dispatch_blocking(Command::FlushDb);
     }
+
+    // ─── Vector operations ──────────────────────────────────────
+
+    /// Insert a vector into a named index, returning the vector ID.
+    ///
+    /// Creates the index if it does not exist.
+    pub fn vector_set(&self, index: &str, dim: usize, vector: &[f32]) -> Result<u64, String> {
+        match self.engine.dispatch_blocking(Command::VecSet {
+            key: index.as_bytes().to_vec(),
+            dimensions: dim,
+            vector: vector.to_vec(),
+        }) {
+            CommandResponse::Integer(id) => Ok(id as u64),
+            CommandResponse::Error(e) => Err(e),
+            _ => Err("unexpected response".into()),
+        }
+    }
+
+    /// Search for the K nearest neighbors of a query vector.
+    ///
+    /// Returns a list of `(id, distance)` pairs sorted by distance.
+    pub fn vector_search(
+        &self,
+        index: &str,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<(u64, f32)>, String> {
+        match self.engine.dispatch_blocking(Command::VecQuery {
+            key: index.as_bytes().to_vec(),
+            k,
+            vector: query.to_vec(),
+        }) {
+            CommandResponse::Array(items) => {
+                let mut results = Vec::with_capacity(items.len());
+                for item in items {
+                    if let CommandResponse::Array(pair) = item {
+                        if pair.len() == 2 {
+                            if let (
+                                CommandResponse::Integer(id),
+                                CommandResponse::BulkString(dist_bytes),
+                            ) = (&pair[0], &pair[1])
+                            {
+                                let dist: f32 = String::from_utf8_lossy(dist_bytes)
+                                    .parse()
+                                    .unwrap_or(f32::MAX);
+                                results.push((*id as u64, dist));
+                            }
+                        }
+                    }
+                }
+                Ok(results)
+            }
+            CommandResponse::Error(e) => Err(e),
+            _ => Err("unexpected response".into()),
+        }
+    }
+
+    /// Delete an entire vector index. Returns true if it existed.
+    pub fn vector_del(&self, index: &str) -> Result<bool, String> {
+        match self.engine.dispatch_blocking(Command::VecDel {
+            key: index.as_bytes().to_vec(),
+        }) {
+            CommandResponse::Integer(n) => Ok(n > 0),
+            CommandResponse::Error(e) => Err(e),
+            _ => Err("unexpected response".into()),
+        }
+    }
+
+    // ─── Hybrid mode ────────────────────────────────────────────
+
+    /// Start a TCP listener on the given address, sharing this database's engine.
+    ///
+    /// Returns a `JoinHandle` for the background server task. The server runs
+    /// until the returned shutdown sender is signaled or the handle is dropped.
+    ///
+    /// Requires the `server` feature.
+    #[cfg(feature = "server")]
+    pub fn start_listener(
+        &self,
+        addr: &str,
+    ) -> Result<(JoinHandle<()>, tokio::sync::watch::Sender<bool>), String> {
+        let engine = self.engine.clone();
+        let config = kora_server::ServerConfig {
+            bind_address: addr.to_string(),
+            worker_count: engine.shard_count(),
+            ..Default::default()
+        };
+        let server = kora_server::KoraServer::with_engine(engine, config);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(async move {
+            if let Err(e) = server.run(shutdown_rx).await {
+                tracing::error!("Hybrid server error: {}", e);
+            }
+        });
+
+        Ok((handle, shutdown_tx))
+    }
 }
 
 #[cfg(test)]
@@ -607,5 +714,48 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn test_vector_set_search_del() {
+        let db = Database::open(Config { shard_count: 2 });
+
+        let v1 = vec![1.0f32, 0.0, 0.0, 0.0];
+        let v2 = vec![0.0f32, 1.0, 0.0, 0.0];
+        let v3 = vec![1.0f32, 1.0, 0.0, 0.0];
+
+        let id1 = db.vector_set("my_idx", 4, &v1).unwrap();
+        let id2 = db.vector_set("my_idx", 4, &v2).unwrap();
+        let id3 = db.vector_set("my_idx", 4, &v3).unwrap();
+        assert_ne!(id1, id2);
+        assert_ne!(id2, id3);
+
+        let results = db.vector_search("my_idx", &v1, 3).unwrap();
+        assert!(!results.is_empty());
+        assert!(
+            results[0].1 < 0.001,
+            "first result should be near-exact match"
+        );
+
+        assert!(db.vector_del("my_idx").unwrap());
+        assert!(!db.vector_del("my_idx").unwrap());
+
+        let results = db.vector_search("my_idx", &v1, 3).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_vector_dimension_mismatch() {
+        let db = Database::open(Config { shard_count: 2 });
+        db.vector_set("idx", 3, &[1.0, 2.0, 3.0]).unwrap();
+        let result = db.vector_set("idx", 5, &[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vector_search_nonexistent_index() {
+        let db = Database::open(Config { shard_count: 2 });
+        let results = db.vector_search("nonexistent", &[1.0, 2.0], 5).unwrap();
+        assert!(results.is_empty());
     }
 }

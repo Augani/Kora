@@ -14,10 +14,12 @@ parking_lot.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 kora-observability = { workspace = true, optional = true }
+kora-vector = { workspace = true, optional = true }
 
 [features]
-default = ["observability"]
+default = ["observability", "vector"]
 observability = ["dep:kora-observability"]
+vector = ["dep:kora-vector"]
 
 [dev-dependencies]
 criterion.workspace = true

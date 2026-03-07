@@ -48,6 +48,10 @@ struct Args {
     /// WASM scripting fuel budget (0 = disabled).
     #[arg(long)]
     script_max_fuel: Option<u64>,
+
+    /// Port for Prometheus metrics HTTP endpoint (0 = disabled).
+    #[arg(long)]
+    metrics_port: Option<u16>,
 }
 
 #[tokio::main]
@@ -111,12 +115,15 @@ async fn main() -> anyhow::Result<()> {
         .or(file_config.script_max_fuel)
         .unwrap_or(0);
 
+    let metrics_port = args.metrics_port.or(file_config.metrics_port).unwrap_or(0);
+
     let config = ServerConfig {
         bind_address: format!("{}:{}", bind, port),
         worker_count,
         storage,
         cdc_capacity,
         script_max_fuel,
+        metrics_port,
     };
 
     tracing::info!(

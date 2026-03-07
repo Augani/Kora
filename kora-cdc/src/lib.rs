@@ -9,9 +9,11 @@
 //!
 //! - [`ring`] — Per-shard ring buffer for mutation events
 //! - [`subscription`] — Consumer subscription management
+//! - [`consumer`] — Consumer group tracking with ack and redelivery
 
 #![warn(clippy::all)]
 #![warn(missing_docs)]
 
+pub mod consumer;
 pub mod ring;
 pub mod subscription;
