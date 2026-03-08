@@ -1,11 +1,8 @@
 use std::cell::RefCell;
-use std::future::{poll_fn, Future};
 use std::mem;
-use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::task::Poll;
 
 use ahash::AHashSet;
 use bytes::BytesMut;
@@ -18,7 +15,7 @@ use kora_protocol::{parse_command, serialize_response_versioned, HotCommandRef, 
 use kora_pubsub::{MessageSink, PubSubMessage};
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 
 use super::dispatch;
 use super::{execute_with_wal_inline, AffinitySharedState, ShardRouter, CROSS_SHARD_TIMEOUT};
@@ -49,7 +46,8 @@ struct ConnState {
 }
 
 type BatchedResponse = Vec<(usize, CommandResponse)>;
-type BatchedResponseReceiver = oneshot::Receiver<BatchedResponse>;
+type BatchedResponseReceiver = mpsc::UnboundedReceiver<BatchedResponse>;
+type BatchedResponseSender = mpsc::UnboundedSender<BatchedResponse>;
 type PendingForeignBatch = Vec<(usize, Command)>;
 
 fn internal_shard_error() -> CommandResponse {
@@ -58,45 +56,31 @@ fn internal_shard_error() -> CommandResponse {
 
 async fn resolve_response_slots(
     mut responses: Vec<Option<CommandResponse>>,
-    batch_receivers: Vec<BatchedResponseReceiver>,
+    mut batch_receiver: BatchedResponseReceiver,
+    expected_batches: usize,
 ) -> Vec<CommandResponse> {
-    let mut batch_receivers: Vec<Option<BatchedResponseReceiver>> =
-        batch_receivers.into_iter().map(Some).collect();
+    if expected_batches > 0 {
+        let deadline = tokio::time::Instant::now() + CROSS_SHARD_TIMEOUT;
+        let mut received_batches = 0usize;
 
-    if !batch_receivers.is_empty() {
-        let wait_for_pending = poll_fn(|cx| {
-            let mut any_pending = false;
+        while received_batches < expected_batches {
+            let now = tokio::time::Instant::now();
+            let Some(remaining) = deadline.checked_duration_since(now) else {
+                break;
+            };
 
-            for receiver in &mut batch_receivers {
-                let Some(rx) = receiver.as_mut() else {
-                    continue;
-                };
-
-                match Pin::new(rx).poll(cx) {
-                    Poll::Ready(Ok(batch)) => {
-                        for (index, resp) in batch {
-                            responses[index] = Some(resp);
-                        }
-                        *receiver = None;
+            match tokio::time::timeout(remaining, batch_receiver.recv()).await {
+                Ok(Some(batch)) => {
+                    for (index, resp) in batch {
+                        responses[index] = Some(resp);
                     }
-                    Poll::Ready(Err(_)) => {
-                        *receiver = None;
-                    }
-                    Poll::Pending => any_pending = true,
+                    received_batches += 1;
                 }
+                Ok(None) | Err(_) => break,
             }
+        }
 
-            if any_pending {
-                Poll::Pending
-            } else {
-                Poll::Ready(())
-            }
-        });
-
-        if tokio::time::timeout(CROSS_SHARD_TIMEOUT, wait_for_pending)
-            .await
-            .is_err()
-        {
+        if received_batches != expected_batches {
             for resp in &mut responses {
                 if resp.is_none() {
                     *resp = Some(internal_shard_error());
@@ -232,7 +216,6 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             parser.feed(&read_buf[..n]);
 
             let mut responses: Vec<Option<CommandResponse>> = Vec::with_capacity(16);
-            let mut pending_batch_receivers = Vec::new();
             let mut pending_foreign_batches: Vec<PendingForeignBatch> =
                 vec![Vec::new(); router.shard_count()];
 
@@ -266,7 +249,6 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                                 flush_pending_responses(
                                     router,
                                     &mut pending_foreign_batches,
-                                    &mut pending_batch_receivers,
                                     &mut responses,
                                     write_buf,
                                     conn.resp3,
@@ -313,7 +295,6 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             flush_pending_responses(
                 router,
                 &mut pending_foreign_batches,
-                &mut pending_batch_receivers,
                 &mut responses,
                 write_buf,
                 conn.resp3,
@@ -369,9 +350,11 @@ fn append_wal_record(wal_writer: &Rc<RefCell<Option<Box<dyn WalWriter>>>>, recor
 fn flush_pending_foreign_batches(
     router: &ShardRouter,
     pending_foreign_batches: &mut [PendingForeignBatch],
-    pending_batch_receivers: &mut Vec<BatchedResponseReceiver>,
+    batch_tx: &BatchedResponseSender,
     responses: &mut [Option<CommandResponse>],
-) {
+) -> usize {
+    let mut expected_batches = 0usize;
+
     for (target_shard, commands) in pending_foreign_batches.iter_mut().enumerate() {
         if commands.is_empty() {
             continue;
@@ -379,8 +362,9 @@ fn flush_pending_foreign_batches(
 
         let batch = mem::take(commands);
         let pending_indices: Vec<usize> = batch.iter().map(|(index, _)| *index).collect();
-        match router.try_dispatch_foreign_batch(target_shard as u16, batch) {
-            Ok(rx) => pending_batch_receivers.push(rx),
+        match router.try_dispatch_foreign_batch_stream(target_shard as u16, batch, batch_tx.clone())
+        {
+            Ok(()) => expected_batches += 1,
             Err(resp) => {
                 for index in pending_indices {
                     responses[index] = Some(resp.clone());
@@ -388,12 +372,13 @@ fn flush_pending_foreign_batches(
             }
         }
     }
+
+    expected_batches
 }
 
 async fn flush_pending_responses(
     router: &ShardRouter,
     pending_foreign_batches: &mut [PendingForeignBatch],
-    pending_batch_receivers: &mut Vec<BatchedResponseReceiver>,
     responses: &mut Vec<Option<CommandResponse>>,
     write_buf: &mut BytesMut,
     resp3: bool,
@@ -402,16 +387,12 @@ async fn flush_pending_responses(
         return;
     }
 
-    flush_pending_foreign_batches(
-        router,
-        pending_foreign_batches,
-        pending_batch_receivers,
-        responses,
-    );
+    let (batch_tx, batch_rx) = mpsc::unbounded_channel();
+    let expected_batches =
+        flush_pending_foreign_batches(router, pending_foreign_batches, &batch_tx, responses);
+    drop(batch_tx);
 
-    for resp in
-        resolve_response_slots(mem::take(responses), mem::take(pending_batch_receivers)).await
-    {
+    for resp in resolve_response_slots(mem::take(responses), batch_rx, expected_batches).await {
         serialize_response_versioned(&resp, write_buf, resp3);
     }
 }

@@ -38,9 +38,9 @@ pub(crate) enum ShardRequest {
         request: MemcacheRequest,
         response_tx: oneshot::Sender<MemcacheResponse>,
     },
-    ExecuteBatch {
+    ExecuteBatchStream {
         commands: Vec<(usize, Command)>,
-        response_tx: oneshot::Sender<Vec<(usize, CommandResponse)>>,
+        response_tx: mpsc::UnboundedSender<Vec<(usize, CommandResponse)>>,
     },
     BgSave {
         request: SnapshotRequest,
@@ -148,19 +148,18 @@ impl ShardRouter {
         Ok(rx)
     }
 
-    pub fn try_dispatch_foreign_batch(
+    pub fn try_dispatch_foreign_batch_stream(
         &self,
         shard_id: u16,
         commands: Vec<(usize, Command)>,
-    ) -> Result<oneshot::Receiver<Vec<(usize, CommandResponse)>>, CommandResponse> {
-        let (tx, rx) = oneshot::channel();
+        response_tx: mpsc::UnboundedSender<Vec<(usize, CommandResponse)>>,
+    ) -> Result<(), CommandResponse> {
         self.shard_senders[shard_id as usize]
-            .try_send(ShardRequest::ExecuteBatch {
+            .try_send(ShardRequest::ExecuteBatchStream {
                 commands,
-                response_tx: tx,
+                response_tx,
             })
-            .map_err(|_| CommandResponse::Error("ERR shard unavailable".into()))?;
-        Ok(rx)
+            .map_err(|_| CommandResponse::Error("ERR shard unavailable".into()))
     }
 
     pub fn try_dispatch_foreign_broadcast<F>(
@@ -653,7 +652,7 @@ async fn shard_worker_loop(
                         );
                         let _ = response_tx.send(resp);
                     }
-                    ShardRequest::ExecuteBatch { commands, response_tx } => {
+                    ShardRequest::ExecuteBatchStream { commands, response_tx } => {
                         let results: Vec<_> = commands
                             .into_iter()
                             .map(|(idx, cmd)| {
