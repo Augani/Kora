@@ -110,8 +110,13 @@ pub enum Value {
 }
 
 impl Value {
-    /// Create a Value from a byte slice, auto-detecting integer or string.
+    /// Create a string Value from a byte slice without integer auto-detection.
     pub fn from_bytes(data: &[u8]) -> Self {
+        Self::from_raw_bytes(data)
+    }
+
+    /// Create a Value from a byte slice, parsing a decimal integer when possible.
+    pub fn from_bytes_auto_int(data: &[u8]) -> Self {
         // Try to parse as integer first
         if let Ok(s) = std::str::from_utf8(data) {
             if let Ok(i) = s.parse::<i64>() {
@@ -372,21 +377,28 @@ mod tests {
     }
 
     #[test]
-    fn test_integer_detection() {
+    fn test_from_bytes_keeps_numeric_strings_raw() {
         let v = Value::from_bytes(b"42");
+        assert!(matches!(v, Value::InlineStr { .. }));
+        assert_eq!(v.as_bytes().unwrap(), b"42");
+    }
+
+    #[test]
+    fn test_integer_detection() {
+        let v = Value::from_bytes_auto_int(b"42");
         assert!(matches!(v, Value::Int(42)));
         assert_eq!(v.as_bytes().unwrap(), b"42");
     }
 
     #[test]
     fn test_negative_integer() {
-        let v = Value::from_bytes(b"-100");
+        let v = Value::from_bytes_auto_int(b"-100");
         assert!(matches!(v, Value::Int(-100)));
     }
 
     #[test]
     fn test_not_an_integer() {
-        let v = Value::from_bytes(b"12abc");
+        let v = Value::from_bytes_auto_int(b"12abc");
         assert!(!matches!(v, Value::Int(_)));
     }
 
