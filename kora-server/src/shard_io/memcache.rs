@@ -364,8 +364,9 @@ fn dispatch_request(
     }
 
     let (tx, rx) = oneshot::channel();
-    match router.shard_senders[target_shard as usize].try_send(ShardRequest::ExecuteMemcache {
+    match router.shard_senders[target_shard as usize].send(ShardRequest::ExecuteMemcache {
         request,
+        queued_at: std::time::Instant::now(),
         response_tx: tx,
     }) {
         Ok(()) => slots.push(ResponseSlot::Pending { rx, noreply }),
@@ -402,8 +403,9 @@ async fn handle_multi_get(
 
         let (tx, rx) = oneshot::channel();
         if router.shard_senders[target_shard as usize]
-            .try_send(ShardRequest::ExecuteMemcache {
+            .send(ShardRequest::ExecuteMemcache {
                 request: MemcacheRequest::Get { key },
+                queued_at: std::time::Instant::now(),
                 response_tx: tx,
             })
             .is_ok()

@@ -1,6 +1,6 @@
 //! Per-shard key-value store with full Redis command execution.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use ahash::AHashMap;
@@ -342,13 +342,10 @@ impl ShardStore {
             Command::IncrBy { key, delta } => self.cmd_incrby(&key, delta),
             Command::DecrBy { key, delta } => self.cmd_incrby(&key, -delta),
             Command::SetNx { key, value } => {
-                let compact = CompactKey::new(&key);
-                let key_exists = self.entries.contains_key(&compact) && !self.is_expired(&compact);
-                if key_exists {
-                    CommandResponse::Integer(0)
-                } else {
-                    self.cmd_set(&key, &value, None, None, false, false);
-                    CommandResponse::Integer(1)
+                match self.cmd_set(&key, &value, None, None, true, false) {
+                    CommandResponse::Ok => CommandResponse::Integer(1),
+                    CommandResponse::Nil => CommandResponse::Integer(0),
+                    other => other,
                 }
             }
 
@@ -577,8 +574,7 @@ impl ShardStore {
 
     fn cmd_get(&mut self, key: &[u8]) -> CommandResponse {
         self.lazy_expire(key);
-        let compact = CompactKey::new(key);
-        match self.entries.get(&compact) {
+        match self.entries.get(key) {
             Some(entry) => match entry.value.bulk_response() {
                 Some(resp) => resp,
                 None => CommandResponse::Error(
@@ -598,33 +594,68 @@ impl ShardStore {
         nx: bool,
         xx: bool,
     ) -> CommandResponse {
+        let ttl = Command::ttl_duration(ex, px);
         let compact = CompactKey::new(key);
-        let key_exists = self.entries.contains_key(&compact) && !self.is_expired(&compact);
+        let tenant_id = self.current_tenant;
+        match self.entries.entry(compact) {
+            Entry::Occupied(mut occupied) => {
+                if occupied.get().is_expired() {
+                    let (map_key, old_entry) = occupied.remove_entry();
+                    let old_size =
+                        Self::estimate_key_entry_size(map_key.as_bytes(), &old_entry.value);
+                    self.memory_used = self.memory_used.saturating_sub(old_size);
+                    let tm = self.tenant_memory.entry(old_entry.tenant_id).or_insert(0);
+                    *tm = tm.saturating_sub(old_size);
 
-        if nx && key_exists {
-            return CommandResponse::Nil;
-        }
-        if xx && !key_exists {
-            return CommandResponse::Nil;
-        }
+                    if xx {
+                        return CommandResponse::Nil;
+                    }
 
-        if let Some(old_entry) = self.entries.get(&compact) {
-            let old_size = Self::estimate_key_entry_size(key, &old_entry.value);
-            let old_tenant = old_entry.tenant_id;
-            self.memory_used = self.memory_used.saturating_sub(old_size);
-            let tm = self.tenant_memory.entry(old_tenant).or_insert(0);
-            *tm = tm.saturating_sub(old_size);
+                    let (entry, entry_size) =
+                        Self::build_string_entry(&map_key, value, ttl, tenant_id);
+                    self.memory_used += entry_size;
+                    *self.tenant_memory.entry(tenant_id).or_insert(0) += entry_size;
+                    self.entries.insert(map_key, entry);
+                    CommandResponse::Ok
+                } else {
+                    if nx {
+                        return CommandResponse::Nil;
+                    }
+
+                    let old_size = Self::estimate_key_entry_size(
+                        occupied.key().as_bytes(),
+                        &occupied.get().value,
+                    );
+                    self.memory_used = self.memory_used.saturating_sub(old_size);
+                    let tm = self
+                        .tenant_memory
+                        .entry(occupied.get().tenant_id)
+                        .or_insert(0);
+                    *tm = tm.saturating_sub(old_size);
+
+                    let replacement_key = occupied.key().clone();
+                    let (entry, entry_size) =
+                        Self::build_string_entry(&replacement_key, value, ttl, tenant_id);
+                    self.memory_used += entry_size;
+                    *self.tenant_memory.entry(tenant_id).or_insert(0) += entry_size;
+                    occupied.insert(entry);
+                    CommandResponse::Ok
+                }
+            }
+            Entry::Vacant(vacant) => {
+                if xx {
+                    return CommandResponse::Nil;
+                }
+
+                let entry_key = vacant.key().clone();
+                let (entry, entry_size) =
+                    Self::build_string_entry(&entry_key, value, ttl, tenant_id);
+                self.memory_used += entry_size;
+                *self.tenant_memory.entry(tenant_id).or_insert(0) += entry_size;
+                vacant.insert(entry);
+                CommandResponse::Ok
+            }
         }
-        let new_value = Value::from_raw_bytes(value);
-        let entry_size = Self::estimate_key_entry_size(key, &new_value);
-        self.memory_used += entry_size;
-        *self.tenant_memory.entry(self.current_tenant).or_insert(0) += entry_size;
-        let mut entry = KeyEntry::new_with_tenant(compact.clone(), new_value, self.current_tenant);
-        if let Some(dur) = Command::ttl_duration(ex, px) {
-            entry.set_ttl(dur);
-        }
-        self.entries.insert(compact, entry);
-        CommandResponse::Ok
     }
 
     fn cmd_getset(&mut self, key: &[u8], value: &[u8]) -> CommandResponse {
@@ -673,8 +704,7 @@ impl ShardStore {
 
     fn cmd_strlen(&mut self, key: &[u8]) -> CommandResponse {
         self.lazy_expire(key);
-        let compact = CompactKey::new(key);
-        match self.entries.get(&compact) {
+        match self.entries.get(key) {
             Some(entry) => match entry.value.string_len() {
                 Some(len) => CommandResponse::Integer(len as i64),
                 None => CommandResponse::Error(
@@ -687,8 +717,7 @@ impl ShardStore {
 
     fn cmd_incrby(&mut self, key: &[u8], delta: i64) -> CommandResponse {
         self.lazy_expire(key);
-        let compact = CompactKey::new(key);
-        match self.entries.get_mut(&compact) {
+        match self.entries.get_mut(key) {
             Some(entry) => {
                 let current = match &entry.value {
                     Value::Int(i) => *i,
@@ -736,6 +765,7 @@ impl ShardStore {
                 }
             }
             None => {
+                let compact = CompactKey::new(key);
                 let entry = KeyEntry::new(compact.clone(), Value::Int(delta));
                 self.entries.insert(compact, entry);
                 CommandResponse::Integer(delta)
@@ -752,13 +782,11 @@ impl ShardStore {
 
     fn exists(&mut self, key: &[u8]) -> bool {
         self.lazy_expire(key);
-        let compact = CompactKey::new(key);
-        self.entries.contains_key(&compact)
+        self.entries.contains_key(key)
     }
 
     fn cmd_expire(&mut self, key: &[u8], duration: Duration) -> CommandResponse {
-        let compact = CompactKey::new(key);
-        match self.entries.get_mut(&compact) {
+        match self.entries.get_mut(key) {
             Some(entry) if !entry.is_expired() => {
                 entry.set_ttl(duration);
                 CommandResponse::Integer(1)
@@ -768,8 +796,7 @@ impl ShardStore {
     }
 
     fn cmd_persist(&mut self, key: &[u8]) -> CommandResponse {
-        let compact = CompactKey::new(key);
-        match self.entries.get_mut(&compact) {
+        match self.entries.get_mut(key) {
             Some(entry) if !entry.is_expired() && entry.ttl.is_some() => {
                 entry.clear_ttl();
                 CommandResponse::Integer(1)
@@ -780,8 +807,7 @@ impl ShardStore {
 
     fn cmd_ttl(&mut self, key: &[u8], millis: bool) -> CommandResponse {
         self.lazy_expire(key);
-        let compact = CompactKey::new(key);
-        match self.entries.get(&compact) {
+        match self.entries.get(key) {
             None => CommandResponse::Integer(-2),
             Some(entry) => match entry.remaining_ttl() {
                 None => CommandResponse::Integer(-1),
@@ -798,8 +824,7 @@ impl ShardStore {
 
     fn cmd_type(&mut self, key: &[u8]) -> CommandResponse {
         self.lazy_expire(key);
-        let compact = CompactKey::new(key);
-        match self.entries.get(&compact) {
+        match self.entries.get(key) {
             Some(entry) => CommandResponse::SimpleString(entry.value.type_name().to_string()),
             None => CommandResponse::SimpleString("none".to_string()),
         }
@@ -1692,14 +1717,29 @@ impl ShardStore {
 
     // ─── Helpers ─────────────────────────────────────────────────────
 
+    fn build_string_entry(
+        key: &CompactKey,
+        value: &[u8],
+        ttl: Option<Duration>,
+        tenant_id: TenantId,
+    ) -> (KeyEntry, usize) {
+        let new_value = Value::from_raw_bytes(value);
+        let entry_size = Self::estimate_key_entry_size(key.as_bytes(), &new_value);
+        let mut entry = KeyEntry::new_with_tenant(key.clone(), new_value, tenant_id);
+        if let Some(dur) = ttl {
+            entry.set_ttl(dur);
+        }
+        (entry, entry_size)
+    }
+
     fn lazy_expire(&mut self, key: &[u8]) {
-        let compact = CompactKey::new(key);
-        if self.is_expired(&compact) {
+        if self.is_expired(key) {
+            let compact = CompactKey::new(key);
             let _ = self.remove_compact_entry(&compact);
         }
     }
 
-    fn is_expired(&self, key: &CompactKey) -> bool {
+    fn is_expired(&self, key: &[u8]) -> bool {
         self.entries
             .get(key)
             .is_some_and(|entry| entry.is_expired())
@@ -2302,6 +2342,34 @@ mod tests {
             CommandResponse::BulkString(v) => assert_eq!(v, b"v1"),
             other => panic!("Expected v1, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_set_xx_treats_expired_key_as_missing() {
+        let mut store = ShardStore::new(0);
+        store.execute(Command::Set {
+            key: b"k".to_vec(),
+            value: b"stale".to_vec(),
+            ex: None,
+            px: Some(1),
+            nx: false,
+            xx: false,
+        });
+        std::thread::sleep(Duration::from_millis(5));
+
+        let resp = store.execute(Command::Set {
+            key: b"k".to_vec(),
+            value: b"fresh".to_vec(),
+            ex: None,
+            px: None,
+            nx: false,
+            xx: true,
+        });
+        assert!(matches!(resp, CommandResponse::Nil));
+        assert!(matches!(
+            store.execute(Command::Get { key: b"k".to_vec() }),
+            CommandResponse::Nil
+        ));
     }
 
     #[test]

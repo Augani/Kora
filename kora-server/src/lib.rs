@@ -42,15 +42,16 @@ pub struct ServerConfig {
 
 /// Returns the optimal shard worker count for the current machine.
 ///
-/// - 1-2 cores: 1 worker (single shard, zero cross-shard overhead — matches
-///   Redis's single-threaded model while keeping inline execution advantage).
-/// - 3+ cores: N workers (multi-shard with SO\_REUSEPORT, scales linearly).
+/// Always uses N workers matching available cores. Even on 2 vCPU,
+/// workers=2 with SO\_REUSEPORT is the correct default: it handles
+/// pipeline workloads correctly and has materially better p99 tail
+/// latency than workers=1 on the benchmarked 2 vCPU setup. Single-shard
+/// mode now pipelines correctly, but still shows large tail stalls from
+/// event-loop blocking during hash table growth and other maintenance work.
 pub fn optimal_worker_count() -> usize {
-    match std::thread::available_parallelism().map(|n| n.get()) {
-        Ok(1) | Ok(2) => 1,
-        Ok(n) => n,
-        Err(_) => 1,
-    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 impl Default for ServerConfig {
@@ -58,7 +59,7 @@ impl Default for ServerConfig {
         Self {
             bind_address: "127.0.0.1:6379".into(),
             memcached_bind_address: None,
-            worker_count: optimal_worker_count(),
+            worker_count: optimal_worker_count().max(1),
             storage: None,
             cdc_capacity: 0,
             script_max_fuel: 0,

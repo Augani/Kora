@@ -1,5 +1,6 @@
 //! Compact key representation and key-entry metadata.
 
+use std::borrow::Borrow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -57,6 +58,12 @@ impl CompactKey {
 
 impl AsRef<[u8]> for CompactKey {
     fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl Borrow<[u8]> for CompactKey {
+    fn borrow(&self) -> &[u8] {
         self.as_bytes()
     }
 }

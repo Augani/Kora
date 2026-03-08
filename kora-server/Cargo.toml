@@ -24,9 +24,9 @@ parking_lot.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
+hdrhistogram.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 rand.workspace = true
-hdrhistogram.workspace = true
 tempfile.workspace = true

@@ -3,6 +3,7 @@ use std::mem;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 
 use ahash::AHashSet;
 use bytes::BytesMut;
@@ -18,6 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use super::dispatch;
+use super::stage_metrics::{format_stage_metrics_info, BatchStage, BatchStageMetrics};
 use super::{execute_with_wal_inline, AffinitySharedState, ShardRouter, CROSS_SHARD_TIMEOUT};
 
 const PUBSUB_CHANNEL_CAPACITY: usize = 8192;
@@ -45,10 +47,24 @@ struct ConnState {
     subscribed_patterns: AHashSet<Vec<u8>>,
 }
 
-type BatchedResponse = Vec<(usize, CommandResponse)>;
+type PendingForeignBatch = Vec<(usize, Command)>;
+type BatchedResponse = (u64, Instant, Vec<(usize, CommandResponse)>);
 type BatchedResponseReceiver = mpsc::UnboundedReceiver<BatchedResponse>;
 type BatchedResponseSender = mpsc::UnboundedSender<BatchedResponse>;
-type PendingForeignBatch = Vec<(usize, Command)>;
+
+#[derive(Default)]
+struct BatchLoopDurations {
+    route_ns: u64,
+    execute_ns: u64,
+    foreign_wait_ns: u64,
+    serialize_ns: u64,
+}
+
+#[derive(Default)]
+struct FlushDurations {
+    foreign_wait_ns: u64,
+    serialize_ns: u64,
+}
 
 fn internal_shard_error() -> CommandResponse {
     CommandResponse::Error("ERR internal error".into())
@@ -56,7 +72,9 @@ fn internal_shard_error() -> CommandResponse {
 
 async fn resolve_response_slots(
     mut responses: Vec<Option<CommandResponse>>,
-    mut batch_receiver: BatchedResponseReceiver,
+    batch_receiver: &mut BatchedResponseReceiver,
+    metrics: &BatchStageMetrics,
+    flush_id: u64,
     expected_batches: usize,
 ) -> Vec<CommandResponse> {
     if expected_batches > 0 {
@@ -70,7 +88,14 @@ async fn resolve_response_slots(
             };
 
             match tokio::time::timeout(remaining, batch_receiver.recv()).await {
-                Ok(Some(batch)) => {
+                Ok(Some((response_flush_id, sent_at, batch))) => {
+                    metrics.record(
+                        BatchStage::RemoteDelivery,
+                        sent_at.elapsed().as_nanos() as u64,
+                    );
+                    if response_flush_id != flush_id {
+                        continue;
+                    }
                     for (index, resp) in batch {
                         responses[index] = Some(resp);
                     }
@@ -152,6 +177,9 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     read_buf: &mut [u8],
     conn: &mut ConnState,
 ) -> std::io::Result<()> {
+    let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
+    let mut next_flush_id = 1u64;
+
     loop {
         let in_pubsub_mode = conn.subscription_count > 0 || conn.pattern_count > 0;
         let mut should_yield_after_batch = false;
@@ -215,11 +243,13 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                 return Ok(());
             }
             parser.feed(&read_buf[..n]);
+            let batch_start = Instant::now();
 
             let mut responses: Vec<Option<CommandResponse>> = Vec::with_capacity(16);
             let mut pending_foreign_batches: Vec<PendingForeignBatch> =
                 vec![Vec::new(); router.shard_count()];
             let mut processed_batch = false;
+            let mut stage_durations = BatchLoopDurations::default();
 
             loop {
                 if parser
@@ -234,6 +264,7 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                             conn,
                             &mut responses,
                             &mut pending_foreign_batches,
+                            &mut stage_durations,
                         );
                     })
                     .is_some()
@@ -250,14 +281,26 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                                 continue;
                             }
                             if is_complex_command(&cmd) {
-                                flush_pending_responses(
+                                let flush_durations = flush_pending_responses(
                                     router,
+                                    &shared.batch_stage_metrics,
                                     &mut pending_foreign_batches,
                                     &mut responses,
+                                    &batch_tx,
+                                    &mut batch_rx,
+                                    &mut next_flush_id,
                                     write_buf,
                                     conn.resp3,
                                 )
                                 .await;
+                                stage_durations.foreign_wait_ns = stage_durations
+                                    .foreign_wait_ns
+                                    .saturating_add(flush_durations.foreign_wait_ns);
+                                stage_durations.serialize_ns = stage_durations
+                                    .serialize_ns
+                                    .saturating_add(flush_durations.serialize_ns);
+
+                                let execute_start = Instant::now();
                                 let resp = dispatch::handle_complex_command(
                                     cmd,
                                     conn.shard_id,
@@ -266,6 +309,9 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                                     router,
                                 )
                                 .await;
+                                stage_durations.execute_ns = stage_durations
+                                    .execute_ns
+                                    .saturating_add(execute_start.elapsed().as_nanos() as u64);
                                 push_ready_response(&mut responses, resp);
                             } else {
                                 process_simple_command(
@@ -278,6 +324,7 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                                     conn,
                                     &mut responses,
                                     &mut pending_foreign_batches,
+                                    &mut stage_durations,
                                 );
                             }
                         }
@@ -298,23 +345,53 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                 }
             }
 
-            flush_pending_responses(
+            let flush_durations = flush_pending_responses(
                 router,
+                &shared.batch_stage_metrics,
                 &mut pending_foreign_batches,
                 &mut responses,
+                &batch_tx,
+                &mut batch_rx,
+                &mut next_flush_id,
                 write_buf,
                 conn.resp3,
             )
             .await;
+            stage_durations.foreign_wait_ns = stage_durations
+                .foreign_wait_ns
+                .saturating_add(flush_durations.foreign_wait_ns);
+            stage_durations.serialize_ns = stage_durations
+                .serialize_ns
+                .saturating_add(flush_durations.serialize_ns);
 
-            // In single-shard mode, accept plus all connection I/O share one
-            // current-thread runtime. Yield between processed batches so one
-            // hot pipelined socket cannot monopolize the reactor.
-            should_yield_after_batch = router.shard_count() == 1 && processed_batch;
+            // Each shard runtime multiplexes many connection tasks plus the
+            // shard request loop. Yield between processed batches so hot
+            // sockets do not starve forwarded-shard work or accept handling.
+            should_yield_after_batch = processed_batch;
+
+            if processed_batch {
+                let batch_total_ns = batch_start.elapsed().as_nanos() as u64;
+                let accounted_ns = stage_durations
+                    .route_ns
+                    .saturating_add(stage_durations.execute_ns)
+                    .saturating_add(stage_durations.foreign_wait_ns)
+                    .saturating_add(stage_durations.serialize_ns);
+                let parse_dispatch_ns = batch_total_ns.saturating_sub(accounted_ns);
+                record_batch_stage_metrics(
+                    &shared.batch_stage_metrics,
+                    &stage_durations,
+                    parse_dispatch_ns,
+                );
+            }
         }
 
         if !write_buf.is_empty() {
+            let write_start = Instant::now();
             stream.write_all(write_buf).await?;
+            shared.batch_stage_metrics.record(
+                BatchStage::SocketWrite,
+                write_start.elapsed().as_nanos() as u64,
+            );
             write_buf.clear();
         }
 
@@ -365,6 +442,7 @@ fn append_wal_record(wal_writer: &Rc<RefCell<Option<Box<dyn WalWriter>>>>, recor
 fn flush_pending_foreign_batches(
     router: &ShardRouter,
     pending_foreign_batches: &mut [PendingForeignBatch],
+    flush_id: u64,
     batch_tx: &BatchedResponseSender,
     responses: &mut [Option<CommandResponse>],
 ) -> usize {
@@ -377,8 +455,12 @@ fn flush_pending_foreign_batches(
 
         let batch = mem::take(commands);
         let pending_indices: Vec<usize> = batch.iter().map(|(index, _)| *index).collect();
-        match router.try_dispatch_foreign_batch_stream(target_shard as u16, batch, batch_tx.clone())
-        {
+        match router.try_dispatch_foreign_batch_stream(
+            target_shard as u16,
+            batch,
+            flush_id,
+            batch_tx.clone(),
+        ) {
             Ok(()) => expected_batches += 1,
             Err(resp) => {
                 for index in pending_indices {
@@ -391,24 +473,52 @@ fn flush_pending_foreign_batches(
     expected_batches
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn flush_pending_responses(
     router: &ShardRouter,
+    metrics: &BatchStageMetrics,
     pending_foreign_batches: &mut [PendingForeignBatch],
     responses: &mut Vec<Option<CommandResponse>>,
+    batch_tx: &BatchedResponseSender,
+    batch_rx: &mut BatchedResponseReceiver,
+    next_flush_id: &mut u64,
     write_buf: &mut BytesMut,
     resp3: bool,
-) {
+) -> FlushDurations {
     if responses.is_empty() {
-        return;
+        return FlushDurations::default();
     }
 
-    let (batch_tx, batch_rx) = mpsc::unbounded_channel();
-    let expected_batches =
-        flush_pending_foreign_batches(router, pending_foreign_batches, &batch_tx, responses);
-    drop(batch_tx);
+    let flush_id = *next_flush_id;
+    *next_flush_id = (*next_flush_id).wrapping_add(1);
+    let expected_batches = flush_pending_foreign_batches(
+        router,
+        pending_foreign_batches,
+        flush_id,
+        batch_tx,
+        responses,
+    );
 
-    for resp in resolve_response_slots(mem::take(responses), batch_rx, expected_batches).await {
+    let foreign_wait_start = Instant::now();
+    let resolved = resolve_response_slots(
+        mem::take(responses),
+        batch_rx,
+        metrics,
+        flush_id,
+        expected_batches,
+    )
+    .await;
+    let foreign_wait_ns = foreign_wait_start.elapsed().as_nanos() as u64;
+
+    let serialize_start = Instant::now();
+    for resp in resolved {
         serialize_response_versioned(&resp, write_buf, resp3);
+    }
+    let serialize_ns = serialize_start.elapsed().as_nanos() as u64;
+
+    FlushDurations {
+        foreign_wait_ns,
+        serialize_ns,
     }
 }
 
@@ -439,6 +549,7 @@ fn process_simple_command(
     conn: &mut ConnState,
     responses: &mut Vec<Option<CommandResponse>>,
     pending_foreign_batches: &mut [PendingForeignBatch],
+    stage_durations: &mut BatchLoopDurations,
 ) {
     if let Some(resp) = try_handle_local_affinity(&cmd, shared, conn) {
         push_ready_response(responses, resp);
@@ -453,15 +564,27 @@ fn process_simple_command(
     }
 
     if let Some(key) = cmd.key() {
+        let route_start = Instant::now();
         let target_shard = router.shard_for_key(key);
+        stage_durations.route_ns = stage_durations
+            .route_ns
+            .saturating_add(route_start.elapsed().as_nanos() as u64);
         if target_shard == shard_id {
+            let execute_start = Instant::now();
             let resp = execute_with_wal_inline(store, wal_writer, cmd);
+            stage_durations.execute_ns = stage_durations
+                .execute_ns
+                .saturating_add(execute_start.elapsed().as_nanos() as u64);
             push_ready_response(responses, resp);
         } else {
             queue_foreign_command(target_shard, cmd, responses, pending_foreign_batches);
         }
     } else {
+        let execute_start = Instant::now();
         let resp = store.borrow_mut().execute(cmd);
+        stage_durations.execute_ns = stage_durations
+            .execute_ns
+            .saturating_add(execute_start.elapsed().as_nanos() as u64);
         push_ready_response(responses, resp);
     }
 }
@@ -477,6 +600,7 @@ fn process_hot_command(
     conn: &ConnState,
     responses: &mut Vec<Option<CommandResponse>>,
     pending_foreign_batches: &mut [PendingForeignBatch],
+    stage_durations: &mut BatchLoopDurations,
 ) {
     match hot_cmd {
         HotCommandRef::Publish { channel, message } => {
@@ -490,9 +614,17 @@ fn process_hot_command(
                     return;
                 }
             }
+            let route_start = Instant::now();
             let target = router.shard_for_key(key);
+            stage_durations.route_ns = stage_durations
+                .route_ns
+                .saturating_add(route_start.elapsed().as_nanos() as u64);
             if target == shard_id {
+                let execute_start = Instant::now();
                 let resp = store.borrow_mut().get_bytes(key);
+                stage_durations.execute_ns = stage_durations
+                    .execute_ns
+                    .saturating_add(execute_start.elapsed().as_nanos() as u64);
                 push_ready_response(responses, resp);
             } else {
                 queue_foreign_command(
@@ -510,8 +642,13 @@ fn process_hot_command(
                     return;
                 }
             }
+            let route_start = Instant::now();
             let target = router.shard_for_key(key);
+            stage_durations.route_ns = stage_durations
+                .route_ns
+                .saturating_add(route_start.elapsed().as_nanos() as u64);
             if target == shard_id {
+                let execute_start = Instant::now();
                 append_wal_record(
                     wal_writer,
                     WalRecord::Set {
@@ -523,6 +660,9 @@ fn process_hot_command(
                 let resp = store
                     .borrow_mut()
                     .set_bytes(key, value, None, None, false, false);
+                stage_durations.execute_ns = stage_durations
+                    .execute_ns
+                    .saturating_add(execute_start.elapsed().as_nanos() as u64);
                 push_ready_response(responses, resp);
             } else {
                 queue_foreign_command(
@@ -547,9 +687,17 @@ fn process_hot_command(
                     return;
                 }
             }
+            let route_start = Instant::now();
             let target = router.shard_for_key(key);
+            stage_durations.route_ns = stage_durations
+                .route_ns
+                .saturating_add(route_start.elapsed().as_nanos() as u64);
             if target == shard_id {
+                let execute_start = Instant::now();
                 let resp = store.borrow_mut().incr_by_bytes(key, 1);
+                stage_durations.execute_ns = stage_durations
+                    .execute_ns
+                    .saturating_add(execute_start.elapsed().as_nanos() as u64);
                 push_ready_response(responses, resp);
             } else {
                 queue_foreign_command(
@@ -563,12 +711,36 @@ fn process_hot_command(
     }
 }
 
+fn record_batch_stage_metrics(
+    metrics: &BatchStageMetrics,
+    stage_durations: &BatchLoopDurations,
+    parse_dispatch_ns: u64,
+) {
+    metrics.record(BatchStage::ParseDispatch, parse_dispatch_ns);
+    metrics.record(BatchStage::Route, stage_durations.route_ns);
+    metrics.record(BatchStage::Execute, stage_durations.execute_ns);
+    metrics.record(BatchStage::ForeignWait, stage_durations.foreign_wait_ns);
+    metrics.record(BatchStage::Serialize, stage_durations.serialize_ns);
+}
+
 fn try_handle_local_affinity(
     cmd: &Command,
     shared: &Arc<AffinitySharedState>,
     conn: &mut ConnState,
 ) -> Option<CommandResponse> {
     match cmd {
+        Command::Info {
+            section: Some(section),
+        } if matches!(
+            section.to_ascii_lowercase().as_str(),
+            "perf" | "profile" | "stages"
+        ) =>
+        {
+            shared.batch_stage_metrics.enable();
+            Some(CommandResponse::BulkString(
+                format_stage_metrics_info(&shared.batch_stage_metrics).into_bytes(),
+            ))
+        }
         Command::Hello { version } => Some(handle_hello(version, conn)),
         Command::Auth { tenant, password } => {
             if let Some(ref expected) = shared.auth_password {

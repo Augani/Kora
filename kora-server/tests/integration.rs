@@ -116,6 +116,14 @@ fn assert_resp_prefix(resp: &[u8], prefix: &[u8]) {
     );
 }
 
+fn extract_info_metric(resp: &[u8], key: &str) -> Option<u64> {
+    let body = String::from_utf8_lossy(resp);
+    let needle = format!("{key}:");
+    let start = body.find(&needle)? + needle.len();
+    let value = body[start..].lines().next()?.trim();
+    value.parse().ok()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -408,6 +416,38 @@ async fn test_pipeline_order_with_local_publish() {
     let resp = send_and_read(&mut stream, &pipeline).await;
     let expected = [&b"+OK\r\n"[..], b":0\r\n", b"$2\r\nv1\r\n"].concat();
     assert_resp(&resp, &expected);
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_info_perf_reports_stage_metrics() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["INFO", "perf"]).await;
+    assert_resp_prefix(&resp, b"$");
+    assert!(
+        String::from_utf8_lossy(&resp).contains("# StageMetrics"),
+        "expected INFO perf stage metrics body"
+    );
+    assert!(
+        String::from_utf8_lossy(&resp).contains("stage_remote_delivery_count:"),
+        "expected INFO perf to expose remote delivery metric"
+    );
+
+    let _ = cmd(&mut stream, &["SET", "perf:key", "value"]).await;
+    let _ = cmd(&mut stream, &["GET", "perf:key"]).await;
+
+    let resp = cmd(&mut stream, &["INFO", "perf"]).await;
+    let execute_count = extract_info_metric(&resp, "stage_execute_count")
+        .expect("stage_execute_count should be present");
+    let serialize_count = extract_info_metric(&resp, "stage_serialize_count")
+        .expect("stage_serialize_count should be present");
+
+    assert!(execute_count > 0, "expected execute stage samples");
+    assert!(serialize_count > 0, "expected serialize stage samples");
 
     let _ = shutdown.send(true);
 }

@@ -1,6 +1,7 @@
 pub(crate) mod connection;
 pub(crate) mod dispatch;
 pub(crate) mod memcache;
+pub(crate) mod stage_metrics;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -26,24 +27,32 @@ use kora_storage::rdb::{self, RdbEntry, RdbValue};
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot, watch};
 
+use self::stage_metrics::{format_stage_metrics_prometheus, BatchStage, BatchStageMetrics};
+
 pub(crate) const CROSS_SHARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+type BatchStreamResponse = (u64, Instant, Vec<(usize, CommandResponse)>);
 
 #[allow(dead_code)]
 pub(crate) enum ShardRequest {
     Execute {
         command: Command,
+        queued_at: Instant,
         response_tx: oneshot::Sender<CommandResponse>,
     },
     ExecuteMemcache {
         request: MemcacheRequest,
+        queued_at: Instant,
         response_tx: oneshot::Sender<MemcacheResponse>,
     },
     ExecuteBatchStream {
         commands: Vec<(usize, Command)>,
-        response_tx: mpsc::UnboundedSender<Vec<(usize, CommandResponse)>>,
+        queued_at: Instant,
+        flush_id: u64,
+        response_tx: mpsc::UnboundedSender<BatchStreamResponse>,
     },
     BgSave {
         request: SnapshotRequest,
+        queued_at: Instant,
         response_tx: oneshot::Sender<Result<(), String>>,
     },
 }
@@ -100,7 +109,7 @@ impl MemcacheRequest {
 
 #[derive(Clone)]
 pub(crate) struct ShardRouter {
-    pub(crate) shard_senders: Arc<[mpsc::Sender<ShardRequest>]>,
+    pub(crate) shard_senders: Arc<[mpsc::UnboundedSender<ShardRequest>]>,
     shard_count: usize,
 }
 
@@ -119,9 +128,9 @@ impl ShardRouter {
         if self.shard_senders[shard_id as usize]
             .send(ShardRequest::Execute {
                 command: cmd,
+                queued_at: Instant::now(),
                 response_tx: tx,
             })
-            .await
             .is_err()
         {
             return CommandResponse::Error("ERR shard unavailable".into());
@@ -140,8 +149,9 @@ impl ShardRouter {
     ) -> Result<oneshot::Receiver<CommandResponse>, CommandResponse> {
         let (tx, rx) = oneshot::channel();
         self.shard_senders[shard_id as usize]
-            .try_send(ShardRequest::Execute {
+            .send(ShardRequest::Execute {
                 command: cmd,
+                queued_at: Instant::now(),
                 response_tx: tx,
             })
             .map_err(|_| CommandResponse::Error("ERR shard unavailable".into()))?;
@@ -152,11 +162,14 @@ impl ShardRouter {
         &self,
         shard_id: u16,
         commands: Vec<(usize, Command)>,
-        response_tx: mpsc::UnboundedSender<Vec<(usize, CommandResponse)>>,
+        flush_id: u64,
+        response_tx: mpsc::UnboundedSender<BatchStreamResponse>,
     ) -> Result<(), CommandResponse> {
         self.shard_senders[shard_id as usize]
-            .try_send(ShardRequest::ExecuteBatchStream {
+            .send(ShardRequest::ExecuteBatchStream {
                 commands,
+                queued_at: Instant::now(),
+                flush_id,
                 response_tx,
             })
             .map_err(|_| CommandResponse::Error("ERR shard unavailable".into()))
@@ -176,8 +189,9 @@ impl ShardRouter {
                 continue;
             }
             let (tx, rx) = oneshot::channel();
-            let _ = sender.try_send(ShardRequest::Execute {
+            let _ = sender.send(ShardRequest::Execute {
                 command: cmd_factory(),
+                queued_at: Instant::now(),
                 response_tx: tx,
             });
             receivers.push(rx);
@@ -192,12 +206,11 @@ impl ShardRouter {
         let mut receivers = Vec::with_capacity(self.shard_count);
         for sender in self.shard_senders.iter() {
             let (tx, rx) = oneshot::channel();
-            let _ = sender
-                .send(ShardRequest::Execute {
-                    command: cmd_factory(),
-                    response_tx: tx,
-                })
-                .await;
+            let _ = sender.send(ShardRequest::Execute {
+                command: cmd_factory(),
+                queued_at: Instant::now(),
+                response_tx: tx,
+            });
             receivers.push(rx);
         }
         let mut results = Vec::with_capacity(self.shard_count);
@@ -219,6 +232,7 @@ pub(crate) struct AffinitySharedState {
     pub histograms: Arc<CommandHistograms>,
     pub track_latency: AtomicBool,
     pub latency_sums_ns: Arc<[AtomicU64; 32]>,
+    pub batch_stage_metrics: Arc<BatchStageMetrics>,
     pub tenants: TenantRegistry,
     pub auth_password: Option<String>,
     pub tenant_limits_enabled: bool,
@@ -242,6 +256,7 @@ pub(crate) struct ShardIoEngine {
     pub shared: Arc<AffinitySharedState>,
     shutdown_tx: watch::Sender<bool>,
     shard_threads: Mutex<Vec<thread::JoinHandle<()>>>,
+    network_threads: Mutex<Vec<thread::JoinHandle<()>>>,
     metrics_port: u16,
 }
 
@@ -266,7 +281,7 @@ impl ShardIoEngine {
         let mut shard_senders = Vec::with_capacity(shard_count);
         let mut shard_receivers = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
-            let (tx, rx) = mpsc::channel(4096);
+            let (tx, rx) = mpsc::unbounded_channel();
             shard_senders.push(tx);
             shard_receivers.push(rx);
         }
@@ -298,6 +313,7 @@ impl ShardIoEngine {
 
         let histograms = Arc::new(CommandHistograms::new());
         let latency_sums_ns = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
+        let batch_stage_metrics = Arc::new(BatchStageMetrics::new(metrics_port > 0));
 
         let mut tenant_reg = TenantRegistry::new();
         tenant_reg.register(TenantId(0), TenantConfig::default());
@@ -312,6 +328,7 @@ impl ShardIoEngine {
             histograms,
             track_latency: AtomicBool::new(metrics_port > 0),
             latency_sums_ns,
+            batch_stage_metrics,
             tenants: tenant_reg,
             auth_password,
             tenant_limits_enabled,
@@ -381,6 +398,7 @@ impl ShardIoEngine {
             shared,
             shutdown_tx,
             shard_threads: Mutex::new(thread_handles),
+            network_threads: Mutex::new(Vec::new()),
             metrics_port,
         }
     }
@@ -422,6 +440,10 @@ impl ShardIoEngine {
 
         let threads: Vec<_> = self.shard_threads.lock().drain(..).collect();
         for handle in threads {
+            let _ = handle.join();
+        }
+        let network_threads: Vec<_> = self.network_threads.lock().drain(..).collect();
+        for handle in network_threads {
             let _ = handle.join();
         }
 
@@ -479,7 +501,7 @@ fn spawn_connection_handler<
             if e.kind() != std::io::ErrorKind::UnexpectedEof
                 && e.kind() != std::io::ErrorKind::ConnectionReset
             {
-                tracing::debug!("Connection {} error: {}", conn_id, e);
+                tracing::debug!("Routed connection {} error: {}", conn_id, e);
             }
         }
 
@@ -539,7 +561,7 @@ async fn shard_worker_loop(
     shard_id: u16,
     store: Rc<RefCell<ShardStore>>,
     wal_writer: Rc<RefCell<Option<Box<dyn WalWriter>>>>,
-    mut rx: mpsc::Receiver<ShardRequest>,
+    mut rx: mpsc::UnboundedReceiver<ShardRequest>,
     router: ShardRouter,
     shared: Arc<AffinitySharedState>,
     conn_counts: Arc<[AtomicUsize]>,
@@ -636,51 +658,118 @@ async fn shard_worker_loop(
             }
             req = rx.recv() => {
                 let Some(req) = req else { break };
-                match req {
-                    ShardRequest::Execute { command, response_tx } => {
-                        maybe_sweep_inline(&store, &mut ops_since_expire);
-                        let resp = execute_with_wal_inline(&store, &wal_writer, command);
-                        let _ = response_tx.send(resp);
-                    }
-                    ShardRequest::ExecuteMemcache { request, response_tx } => {
-                        maybe_sweep_inline(&store, &mut ops_since_expire);
-                        let resp = memcache::execute_memcache_inline(
-                            &store,
-                            &wal_writer,
-                            &shared,
-                            request,
-                        );
-                        let _ = response_tx.send(resp);
-                    }
-                    ShardRequest::ExecuteBatchStream { commands, response_tx } => {
-                        let results: Vec<_> = commands
-                            .into_iter()
-                            .map(|(idx, cmd)| {
-                                maybe_sweep_inline(&store, &mut ops_since_expire);
-                                let resp = execute_with_wal_inline(&store, &wal_writer, cmd);
-                                (idx, resp)
-                            })
-                            .collect();
-                        let _ = response_tx.send(results);
-                    }
-                    ShardRequest::BgSave { request, response_tx } => {
-                        let entries = store_to_rdb_entries(&store.borrow());
-                        let shard_dir = request.data_dir.join(format!("shard-{}", shard_id));
-                        let result = save_snapshot_files(&shard_dir, &entries, &request)
-                            .map_err(|e| e.to_string());
-                        if result.is_ok() {
-                            tracing::info!(
-                                "Shard {} RDB snapshot saved: {} entries",
-                                shard_id, entries.len()
-                            );
-                        }
-                        let _ = response_tx.send(result);
-                    }
-                }
+                handle_shard_request(
+                    shard_id,
+                    &store,
+                    &wal_writer,
+                    &shared,
+                    req,
+                    &mut ops_since_expire,
+                );
             }
             _ = shutdown.changed() => {
                 break;
             }
+        }
+    }
+}
+
+fn handle_shard_request(
+    shard_id: u16,
+    store: &Rc<RefCell<ShardStore>>,
+    wal_writer: &Rc<RefCell<Option<Box<dyn WalWriter>>>>,
+    shared: &Arc<AffinitySharedState>,
+    req: ShardRequest,
+    ops_since_expire: &mut u32,
+) {
+    match req {
+        ShardRequest::Execute {
+            command,
+            queued_at,
+            response_tx,
+        } => {
+            shared.batch_stage_metrics.record(
+                BatchStage::RemoteQueue,
+                queued_at.elapsed().as_nanos() as u64,
+            );
+            let execute_start = Instant::now();
+            maybe_sweep_inline(store, ops_since_expire);
+            let resp = execute_with_wal_inline(store, wal_writer, command);
+            shared.batch_stage_metrics.record(
+                BatchStage::RemoteExecute,
+                execute_start.elapsed().as_nanos() as u64,
+            );
+            let _ = response_tx.send(resp);
+        }
+        ShardRequest::ExecuteMemcache {
+            request,
+            queued_at,
+            response_tx,
+        } => {
+            shared.batch_stage_metrics.record(
+                BatchStage::RemoteQueue,
+                queued_at.elapsed().as_nanos() as u64,
+            );
+            let execute_start = Instant::now();
+            maybe_sweep_inline(store, ops_since_expire);
+            let resp = memcache::execute_memcache_inline(store, wal_writer, shared, request);
+            shared.batch_stage_metrics.record(
+                BatchStage::RemoteExecute,
+                execute_start.elapsed().as_nanos() as u64,
+            );
+            let _ = response_tx.send(resp);
+        }
+        ShardRequest::ExecuteBatchStream {
+            commands,
+            queued_at,
+            flush_id,
+            response_tx,
+        } => {
+            shared.batch_stage_metrics.record(
+                BatchStage::RemoteQueue,
+                queued_at.elapsed().as_nanos() as u64,
+            );
+            let execute_start = Instant::now();
+            let results: Vec<_> = commands
+                .into_iter()
+                .map(|(idx, cmd)| {
+                    maybe_sweep_inline(store, ops_since_expire);
+                    let resp = execute_with_wal_inline(store, wal_writer, cmd);
+                    (idx, resp)
+                })
+                .collect();
+            shared.batch_stage_metrics.record(
+                BatchStage::RemoteExecute,
+                execute_start.elapsed().as_nanos() as u64,
+            );
+            let _ = response_tx.send((flush_id, Instant::now(), results));
+        }
+        ShardRequest::BgSave {
+            request,
+            queued_at,
+            response_tx,
+        } => {
+            shared.batch_stage_metrics.record(
+                BatchStage::RemoteQueue,
+                queued_at.elapsed().as_nanos() as u64,
+            );
+            let execute_start = Instant::now();
+            let entries = store_to_rdb_entries(&store.borrow());
+            let shard_dir = request.data_dir.join(format!("shard-{}", shard_id));
+            let result =
+                save_snapshot_files(&shard_dir, &entries, &request).map_err(|e| e.to_string());
+            shared.batch_stage_metrics.record(
+                BatchStage::RemoteExecute,
+                execute_start.elapsed().as_nanos() as u64,
+            );
+            if result.is_ok() {
+                tracing::info!(
+                    "Shard {} RDB snapshot saved: {} entries",
+                    shard_id,
+                    entries.len()
+                );
+            }
+            let _ = response_tx.send(result);
         }
     }
 }
@@ -722,8 +811,9 @@ fn start_snapshot(
     for sender in shared.router.shard_senders.iter() {
         let (tx, rx) = oneshot::channel();
         if sender
-            .try_send(ShardRequest::BgSave {
+            .send(ShardRequest::BgSave {
                 request: request.clone(),
+                queued_at: Instant::now(),
                 response_tx: tx,
             })
             .is_err()
@@ -952,7 +1042,10 @@ async fn run_metrics_affinity(
                 let shared = shared.clone();
                 async move {
                     let snapshot = build_affinity_metrics(&shared).await;
-                    let body = format_metrics(&snapshot, &shared.histograms);
+                    let mut body = format_metrics(&snapshot, &shared.histograms);
+                    body.push_str(&format_stage_metrics_prometheus(
+                        &shared.batch_stage_metrics,
+                    ));
                     Ok::<_, Infallible>(
                         Response::builder()
                             .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
