@@ -148,6 +148,21 @@ impl ShardRouter {
         Ok(rx)
     }
 
+    pub fn try_dispatch_foreign_batch(
+        &self,
+        shard_id: u16,
+        commands: Vec<(usize, Command)>,
+    ) -> Result<oneshot::Receiver<Vec<(usize, CommandResponse)>>, CommandResponse> {
+        let (tx, rx) = oneshot::channel();
+        self.shard_senders[shard_id as usize]
+            .try_send(ShardRequest::ExecuteBatch {
+                commands,
+                response_tx: tx,
+            })
+            .map_err(|_| CommandResponse::Error("ERR shard unavailable".into()))?;
+        Ok(rx)
+    }
+
     pub fn try_dispatch_foreign_broadcast<F>(
         &self,
         exclude_shard: u16,

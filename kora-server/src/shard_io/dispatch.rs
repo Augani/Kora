@@ -1,5 +1,8 @@
 use std::cell::RefCell;
+use std::future::{poll_fn, Future};
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::Poll;
 
 use kora_core::command::{Command, CommandResponse};
 use kora_core::hash::shard_for_key;
@@ -53,14 +56,73 @@ pub(crate) async fn handle_complex_command(
 async fn resolve_receivers(
     receivers: Vec<oneshot::Receiver<CommandResponse>>,
 ) -> Vec<CommandResponse> {
-    let mut results = Vec::with_capacity(receivers.len());
-    for rx in receivers {
-        match tokio::time::timeout(CROSS_SHARD_TIMEOUT, rx).await {
-            Ok(Ok(resp)) => results.push(resp),
-            _ => results.push(CommandResponse::Error("ERR shard error".into())),
+    resolve_tagged_receivers(receivers.into_iter().map(|rx| ((), rx)).collect())
+        .await
+        .into_iter()
+        .map(|(_, resp)| resp)
+        .collect()
+}
+
+async fn resolve_tagged_receivers<T>(
+    receivers: Vec<(T, oneshot::Receiver<CommandResponse>)>,
+) -> Vec<(T, CommandResponse)> {
+    let mut pending: Vec<(Option<T>, Option<oneshot::Receiver<CommandResponse>>)> = receivers
+        .into_iter()
+        .map(|(tag, rx)| (Some(tag), Some(rx)))
+        .collect();
+    let mut responses: Vec<Option<CommandResponse>> = vec![None; pending.len()];
+
+    if !pending.is_empty() {
+        let wait_for_pending = poll_fn(|cx| {
+            let mut any_pending = false;
+
+            for (index, (_, receiver)) in pending.iter_mut().enumerate() {
+                let Some(rx) = receiver.as_mut() else {
+                    continue;
+                };
+
+                match Pin::new(rx).poll(cx) {
+                    Poll::Ready(Ok(resp)) => {
+                        responses[index] = Some(resp);
+                        *receiver = None;
+                    }
+                    Poll::Ready(Err(_)) => {
+                        responses[index] = Some(CommandResponse::Error("ERR shard error".into()));
+                        *receiver = None;
+                    }
+                    Poll::Pending => any_pending = true,
+                }
+            }
+
+            if any_pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        });
+
+        if tokio::time::timeout(CROSS_SHARD_TIMEOUT, wait_for_pending)
+            .await
+            .is_err()
+        {
+            for response in &mut responses {
+                if response.is_none() {
+                    *response = Some(CommandResponse::Error("ERR shard error".into()));
+                }
+            }
         }
     }
-    results
+
+    pending
+        .into_iter()
+        .zip(responses)
+        .map(|((tag, _), response)| {
+            (
+                tag.expect("tag missing before resolution"),
+                response.unwrap_or_else(|| CommandResponse::Error("ERR shard error".into())),
+            )
+        })
+        .collect()
 }
 
 async fn handle_mget(
@@ -103,10 +165,8 @@ async fn handle_mget(
         }
     }
 
-    for (indices, rx) in receivers {
-        if let Ok(Ok(CommandResponse::Array(values))) =
-            tokio::time::timeout(CROSS_SHARD_TIMEOUT, rx).await
-        {
+    for (indices, resp) in resolve_tagged_receivers(receivers).await {
+        if let CommandResponse::Array(values) = resp {
             for (idx, val) in indices.into_iter().zip(values) {
                 results[idx] = val;
             }

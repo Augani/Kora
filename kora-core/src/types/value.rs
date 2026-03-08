@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
+use crate::command::CommandResponse;
 use crate::types::CompactKey;
 
 /// A stream entry ID consisting of a millisecond timestamp and a sequence number.
@@ -118,6 +119,11 @@ impl Value {
             }
         }
 
+        Self::from_raw_bytes(data)
+    }
+
+    /// Create a string Value from raw bytes without integer auto-detection.
+    pub fn from_raw_bytes(data: &[u8]) -> Self {
         if data.len() <= 23 {
             let mut buf = [0u8; 23];
             buf[..data.len()].copy_from_slice(data);
@@ -127,6 +133,30 @@ impl Value {
             }
         } else {
             Value::HeapStr(Arc::from(data))
+        }
+    }
+
+    /// Convert the value into an efficient bulk-string response when possible.
+    pub fn bulk_response(&self) -> Option<CommandResponse> {
+        match self {
+            Value::InlineStr { data, len } => {
+                Some(CommandResponse::BulkString(data[..*len as usize].to_vec()))
+            }
+            Value::HeapStr(arc) => Some(CommandResponse::BulkStringShared(Arc::clone(arc))),
+            Value::Int(i) => Some(CommandResponse::BulkString(i.to_string().into_bytes())),
+            Value::WarmRef(_) | Value::ColdRef(_) => None,
+            _ => None,
+        }
+    }
+
+    /// Returns the string length for string-compatible values without materializing bytes.
+    pub fn string_len(&self) -> Option<usize> {
+        match self {
+            Value::InlineStr { len, .. } => Some(*len as usize),
+            Value::HeapStr(arc) => Some(arc.len()),
+            Value::Int(i) => Some(i.to_string().len()),
+            Value::WarmRef(_) | Value::ColdRef(_) => None,
+            _ => None,
         }
     }
 
@@ -358,6 +388,23 @@ mod tests {
     fn test_not_an_integer() {
         let v = Value::from_bytes(b"12abc");
         assert!(!matches!(v, Value::Int(_)));
+    }
+
+    #[test]
+    fn test_raw_bytes_skip_integer_detection() {
+        let v = Value::from_raw_bytes(b"42");
+        assert!(matches!(v, Value::InlineStr { .. }));
+        assert_eq!(v.as_bytes().unwrap(), b"42");
+    }
+
+    #[test]
+    fn test_bulk_response_shares_heap_bytes() {
+        let data = vec![b'x'; 256];
+        let v = Value::from_raw_bytes(&data);
+        match v.bulk_response() {
+            Some(CommandResponse::BulkStringShared(bytes)) => assert_eq!(bytes.as_ref(), data),
+            other => panic!("Expected shared bulk response, got {:?}", other),
+        }
     }
 
     #[test]

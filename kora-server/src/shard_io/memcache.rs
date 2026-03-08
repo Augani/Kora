@@ -116,8 +116,8 @@ pub(crate) fn execute_memcache_inline(
                 let mut store_ref = store.borrow_mut();
                 store_ref.execute(Command::Get { key: key.clone() })
             };
-            match response {
-                CommandResponse::BulkString(data) => {
+            match response.bulk_string_bytes().map(|data| data.to_vec()) {
+                Some(data) => {
                     shared.memcache_get_hits.fetch_add(1, Ordering::Relaxed);
                     let flags = store
                         .borrow()
@@ -126,14 +126,16 @@ pub(crate) fn execute_memcache_inline(
                         .unwrap_or(0);
                     MemcacheResponse::Values(vec![MemcacheValue { key, flags, data }])
                 }
-                CommandResponse::Nil => {
+                None if matches!(response, CommandResponse::Nil) => {
                     shared.memcache_get_misses.fetch_add(1, Ordering::Relaxed);
                     MemcacheResponse::Values(vec![])
                 }
-                CommandResponse::Error(msg) => {
-                    MemcacheResponse::ServerError(sanitize_error_message(&msg))
-                }
-                _ => MemcacheResponse::ServerError("unexpected get response".into()),
+                None => match response {
+                    CommandResponse::Error(msg) => {
+                        MemcacheResponse::ServerError(sanitize_error_message(&msg))
+                    }
+                    _ => MemcacheResponse::ServerError("unexpected get response".into()),
+                },
             }
         }
         MemcacheRequest::Store {
@@ -542,7 +544,7 @@ fn mutate_counter(
     let get_resp = store
         .borrow_mut()
         .execute(Command::Get { key: key.clone() });
-    let CommandResponse::BulkString(current_bytes) = get_resp else {
+    let Some(current_bytes) = get_resp.bulk_string_bytes().map(|data| data.to_vec()) else {
         return match get_resp {
             CommandResponse::Nil => MemcacheResponse::NotFound,
             CommandResponse::Error(msg) => {

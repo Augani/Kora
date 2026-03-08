@@ -26,6 +26,22 @@ pub enum HotCommand {
     Publish { channel: Vec<u8>, message: Vec<u8> },
 }
 
+/// Borrowed view of a hot-path command extracted directly from the parser buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotCommandRef<'a> {
+    /// GET key
+    Get { key: &'a [u8] },
+    /// INCR key
+    Incr { key: &'a [u8] },
+    /// SET key value
+    Set { key: &'a [u8], value: &'a [u8] },
+    /// PUBLISH channel message
+    Publish {
+        channel: &'a [u8],
+        message: &'a [u8],
+    },
+}
+
 impl RespParser {
     /// Create a new parser.
     pub fn new() -> Self {
@@ -92,9 +108,65 @@ impl RespParser {
     /// This recognizes `GET key`, `INCR key`, `SET key value`, and
     /// `PUBLISH channel message` in both RESP and inline forms.
     pub fn try_parse_hot_command(&mut self) -> Option<HotCommand> {
-        let (cmd, consumed) = parse_hot_command_fast(&self.buffer)?;
-        let _ = self.buffer.split_to(consumed);
-        Some(cmd)
+        self.try_parse_hot_command_with(|cmd| match cmd {
+            HotCommandRef::Get { key } => HotCommand::Get { key: key.to_vec() },
+            HotCommandRef::Incr { key } => HotCommand::Incr { key: key.to_vec() },
+            HotCommandRef::Set { key, value } => HotCommand::Set {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            },
+            HotCommandRef::Publish { channel, message } => HotCommand::Publish {
+                channel: channel.to_vec(),
+                message: message.to_vec(),
+            },
+        })
+    }
+
+    /// Fast-path parse for high-frequency commands, borrowing payloads from the parser buffer.
+    ///
+    /// The callback must not retain the borrowed slices after it returns.
+    pub fn try_parse_hot_command_with<R, F>(&mut self, f: F) -> Option<R>
+    where
+        F: FnOnce(HotCommandRef<'_>) -> R,
+    {
+        let spans = parse_hot_command_fast_spans(&self.buffer)?;
+        let result = {
+            let data = self.buffer.as_ref();
+            match spans {
+                HotCommandSpans::Get {
+                    key_start, key_end, ..
+                } => f(HotCommandRef::Get {
+                    key: &data[key_start..key_end],
+                }),
+                HotCommandSpans::Incr {
+                    key_start, key_end, ..
+                } => f(HotCommandRef::Incr {
+                    key: &data[key_start..key_end],
+                }),
+                HotCommandSpans::Set {
+                    key_start,
+                    key_end,
+                    value_start,
+                    value_end,
+                    ..
+                } => f(HotCommandRef::Set {
+                    key: &data[key_start..key_end],
+                    value: &data[value_start..value_end],
+                }),
+                HotCommandSpans::Publish {
+                    channel_start,
+                    channel_end,
+                    message_start,
+                    message_end,
+                    ..
+                } => f(HotCommandRef::Publish {
+                    channel: &data[channel_start..channel_end],
+                    message: &data[message_start..message_end],
+                }),
+            }
+        };
+        let _ = self.buffer.split_to(spans.consumed());
+        Some(result)
     }
 
     /// Get the current buffer length.
@@ -145,6 +217,44 @@ struct PublishCommandSpans {
     channel_end: usize,
     message_start: usize,
     message_end: usize,
+}
+
+enum HotCommandSpans {
+    Get {
+        consumed: usize,
+        key_start: usize,
+        key_end: usize,
+    },
+    Incr {
+        consumed: usize,
+        key_start: usize,
+        key_end: usize,
+    },
+    Set {
+        consumed: usize,
+        key_start: usize,
+        key_end: usize,
+        value_start: usize,
+        value_end: usize,
+    },
+    Publish {
+        consumed: usize,
+        channel_start: usize,
+        channel_end: usize,
+        message_start: usize,
+        message_end: usize,
+    },
+}
+
+impl HotCommandSpans {
+    fn consumed(&self) -> usize {
+        match self {
+            HotCommandSpans::Get { consumed, .. }
+            | HotCommandSpans::Incr { consumed, .. }
+            | HotCommandSpans::Set { consumed, .. }
+            | HotCommandSpans::Publish { consumed, .. } => *consumed,
+        }
+    }
 }
 
 fn parse_publish_command_fast_spans(data: &[u8]) -> Option<PublishCommandSpans> {
@@ -247,15 +357,15 @@ fn parse_publish_inline_command_fast_spans(data: &[u8]) -> Option<PublishCommand
     })
 }
 
-fn parse_hot_command_fast(data: &[u8]) -> Option<(HotCommand, usize)> {
+fn parse_hot_command_fast_spans(data: &[u8]) -> Option<HotCommandSpans> {
     if data.first() == Some(&b'*') {
-        parse_hot_resp_command_fast(data)
+        parse_hot_resp_command_fast_spans(data)
     } else {
-        parse_hot_inline_command_fast(data)
+        parse_hot_inline_command_fast_spans(data)
     }
 }
 
-fn parse_hot_resp_command_fast(data: &[u8]) -> Option<(HotCommand, usize)> {
+fn parse_hot_resp_command_fast_spans(data: &[u8]) -> Option<HotCommandSpans> {
     if data.first() != Some(&b'*') {
         return None;
     }
@@ -274,12 +384,11 @@ fn parse_hot_resp_command_fast(data: &[u8]) -> Option<(HotCommand, usize)> {
             return None;
         }
         let (consumed, key_start, key_end) = parse_bulk_span(data, idx)?;
-        return Some((
-            HotCommand::Get {
-                key: data[key_start..key_end].to_vec(),
-            },
+        return Some(HotCommandSpans::Get {
             consumed,
-        ));
+            key_start,
+            key_end,
+        });
     }
 
     if cmd.eq_ignore_ascii_case(b"INCR") {
@@ -287,12 +396,11 @@ fn parse_hot_resp_command_fast(data: &[u8]) -> Option<(HotCommand, usize)> {
             return None;
         }
         let (consumed, key_start, key_end) = parse_bulk_span(data, idx)?;
-        return Some((
-            HotCommand::Incr {
-                key: data[key_start..key_end].to_vec(),
-            },
+        return Some(HotCommandSpans::Incr {
             consumed,
-        ));
+            key_start,
+            key_end,
+        });
     }
 
     if cmd.eq_ignore_ascii_case(b"SET") {
@@ -301,13 +409,13 @@ fn parse_hot_resp_command_fast(data: &[u8]) -> Option<(HotCommand, usize)> {
         }
         let (next, key_start, key_end) = parse_bulk_span(data, idx)?;
         let (consumed, value_start, value_end) = parse_bulk_span(data, next)?;
-        return Some((
-            HotCommand::Set {
-                key: data[key_start..key_end].to_vec(),
-                value: data[value_start..value_end].to_vec(),
-            },
+        return Some(HotCommandSpans::Set {
             consumed,
-        ));
+            key_start,
+            key_end,
+            value_start,
+            value_end,
+        });
     }
 
     if cmd.eq_ignore_ascii_case(b"PUBLISH") {
@@ -316,19 +424,19 @@ fn parse_hot_resp_command_fast(data: &[u8]) -> Option<(HotCommand, usize)> {
         }
         let (next, channel_start, channel_end) = parse_bulk_span(data, idx)?;
         let (consumed, message_start, message_end) = parse_bulk_span(data, next)?;
-        return Some((
-            HotCommand::Publish {
-                channel: data[channel_start..channel_end].to_vec(),
-                message: data[message_start..message_end].to_vec(),
-            },
+        return Some(HotCommandSpans::Publish {
             consumed,
-        ));
+            channel_start,
+            channel_end,
+            message_start,
+            message_end,
+        });
     }
 
     None
 }
 
-fn parse_hot_inline_command_fast(data: &[u8]) -> Option<(HotCommand, usize)> {
+fn parse_hot_inline_command_fast_spans(data: &[u8]) -> Option<HotCommandSpans> {
     let line_end = find_crlf(data)?;
     let line = &data[..line_end];
     let mut token_spans = [(0usize, 0usize); 3];
@@ -365,12 +473,11 @@ fn parse_hot_inline_command_fast(data: &[u8]) -> Option<(HotCommand, usize)> {
             return None;
         }
         let (s, e) = token_spans[1];
-        return Some((
-            HotCommand::Get {
-                key: line[s..e].to_vec(),
-            },
+        return Some(HotCommandSpans::Get {
             consumed,
-        ));
+            key_start: s,
+            key_end: e,
+        });
     }
 
     if cmd.eq_ignore_ascii_case(b"INCR") {
@@ -378,12 +485,11 @@ fn parse_hot_inline_command_fast(data: &[u8]) -> Option<(HotCommand, usize)> {
             return None;
         }
         let (s, e) = token_spans[1];
-        return Some((
-            HotCommand::Incr {
-                key: line[s..e].to_vec(),
-            },
+        return Some(HotCommandSpans::Incr {
             consumed,
-        ));
+            key_start: s,
+            key_end: e,
+        });
     }
 
     if cmd.eq_ignore_ascii_case(b"SET") {
@@ -392,13 +498,13 @@ fn parse_hot_inline_command_fast(data: &[u8]) -> Option<(HotCommand, usize)> {
         }
         let (ks, ke) = token_spans[1];
         let (vs, ve) = token_spans[2];
-        return Some((
-            HotCommand::Set {
-                key: line[ks..ke].to_vec(),
-                value: line[vs..ve].to_vec(),
-            },
+        return Some(HotCommandSpans::Set {
             consumed,
-        ));
+            key_start: ks,
+            key_end: ke,
+            value_start: vs,
+            value_end: ve,
+        });
     }
 
     if cmd.eq_ignore_ascii_case(b"PUBLISH") {
@@ -407,13 +513,13 @@ fn parse_hot_inline_command_fast(data: &[u8]) -> Option<(HotCommand, usize)> {
         }
         let (cs, ce) = token_spans[1];
         let (ms, me) = token_spans[2];
-        return Some((
-            HotCommand::Publish {
-                channel: line[cs..ce].to_vec(),
-                message: line[ms..me].to_vec(),
-            },
+        return Some(HotCommandSpans::Publish {
             consumed,
-        ));
+            channel_start: cs,
+            channel_end: ce,
+            message_start: ms,
+            message_end: me,
+        });
     }
 
     None
@@ -940,6 +1046,34 @@ mod tests {
                 value: b"b".to_vec()
             })
         );
+    }
+
+    #[test]
+    fn test_try_parse_hot_command_with_borrowed_resp() {
+        let mut parser = RespParser::new();
+        parser.feed(b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n");
+
+        let parsed = parser.try_parse_hot_command_with(|cmd| match cmd {
+            HotCommandRef::Set { key, value } => (key.to_vec(), value.to_vec()),
+            other => panic!("unexpected hot command: {:?}", other),
+        });
+
+        assert_eq!(parsed, Some((b"key".to_vec(), b"value".to_vec())));
+        assert!(parser.try_parse().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_try_parse_hot_command_with_borrowed_inline() {
+        let mut parser = RespParser::new();
+        parser.feed(b"GET borrowed\r\n");
+
+        let parsed = parser.try_parse_hot_command_with(|cmd| match cmd {
+            HotCommandRef::Get { key } => key.to_vec(),
+            other => panic!("unexpected hot command: {:?}", other),
+        });
+
+        assert_eq!(parsed, Some(b"borrowed".to_vec()));
+        assert!(parser.try_parse().unwrap().is_none());
     }
 
     #[test]

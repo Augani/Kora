@@ -20,6 +20,6 @@ pub use memcache::{
     serialize_memcache_response, MemcacheCommand, MemcacheParser, MemcacheResponse,
     MemcacheStoreMode, MemcacheValue,
 };
-pub use parser::{HotCommand, RespParser};
+pub use parser::{HotCommand, HotCommandRef, RespParser};
 pub use resp::RespValue;
 pub use serializer::{serialize_response, serialize_response_versioned};

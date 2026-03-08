@@ -2,6 +2,7 @@
 //!
 //! These types define the interface between the protocol layer and the shard engine.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 /// A parsed command ready for execution by a shard.
@@ -855,6 +856,8 @@ pub enum CommandResponse {
     Integer(i64),
     /// Bulk string
     BulkString(Vec<u8>),
+    /// Bulk string backed by shared bytes to avoid copying large values on reads.
+    BulkStringShared(Arc<[u8]>),
     /// Simple string (without the +)
     SimpleString(String),
     /// Array of responses
@@ -869,4 +872,24 @@ pub enum CommandResponse {
     Double(f64),
     /// RESP3 Boolean
     Boolean(bool),
+}
+
+impl CommandResponse {
+    /// Returns the bulk-string payload if this response contains one.
+    pub fn bulk_string_bytes(&self) -> Option<&[u8]> {
+        match self {
+            CommandResponse::BulkString(data) => Some(data),
+            CommandResponse::BulkStringShared(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    /// Consumes the response and returns an owned bulk-string payload when present.
+    pub fn into_bulk_string_bytes(self) -> Option<Vec<u8>> {
+        match self {
+            CommandResponse::BulkString(data) => Some(data),
+            CommandResponse::BulkStringShared(data) => Some(data.as_ref().to_vec()),
+            _ => None,
+        }
+    }
 }

@@ -134,6 +134,29 @@ impl ShardStore {
         self.entries.get(key)
     }
 
+    /// Execute a GET operation against a borrowed key.
+    pub fn get_bytes(&mut self, key: &[u8]) -> CommandResponse {
+        self.cmd_get(key)
+    }
+
+    /// Execute a SET-like operation against borrowed key and value bytes.
+    pub fn set_bytes(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        ex: Option<u64>,
+        px: Option<u64>,
+        nx: bool,
+        xx: bool,
+    ) -> CommandResponse {
+        self.cmd_set(key, value, ex, px, nx, xx)
+    }
+
+    /// Execute INCRBY/DECRBY style mutation against a borrowed key.
+    pub fn incr_by_bytes(&mut self, key: &[u8], delta: i64) -> CommandResponse {
+        self.cmd_incrby(key, delta)
+    }
+
     /// Get a mutable reference to a key entry.
     pub fn get_entry_mut(&mut self, key: &CompactKey) -> Option<&mut KeyEntry> {
         self.entries.get_mut(key)
@@ -556,8 +579,8 @@ impl ShardStore {
         self.lazy_expire(key);
         let compact = CompactKey::new(key);
         match self.entries.get(&compact) {
-            Some(entry) => match entry.value.as_bytes() {
-                Some(bytes) => CommandResponse::BulkString(bytes),
+            Some(entry) => match entry.value.bulk_response() {
+                Some(resp) => resp,
                 None => CommandResponse::Error(
                     "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
                 ),
@@ -592,7 +615,7 @@ impl ShardStore {
             let tm = self.tenant_memory.entry(old_tenant).or_insert(0);
             *tm = tm.saturating_sub(old_size);
         }
-        let new_value = Value::from_bytes(value);
+        let new_value = Value::from_raw_bytes(value);
         let entry_size = Self::estimate_key_entry_size(key, &new_value);
         self.memory_used += entry_size;
         *self.tenant_memory.entry(self.current_tenant).or_insert(0) += entry_size;
@@ -619,21 +642,21 @@ impl ShardStore {
                     let mut existing = data[..*len as usize].to_vec();
                     existing.extend_from_slice(value);
                     let new_len = existing.len();
-                    entry.value = Value::from_bytes(&existing);
+                    entry.value = Value::from_raw_bytes(&existing);
                     CommandResponse::Integer(new_len as i64)
                 }
                 Value::HeapStr(arc) => {
                     let mut existing = arc.to_vec();
                     existing.extend_from_slice(value);
                     let new_len = existing.len();
-                    entry.value = Value::from_bytes(&existing);
+                    entry.value = Value::from_raw_bytes(&existing);
                     CommandResponse::Integer(new_len as i64)
                 }
                 Value::Int(i) => {
                     let mut existing = i.to_string().into_bytes();
                     existing.extend_from_slice(value);
                     let new_len = existing.len();
-                    entry.value = Value::from_bytes(&existing);
+                    entry.value = Value::from_raw_bytes(&existing);
                     CommandResponse::Integer(new_len as i64)
                 }
                 _ => CommandResponse::Error(
@@ -641,7 +664,7 @@ impl ShardStore {
                 ),
             },
             None => {
-                let new_entry = KeyEntry::new(compact.clone(), Value::from_bytes(value));
+                let new_entry = KeyEntry::new(compact.clone(), Value::from_raw_bytes(value));
                 self.entries.insert(compact, new_entry);
                 CommandResponse::Integer(value.len() as i64)
             }
@@ -652,8 +675,8 @@ impl ShardStore {
         self.lazy_expire(key);
         let compact = CompactKey::new(key);
         match self.entries.get(&compact) {
-            Some(entry) => match entry.value.as_bytes() {
-                Some(bytes) => CommandResponse::Integer(bytes.len() as i64),
+            Some(entry) => match entry.value.string_len() {
+                Some(len) => CommandResponse::Integer(len as i64),
                 None => CommandResponse::Error(
                     "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
                 ),
@@ -886,7 +909,7 @@ impl ShardStore {
         let prepared_values: Vec<Value> = values
             .iter()
             .map(|v| {
-                let val = Value::from_bytes(v);
+                let val = Value::from_raw_bytes(v);
                 mem_delta += val.estimated_size();
                 val
             })
@@ -918,7 +941,7 @@ impl ShardStore {
         let prepared_values: Vec<Value> = values
             .iter()
             .map(|v| {
-                let val = Value::from_bytes(v);
+                let val = Value::from_raw_bytes(v);
                 mem_delta += val.estimated_size();
                 val
             })
@@ -947,8 +970,8 @@ impl ShardStore {
                     let val = deque.pop_front();
                     let empty = deque.is_empty();
                     match val {
-                        Some(v) => match v.as_bytes() {
-                            Some(b) => (CommandResponse::BulkString(b), empty),
+                        Some(v) => match v.bulk_response() {
+                            Some(resp) => (resp, empty),
                             None => (CommandResponse::Nil, empty),
                         },
                         None => (CommandResponse::Nil, false),
@@ -978,8 +1001,8 @@ impl ShardStore {
                     let val = deque.pop_back();
                     let empty = deque.is_empty();
                     match val {
-                        Some(v) => match v.as_bytes() {
-                            Some(b) => (CommandResponse::BulkString(b), empty),
+                        Some(v) => match v.bulk_response() {
+                            Some(resp) => (resp, empty),
                             None => (CommandResponse::Nil, empty),
                         },
                         None => (CommandResponse::Nil, false),
@@ -1031,8 +1054,8 @@ impl ShardStore {
                         .iter()
                         .skip(s)
                         .take(e - s + 1)
-                        .map(|v| match v.as_bytes() {
-                            Some(b) => CommandResponse::BulkString(b),
+                        .map(|v| match v.bulk_response() {
+                            Some(resp) => resp,
                             None => CommandResponse::Nil,
                         })
                         .collect();
@@ -1054,8 +1077,8 @@ impl ShardStore {
                 Value::List(deque) => {
                     let idx = normalize_index(index, deque.len() as i64);
                     match deque.get(idx) {
-                        Some(val) => match val.as_bytes() {
-                            Some(b) => CommandResponse::BulkString(b),
+                        Some(val) => match val.bulk_response() {
+                            Some(resp) => resp,
                             None => CommandResponse::Nil,
                         },
                         None => CommandResponse::Nil,
@@ -1088,7 +1111,7 @@ impl ShardStore {
                 let mut count = 0i64;
                 for (f, v) in fields {
                     let fk = CompactKey::new(f);
-                    let new_val = Value::from_bytes(v);
+                    let new_val = Value::from_raw_bytes(v);
                     memory_delta += (fk.as_bytes().len() + new_val.estimated_size()) as isize;
                     if let Some(old_val) = map.insert(fk, new_val) {
                         memory_delta -= (f.len() + old_val.estimated_size()) as isize;
@@ -1119,8 +1142,8 @@ impl ShardStore {
                 Value::Hash(map) => {
                     let fk = CompactKey::new(field);
                     match map.get(&fk) {
-                        Some(val) => match val.as_bytes() {
-                            Some(b) => CommandResponse::BulkString(b),
+                        Some(val) => match val.bulk_response() {
+                            Some(resp) => resp,
                             None => CommandResponse::Nil,
                         },
                         None => CommandResponse::Nil,
@@ -1169,8 +1192,8 @@ impl ShardStore {
                     let mut results = Vec::with_capacity(map.len() * 2);
                     for (k, v) in map {
                         results.push(CommandResponse::BulkString(k.as_bytes().to_vec()));
-                        results.push(match v.as_bytes() {
-                            Some(b) => CommandResponse::BulkString(b),
+                        results.push(match v.bulk_response() {
+                            Some(resp) => resp,
                             None => CommandResponse::Nil,
                         });
                     }
@@ -1268,7 +1291,7 @@ impl ShardStore {
                 }
                 let mut count = 0usize;
                 for m in members {
-                    let val = Value::from_bytes(m);
+                    let val = Value::from_raw_bytes(m);
                     let size = val.estimated_size();
                     if set.insert(val) {
                         memory_delta += size;
@@ -1291,7 +1314,7 @@ impl ShardStore {
                 Value::Set(set) => {
                     let c = members
                         .iter()
-                        .filter(|m| set.remove(&Value::from_bytes(m)))
+                        .filter(|m| set.remove(&Value::from_raw_bytes(m)))
                         .count();
                     (c as i64, set.is_empty())
                 }
@@ -1317,8 +1340,8 @@ impl ShardStore {
                 Value::Set(set) => {
                     let results: Vec<CommandResponse> = set
                         .iter()
-                        .map(|v| match v.as_bytes() {
-                            Some(b) => CommandResponse::BulkString(b),
+                        .map(|v| match v.bulk_response() {
+                            Some(resp) => resp,
                             None => CommandResponse::Nil,
                         })
                         .collect();
@@ -1338,7 +1361,7 @@ impl ShardStore {
         match self.entries.get(&compact) {
             Some(entry) => match &entry.value {
                 Value::Set(set) => {
-                    let val = Value::from_bytes(member);
+                    let val = Value::from_raw_bytes(member);
                     CommandResponse::Integer(if set.contains(&val) { 1 } else { 0 })
                 }
                 _ => CommandResponse::Error(
@@ -2226,6 +2249,27 @@ mod tests {
     }
 
     #[test]
+    fn test_get_large_value_uses_shared_bulk_string() {
+        let mut store = ShardStore::new(0);
+        let value = vec![b'x'; 256];
+        store.execute(Command::Set {
+            key: b"large".to_vec(),
+            value: value.clone(),
+            ex: None,
+            px: None,
+            nx: false,
+            xx: false,
+        });
+
+        match store.execute(Command::Get {
+            key: b"large".to_vec(),
+        }) {
+            CommandResponse::BulkStringShared(bytes) => assert_eq!(bytes.as_ref(), value),
+            other => panic!("Expected BulkStringShared, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_get_nonexistent() {
         let mut store = ShardStore::new(0);
         assert!(matches!(
@@ -2492,6 +2536,55 @@ mod tests {
             }),
             CommandResponse::Integer(2)
         ));
+    }
+
+    #[test]
+    fn test_set_numeric_payload_keeps_string_encoding() {
+        let mut store = ShardStore::new(0);
+        store.execute(Command::Set {
+            key: b"num".to_vec(),
+            value: b"42".to_vec(),
+            ex: None,
+            px: None,
+            nx: false,
+            xx: false,
+        });
+
+        let get_resp = store.execute(Command::Get {
+            key: b"num".to_vec(),
+        });
+        assert_eq!(get_resp.bulk_string_bytes(), Some(b"42".as_slice()));
+
+        match store.execute(Command::ObjectEncoding {
+            key: b"num".to_vec(),
+        }) {
+            CommandResponse::BulkString(encoding) => assert_eq!(encoding, b"embstr"),
+            other => panic!("Expected embstr encoding, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_set_members_are_binary_safe() {
+        let mut store = ShardStore::new(0);
+        store.execute(Command::SAdd {
+            key: b"codes".to_vec(),
+            members: vec![b"042".to_vec()],
+        });
+
+        assert_eq!(
+            store.execute(Command::SIsMember {
+                key: b"codes".to_vec(),
+                member: b"042".to_vec(),
+            }),
+            CommandResponse::Integer(1)
+        );
+        assert_eq!(
+            store.execute(Command::SIsMember {
+                key: b"codes".to_vec(),
+                member: b"42".to_vec(),
+            }),
+            CommandResponse::Integer(0)
+        );
     }
 
     #[test]

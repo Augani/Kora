@@ -26,6 +26,11 @@ pub fn serialize_response_versioned(resp: &CommandResponse, buf: &mut BytesMut, 
             buf.extend_from_slice(data);
             buf.extend_from_slice(b"\r\n");
         }
+        CommandResponse::BulkStringShared(data) => {
+            let _ = write!(buf, "${}\r\n", data.len());
+            buf.extend_from_slice(data);
+            buf.extend_from_slice(b"\r\n");
+        }
         CommandResponse::SimpleString(s) => {
             buf.extend_from_slice(b"+");
             buf.extend_from_slice(s.as_bytes());
@@ -151,6 +156,16 @@ mod tests {
     fn test_serialize_bulk_string() {
         assert_eq!(
             serialize(&CommandResponse::BulkString(b"hello".to_vec())),
+            b"$5\r\nhello\r\n"
+        );
+    }
+
+    #[test]
+    fn test_serialize_shared_bulk_string() {
+        assert_eq!(
+            serialize(&CommandResponse::BulkStringShared(std::sync::Arc::from(
+                b"hello".as_slice()
+            ))),
             b"$5\r\nhello\r\n"
         );
     }

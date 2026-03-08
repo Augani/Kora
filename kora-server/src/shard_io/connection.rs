@@ -1,16 +1,20 @@
 use std::cell::RefCell;
+use std::future::{poll_fn, Future};
+use std::mem;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::task::Poll;
 
 use ahash::AHashSet;
 use bytes::BytesMut;
 use kora_cdc::consumer::ConsumerGroupManager;
 use kora_cdc::ring::CdcRing;
 use kora_core::command::{Command, CommandResponse};
-use kora_core::shard::{ShardStore, WalWriter};
+use kora_core::shard::{ShardStore, WalRecord, WalWriter};
 use kora_core::tenant::TenantId;
-use kora_protocol::{parse_command, serialize_response_versioned, HotCommand, RespParser};
+use kora_protocol::{parse_command, serialize_response_versioned, HotCommandRef, RespParser};
 use kora_pubsub::{MessageSink, PubSubMessage};
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -44,9 +48,67 @@ struct ConnState {
     subscribed_patterns: AHashSet<Vec<u8>>,
 }
 
-enum ResponseSlot {
-    Ready(CommandResponse),
-    Pending(oneshot::Receiver<CommandResponse>),
+type BatchedResponse = Vec<(usize, CommandResponse)>;
+type BatchedResponseReceiver = oneshot::Receiver<BatchedResponse>;
+type PendingForeignBatch = Vec<(usize, Command)>;
+
+fn internal_shard_error() -> CommandResponse {
+    CommandResponse::Error("ERR internal error".into())
+}
+
+async fn resolve_response_slots(
+    mut responses: Vec<Option<CommandResponse>>,
+    batch_receivers: Vec<BatchedResponseReceiver>,
+) -> Vec<CommandResponse> {
+    let mut batch_receivers: Vec<Option<BatchedResponseReceiver>> =
+        batch_receivers.into_iter().map(Some).collect();
+
+    if !batch_receivers.is_empty() {
+        let wait_for_pending = poll_fn(|cx| {
+            let mut any_pending = false;
+
+            for receiver in &mut batch_receivers {
+                let Some(rx) = receiver.as_mut() else {
+                    continue;
+                };
+
+                match Pin::new(rx).poll(cx) {
+                    Poll::Ready(Ok(batch)) => {
+                        for (index, resp) in batch {
+                            responses[index] = Some(resp);
+                        }
+                        *receiver = None;
+                    }
+                    Poll::Ready(Err(_)) => {
+                        *receiver = None;
+                    }
+                    Poll::Pending => any_pending = true,
+                }
+            }
+
+            if any_pending {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        });
+
+        if tokio::time::timeout(CROSS_SHARD_TIMEOUT, wait_for_pending)
+            .await
+            .is_err()
+        {
+            for resp in &mut responses {
+                if resp.is_none() {
+                    *resp = Some(internal_shard_error());
+                }
+            }
+        }
+    }
+
+    responses
+        .into_iter()
+        .map(|resp| resp.unwrap_or_else(internal_shard_error))
+        .collect()
 }
 
 pub(crate) async fn handle_connection_affinity<S: AsyncReadExt + AsyncWriteExt + Unpin>(
@@ -169,20 +231,28 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             }
             parser.feed(&read_buf[..n]);
 
-            let mut slots: Vec<ResponseSlot> = Vec::with_capacity(16);
+            let mut responses: Vec<Option<CommandResponse>> = Vec::with_capacity(16);
+            let mut pending_batch_receivers = Vec::new();
+            let mut pending_foreign_batches: Vec<PendingForeignBatch> =
+                vec![Vec::new(); router.shard_count()];
 
             loop {
-                if let Some(hot_cmd) = parser.try_parse_hot_command() {
-                    process_hot_command(
-                        hot_cmd,
-                        conn.shard_id,
-                        store,
-                        wal_writer,
-                        router,
-                        shared,
-                        conn,
-                        &mut slots,
-                    );
+                if parser
+                    .try_parse_hot_command_with(|hot_cmd| {
+                        process_hot_command(
+                            hot_cmd,
+                            conn.shard_id,
+                            store,
+                            wal_writer,
+                            router,
+                            shared,
+                            conn,
+                            &mut responses,
+                            &mut pending_foreign_batches,
+                        );
+                    })
+                    .is_some()
+                {
                     continue;
                 }
 
@@ -193,6 +263,15 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                                 continue;
                             }
                             if is_complex_command(&cmd) {
+                                flush_pending_responses(
+                                    router,
+                                    &mut pending_foreign_batches,
+                                    &mut pending_batch_receivers,
+                                    &mut responses,
+                                    write_buf,
+                                    conn.resp3,
+                                )
+                                .await;
                                 let resp = dispatch::handle_complex_command(
                                     cmd,
                                     conn.shard_id,
@@ -201,7 +280,7 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                                     router,
                                 )
                                 .await;
-                                slots.push(ResponseSlot::Ready(resp));
+                                push_ready_response(&mut responses, resp);
                             } else {
                                 process_simple_command(
                                     cmd,
@@ -211,34 +290,35 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                                     router,
                                     shared,
                                     conn,
-                                    &mut slots,
+                                    &mut responses,
+                                    &mut pending_foreign_batches,
                                 );
                             }
                         }
                         Err(e) => {
-                            slots.push(ResponseSlot::Ready(CommandResponse::Error(e.to_string())));
+                            push_ready_response(
+                                &mut responses,
+                                CommandResponse::Error(e.to_string()),
+                            );
                         }
                     },
                     Ok(None) => break,
                     Err(e) => {
-                        slots.push(ResponseSlot::Ready(CommandResponse::Error(e.to_string())));
+                        push_ready_response(&mut responses, CommandResponse::Error(e.to_string()));
                         break;
                     }
                 }
             }
 
-            for slot in slots {
-                let resp = match slot {
-                    ResponseSlot::Ready(resp) => resp,
-                    ResponseSlot::Pending(rx) => {
-                        match tokio::time::timeout(CROSS_SHARD_TIMEOUT, rx).await {
-                            Ok(Ok(resp)) => resp,
-                            _ => CommandResponse::Error("ERR internal error".into()),
-                        }
-                    }
-                };
-                serialize_response_versioned(&resp, write_buf, conn.resp3);
-            }
+            flush_pending_responses(
+                router,
+                &mut pending_foreign_batches,
+                &mut pending_batch_receivers,
+                &mut responses,
+                write_buf,
+                conn.resp3,
+            )
+            .await;
         }
 
         if !write_buf.is_empty() {
@@ -264,6 +344,94 @@ fn is_complex_command(cmd: &Command) -> bool {
         )
 }
 
+fn push_ready_response(responses: &mut Vec<Option<CommandResponse>>, resp: CommandResponse) {
+    responses.push(Some(resp));
+}
+
+fn queue_foreign_command(
+    target_shard: u16,
+    cmd: Command,
+    responses: &mut Vec<Option<CommandResponse>>,
+    pending_foreign_batches: &mut [PendingForeignBatch],
+) {
+    let slot_index = responses.len();
+    responses.push(None);
+    pending_foreign_batches[target_shard as usize].push((slot_index, cmd));
+}
+
+fn append_wal_record(wal_writer: &Rc<RefCell<Option<Box<dyn WalWriter>>>>, record: WalRecord) {
+    let mut wal = wal_writer.borrow_mut();
+    if let Some(ref mut writer) = *wal {
+        writer.append(&record);
+    }
+}
+
+fn flush_pending_foreign_batches(
+    router: &ShardRouter,
+    pending_foreign_batches: &mut [PendingForeignBatch],
+    pending_batch_receivers: &mut Vec<BatchedResponseReceiver>,
+    responses: &mut [Option<CommandResponse>],
+) {
+    for (target_shard, commands) in pending_foreign_batches.iter_mut().enumerate() {
+        if commands.is_empty() {
+            continue;
+        }
+
+        let batch = mem::take(commands);
+        let pending_indices: Vec<usize> = batch.iter().map(|(index, _)| *index).collect();
+        match router.try_dispatch_foreign_batch(target_shard as u16, batch) {
+            Ok(rx) => pending_batch_receivers.push(rx),
+            Err(resp) => {
+                for index in pending_indices {
+                    responses[index] = Some(resp.clone());
+                }
+            }
+        }
+    }
+}
+
+async fn flush_pending_responses(
+    router: &ShardRouter,
+    pending_foreign_batches: &mut [PendingForeignBatch],
+    pending_batch_receivers: &mut Vec<BatchedResponseReceiver>,
+    responses: &mut Vec<Option<CommandResponse>>,
+    write_buf: &mut BytesMut,
+    resp3: bool,
+) {
+    if responses.is_empty() {
+        return;
+    }
+
+    flush_pending_foreign_batches(
+        router,
+        pending_foreign_batches,
+        pending_batch_receivers,
+        responses,
+    );
+
+    for resp in
+        resolve_response_slots(mem::take(responses), mem::take(pending_batch_receivers)).await
+    {
+        serialize_response_versioned(&resp, write_buf, resp3);
+    }
+}
+
+fn authorize_hot_dispatch(
+    is_mutation: bool,
+    shared: &AffinitySharedState,
+    conn: &ConnState,
+) -> Result<(), CommandResponse> {
+    let key_count_delta = if is_mutation { 1 } else { 0 };
+    if let Err(e) = shared
+        .tenants
+        .check_limits(conn.tenant_id, key_count_delta, 0)
+    {
+        return Err(CommandResponse::Error(format!("ERR {}", e)));
+    }
+    shared.tenants.record_operation(conn.tenant_id);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_simple_command(
     cmd: Command,
@@ -273,16 +441,17 @@ fn process_simple_command(
     router: &ShardRouter,
     shared: &Arc<AffinitySharedState>,
     conn: &mut ConnState,
-    slots: &mut Vec<ResponseSlot>,
+    responses: &mut Vec<Option<CommandResponse>>,
+    pending_foreign_batches: &mut [PendingForeignBatch],
 ) {
     if let Some(resp) = try_handle_local_affinity(&cmd, shared, conn) {
-        slots.push(ResponseSlot::Ready(resp));
+        push_ready_response(responses, resp);
         return;
     }
 
     if shared.tenant_limits_enabled {
         if let Err(resp) = authorize_dispatch(&cmd, shared, conn) {
-            slots.push(ResponseSlot::Ready(resp));
+            push_ready_response(responses, resp);
             return;
         }
     }
@@ -291,79 +460,108 @@ fn process_simple_command(
         let target_shard = router.shard_for_key(key);
         if target_shard == shard_id {
             let resp = execute_with_wal_inline(store, wal_writer, cmd);
-            slots.push(ResponseSlot::Ready(resp));
+            push_ready_response(responses, resp);
         } else {
-            match router.try_dispatch_foreign(target_shard, cmd) {
-                Ok(rx) => slots.push(ResponseSlot::Pending(rx)),
-                Err(resp) => slots.push(ResponseSlot::Ready(resp)),
-            }
+            queue_foreign_command(target_shard, cmd, responses, pending_foreign_batches);
         }
     } else {
         let resp = store.borrow_mut().execute(cmd);
-        slots.push(ResponseSlot::Ready(resp));
+        push_ready_response(responses, resp);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn process_hot_command(
-    hot_cmd: HotCommand,
+    hot_cmd: HotCommandRef<'_>,
     shard_id: u16,
     store: &Rc<RefCell<ShardStore>>,
     wal_writer: &Rc<RefCell<Option<Box<dyn WalWriter>>>>,
     router: &ShardRouter,
     shared: &Arc<AffinitySharedState>,
-    _conn: &mut ConnState,
-    slots: &mut Vec<ResponseSlot>,
+    conn: &ConnState,
+    responses: &mut Vec<Option<CommandResponse>>,
+    pending_foreign_batches: &mut [PendingForeignBatch],
 ) {
     match hot_cmd {
-        HotCommand::Publish { channel, message } => {
-            let count = shared.pub_sub.publish(&channel, &message);
-            slots.push(ResponseSlot::Ready(CommandResponse::Integer(count as i64)));
+        HotCommandRef::Publish { channel, message } => {
+            let count = shared.pub_sub.publish(channel, message);
+            push_ready_response(responses, CommandResponse::Integer(count as i64));
         }
-        HotCommand::Get { key } => {
-            let cmd = Command::Get { key: key.clone() };
-            let target = router.shard_for_key(&key);
-            if target == shard_id {
-                let resp = store.borrow_mut().execute(cmd);
-                slots.push(ResponseSlot::Ready(resp));
-            } else {
-                match router.try_dispatch_foreign(target, cmd) {
-                    Ok(rx) => slots.push(ResponseSlot::Pending(rx)),
-                    Err(resp) => slots.push(ResponseSlot::Ready(resp)),
+        HotCommandRef::Get { key } => {
+            if shared.tenant_limits_enabled {
+                if let Err(resp) = authorize_hot_dispatch(false, shared, conn) {
+                    push_ready_response(responses, resp);
+                    return;
                 }
             }
-        }
-        HotCommand::Set { key, value } => {
-            let cmd = Command::Set {
-                key: key.clone(),
-                value,
-                ex: None,
-                px: None,
-                nx: false,
-                xx: false,
-            };
-            let target = router.shard_for_key(&key);
+            let target = router.shard_for_key(key);
             if target == shard_id {
-                let resp = execute_with_wal_inline(store, wal_writer, cmd);
-                slots.push(ResponseSlot::Ready(resp));
+                let resp = store.borrow_mut().get_bytes(key);
+                push_ready_response(responses, resp);
             } else {
-                match router.try_dispatch_foreign(target, cmd) {
-                    Ok(rx) => slots.push(ResponseSlot::Pending(rx)),
-                    Err(resp) => slots.push(ResponseSlot::Ready(resp)),
-                }
+                queue_foreign_command(
+                    target,
+                    Command::Get { key: key.to_vec() },
+                    responses,
+                    pending_foreign_batches,
+                );
             }
         }
-        HotCommand::Incr { key } => {
-            let cmd = Command::Incr { key: key.clone() };
-            let target = router.shard_for_key(&key);
-            if target == shard_id {
-                let resp = execute_with_wal_inline(store, wal_writer, cmd);
-                slots.push(ResponseSlot::Ready(resp));
-            } else {
-                match router.try_dispatch_foreign(target, cmd) {
-                    Ok(rx) => slots.push(ResponseSlot::Pending(rx)),
-                    Err(resp) => slots.push(ResponseSlot::Ready(resp)),
+        HotCommandRef::Set { key, value } => {
+            if shared.tenant_limits_enabled {
+                if let Err(resp) = authorize_hot_dispatch(true, shared, conn) {
+                    push_ready_response(responses, resp);
+                    return;
                 }
+            }
+            let target = router.shard_for_key(key);
+            if target == shard_id {
+                append_wal_record(
+                    wal_writer,
+                    WalRecord::Set {
+                        key: key.to_vec(),
+                        value: value.to_vec(),
+                        ttl_ms: None,
+                    },
+                );
+                let resp = store
+                    .borrow_mut()
+                    .set_bytes(key, value, None, None, false, false);
+                push_ready_response(responses, resp);
+            } else {
+                queue_foreign_command(
+                    target,
+                    Command::Set {
+                        key: key.to_vec(),
+                        value: value.to_vec(),
+                        ex: None,
+                        px: None,
+                        nx: false,
+                        xx: false,
+                    },
+                    responses,
+                    pending_foreign_batches,
+                );
+            }
+        }
+        HotCommandRef::Incr { key } => {
+            if shared.tenant_limits_enabled {
+                if let Err(resp) = authorize_hot_dispatch(true, shared, conn) {
+                    push_ready_response(responses, resp);
+                    return;
+                }
+            }
+            let target = router.shard_for_key(key);
+            if target == shard_id {
+                let resp = store.borrow_mut().incr_by_bytes(key, 1);
+                push_ready_response(responses, resp);
+            } else {
+                queue_foreign_command(
+                    target,
+                    Command::Incr { key: key.to_vec() },
+                    responses,
+                    pending_foreign_batches,
+                );
             }
         }
     }
