@@ -154,6 +154,7 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 ) -> std::io::Result<()> {
     loop {
         let in_pubsub_mode = conn.subscription_count > 0 || conn.pattern_count > 0;
+        let mut should_yield_after_batch = false;
 
         if in_pubsub_mode {
             let rx = conn.pubsub_rx.as_mut().unwrap();
@@ -218,6 +219,7 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             let mut responses: Vec<Option<CommandResponse>> = Vec::with_capacity(16);
             let mut pending_foreign_batches: Vec<PendingForeignBatch> =
                 vec![Vec::new(); router.shard_count()];
+            let mut processed_batch = false;
 
             loop {
                 if parser
@@ -236,12 +238,14 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                     })
                     .is_some()
                 {
+                    processed_batch = true;
                     continue;
                 }
 
                 match parser.try_parse() {
                     Ok(Some(frame)) => match parse_command(frame) {
                         Ok(cmd) => {
+                            processed_batch = true;
                             if handle_pubsub_command(&cmd, shared, conn, write_buf) {
                                 continue;
                             }
@@ -278,6 +282,7 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                             }
                         }
                         Err(e) => {
+                            processed_batch = true;
                             push_ready_response(
                                 &mut responses,
                                 CommandResponse::Error(e.to_string()),
@@ -286,6 +291,7 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                     },
                     Ok(None) => break,
                     Err(e) => {
+                        processed_batch = true;
                         push_ready_response(&mut responses, CommandResponse::Error(e.to_string()));
                         break;
                     }
@@ -300,11 +306,20 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                 conn.resp3,
             )
             .await;
+
+            // In single-shard mode, accept plus all connection I/O share one
+            // current-thread runtime. Yield between processed batches so one
+            // hot pipelined socket cannot monopolize the reactor.
+            should_yield_after_batch = router.shard_count() == 1 && processed_batch;
         }
 
         if !write_buf.is_empty() {
             stream.write_all(write_buf).await?;
             write_buf.clear();
+        }
+
+        if should_yield_after_batch {
+            tokio::task::yield_now().await;
         }
     }
 }

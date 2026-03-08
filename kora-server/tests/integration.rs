@@ -39,10 +39,17 @@ fn resp_cmd(args: &[&str]) -> Vec<u8> {
 /// Start a server on the given port and return the shutdown sender.
 /// The server runs in a background task.
 async fn start_server(port: u16) -> tokio::sync::watch::Sender<bool> {
+    start_server_with_workers(port, 2).await
+}
+
+async fn start_server_with_workers(
+    port: u16,
+    worker_count: usize,
+) -> tokio::sync::watch::Sender<bool> {
     let (tx, rx) = tokio::sync::watch::channel(false);
     let config = ServerConfig {
         bind_address: format!("127.0.0.1:{}", port),
-        worker_count: 2,
+        worker_count,
         ..Default::default()
     };
     let server = KoraServer::new(config);
@@ -71,6 +78,15 @@ async fn send_and_read(stream: &mut TcpStream, cmd: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; 8192];
     let n = stream.read(&mut buf).await.unwrap();
     buf.truncate(n);
+    buf
+}
+
+async fn read_exact_response(stream: &mut TcpStream, len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
     buf
 }
 
@@ -392,6 +408,58 @@ async fn test_pipeline_order_with_local_publish() {
     let resp = send_and_read(&mut stream, &pipeline).await;
     let expected = [&b"+OK\r\n"[..], b":0\r\n", b"$2\r\nv1\r\n"].concat();
     assert_resp(&resp, &expected);
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_single_worker_pipeline_16_concurrent_stability() {
+    let port = free_port().await;
+    let shutdown = start_server_with_workers(port, 1).await;
+
+    let client_count = 24usize;
+    let rounds = 24usize;
+    let mut tasks = Vec::with_capacity(client_count);
+
+    for client_id in 0..client_count {
+        tasks.push(tokio::spawn(async move {
+            let mut stream = connect(port).await;
+
+            for round in 0..rounds {
+                let mut set_pipeline = Vec::new();
+                let expected_set = b"+OK\r\n".repeat(16);
+
+                for slot in 0..16 {
+                    let key = format!("w1:{client_id}:{round}:{slot}");
+                    let value = format!("value:{slot}");
+                    set_pipeline.extend_from_slice(&resp_cmd(&["SET", &key, &value]));
+                }
+
+                stream.write_all(&set_pipeline).await.unwrap();
+                let set_resp = read_exact_response(&mut stream, expected_set.len()).await;
+                assert_eq!(set_resp, expected_set);
+
+                let mut get_pipeline = Vec::new();
+                let mut expected_get = Vec::new();
+
+                for slot in 0..16 {
+                    let key = format!("w1:{client_id}:{round}:{slot}");
+                    let value = format!("value:{slot}");
+                    get_pipeline.extend_from_slice(&resp_cmd(&["GET", &key]));
+                    expected_get
+                        .extend_from_slice(format!("${}\r\n{}\r\n", value.len(), value).as_bytes());
+                }
+
+                stream.write_all(&get_pipeline).await.unwrap();
+                let get_resp = read_exact_response(&mut stream, expected_get.len()).await;
+                assert_eq!(get_resp, expected_get);
+            }
+        }));
+    }
+
+    for task in tasks {
+        task.await.unwrap();
+    }
 
     let _ = shutdown.send(true);
 }
