@@ -36,9 +36,13 @@ kora/
 │   │   └── serializer.rs   # serialize_response
 │   ├── benches/resp.rs     # Criterion benchmarks (parse/serialize)
 │   └── tests/stress.rs     # Fuzz-like, roundtrip, pipeline tests
-├── kora-server/            # TCP listener, connection handling
-│   ├── src/lib.rs          # KoraServer, ServerConfig, connection handler
-│   └── tests/integration.rs # TCP integration tests
+├── kora-server/            # TCP/Unix server, shard-affinity I/O engine
+│   ├── src/
+│   │   ├── lib.rs          # KoraServer, ServerConfig
+│   │   └── shard_io/       # ShardIoEngine, ShardRouter, connection handler
+│   └── tests/
+│       ├── integration.rs  # TCP integration tests (27 tests)
+│       └── real_app_traffic.rs # Redis vs Kora benchmarks
 ├── kora-embedded/          # library mode — direct API, no network
 │   └── src/lib.rs          # Database struct with get/set/del/etc.
 ├── kora-storage/           # persistence layer
@@ -58,6 +62,8 @@ kora/
 │   └── src/
 │       ├── ring.rs         # CdcRing (per-shard ring buffer)
 │       └── subscription.rs # Subscription manager with glob patterns
+├── kora-pubsub/            # publish/subscribe messaging
+│   └── src/broker.rs       # PubSubBroker with pattern matching
 ├── kora-scripting/         # WASM runtime (wasmtime)
 │   └── src/lib.rs          # WasmRuntime, FunctionRegistry
 ├── kora-observability/     # statistics & hot-key detection
@@ -73,7 +79,7 @@ kora/
 ### Dependency Graph (strict, acyclic)
 
 ```
-cli → server → core, protocol, storage, vector, cdc, scripting, observability
+cli → server → core, protocol, storage, vector, cdc, pubsub, scripting, observability
 embedded → core, storage, vector, cdc, observability
 ```
 
@@ -90,7 +96,7 @@ embedded → core, storage, vector, cdc, observability
 
 These principles are non-negotiable — all code must follow them:
 
-1. **Shared-nothing threading:** Each worker thread owns a shard of the keyspace. No locks or mutexes on the data path. Cross-shard communication uses lock-free MPSC channels only.
+1. **Shard-affinity I/O:** Each shard worker thread owns both its data AND its connections' I/O via a `current_thread` tokio runtime. Store access uses `Rc<RefCell<>>` (no locks). Cross-shard communication uses `tokio::sync::mpsc` + `oneshot`.
 
 2. **Zero-copy where possible:** Use `Arc<[u8]>` for shared strings, store keys/values as `Vec<u8>`.
 
@@ -182,9 +188,9 @@ cargo run -- --config kora.toml
 - Command parsing from RESP arrays
 
 ### Server (kora-server)
-- Async TCP server with Tokio
-- Pipeline support (multiple commands per read)
-- Graceful shutdown
+- Shard-affinity I/O: each shard owns data + connection I/O
+- `ShardIoEngine` with per-shard `current_thread` tokio runtimes
+- Pipeline support, graceful shutdown, Unix socket support
 
 ### Storage (kora-storage)
 - Write-Ahead Log with CRC-32C integrity, configurable sync policy, rotation
@@ -207,6 +213,11 @@ cargo run -- --config kora.toml
 - Per-shard atomic statistics (command counts, durations, memory, bytes)
 - RAII CommandTimer for automatic duration recording
 - Snapshot merging across shards
+
+### Pub/Sub (kora-pubsub)
+- SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH
+- Thread-safe PubSubBroker with glob-pattern matching
+- Push-mode delivery to subscriber connections
 
 ### CLI (kora-cli)
 - TOML config file support with layered configuration

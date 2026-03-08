@@ -29,9 +29,13 @@ struct Args {
     #[arg(short, long)]
     port: Option<u16>,
 
-    /// Number of worker threads (defaults to CPU count).
+    /// Number of shard worker threads (defaults to cores/3, minimum 1).
     #[arg(short, long)]
     workers: Option<usize>,
+
+    /// Number of Tokio runtime worker threads.
+    #[arg(long)]
+    runtime_workers: Option<usize>,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(long)]
@@ -56,10 +60,13 @@ struct Args {
     /// Unix socket path.
     #[arg(long)]
     unix_socket: Option<String>,
+
+    /// Enable tenant resource-limit checks on command dispatch.
+    #[arg(long)]
+    tenant_limits: bool,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Load config file (defaults to kora.toml, ignored if not found)
@@ -77,9 +84,13 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "info".into());
     let worker_count = args.workers.or(file_config.workers).unwrap_or_else(|| {
         std::thread::available_parallelism()
-            .map(|n| n.get())
+            .map(|n| (n.get() / 3).max(1))
             .unwrap_or(4)
     });
+    let runtime_worker_count = args
+        .runtime_workers
+        .or(file_config.runtime_workers)
+        .unwrap_or(2);
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -124,6 +135,8 @@ async fn main() -> anyhow::Result<()> {
         .unix_socket
         .or(file_config.unix_socket)
         .map(PathBuf::from);
+    let tenant_limits_enabled =
+        args.tenant_limits || file_config.tenant_limits_enabled.unwrap_or(false);
 
     let config = ServerConfig {
         bind_address: format!("{}:{}", bind, port),
@@ -134,25 +147,33 @@ async fn main() -> anyhow::Result<()> {
         metrics_port,
         unix_socket,
         password: None,
+        tenant_limits_enabled,
     };
 
     tracing::info!(
-        "Starting Kōra v{} with {} worker threads",
+        "Starting Kōra v{} with {} shard-IO workers",
         env!("CARGO_PKG_VERSION"),
-        worker_count
+        worker_count,
     );
 
-    let server = KoraServer::new(config);
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(runtime_worker_count)
+        .enable_all()
+        .build()?;
 
-    // Handle Ctrl+C
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!("Received shutdown signal");
-        let _ = shutdown_tx.send(true);
-    });
+    runtime.block_on(async move {
+        let server = KoraServer::new(config);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    server.run(shutdown_rx).await?;
+        // Handle Ctrl+C
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            tracing::info!("Received shutdown signal");
+            let _ = shutdown_tx.send(true);
+        });
+
+        server.run(shutdown_rx).await
+    })?;
 
     Ok(())
 }

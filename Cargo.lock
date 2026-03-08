@@ -1051,7 +1051,10 @@ dependencies = [
 name = "kora-server"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "bytes",
+ "crossbeam-channel",
+ "hdrhistogram",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -1059,10 +1062,12 @@ dependencies = [
  "kora-core",
  "kora-observability",
  "kora-protocol",
+ "kora-pubsub",
  "kora-scripting",
  "kora-storage",
  "parking_lot",
  "rand",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

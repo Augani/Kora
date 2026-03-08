@@ -15,6 +15,6 @@ mod serializer;
 
 pub use command::parse_command;
 pub use error::ProtocolError;
-pub use parser::RespParser;
+pub use parser::{HotCommand, RespParser};
 pub use resp::RespValue;
 pub use serializer::{serialize_response, serialize_response_versioned};

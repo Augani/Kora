@@ -8,6 +8,7 @@ description = "RESP2/RESP3 protocol parser and serializer for Kōra"
 
 [dependencies]
 bytes.workspace = true
+memchr.workspace = true
 kora-core.workspace = true
 thiserror.workspace = true
 

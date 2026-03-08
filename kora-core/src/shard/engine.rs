@@ -11,20 +11,39 @@ use crate::shard::store::ShardStore;
 use crate::shard::wal_trait::{WalRecord, WalWriter};
 
 /// Message sent from the dispatcher to a shard worker.
-pub struct ShardMessage {
-    /// The command to execute.
-    pub command: Command,
-    /// Channel to send the response back.
-    pub response_tx: ResponseSender,
+pub enum ShardMessage {
+    /// Execute a single command.
+    Single {
+        /// The command to execute.
+        command: Command,
+        /// Channel to send the response back.
+        response_tx: ResponseSender,
+    },
+    /// Execute multiple commands on the same shard in order.
+    Batch {
+        /// Commands tagged with their original position in the batch.
+        commands: Vec<(usize, Command)>,
+        /// Channel to send all responses back.
+        response_tx: BatchResponseSender,
+    },
 }
 
 /// A oneshot-like sender for command responses. Uses a crossbeam channel with capacity 1.
 pub type ResponseSender = Sender<CommandResponse>;
 /// A oneshot-like receiver for command responses.
 pub type ResponseReceiver = Receiver<CommandResponse>;
+/// Sender for batched command responses.
+type BatchResponseSender = Sender<Vec<(usize, CommandResponse)>>;
+/// Receiver for batched command responses.
+type BatchResponseReceiver = Receiver<Vec<(usize, CommandResponse)>>;
 
 /// Create a response channel pair.
 pub fn response_channel() -> (ResponseSender, ResponseReceiver) {
+    crossbeam_channel::bounded(1)
+}
+
+/// Create a response channel pair for batched command responses.
+fn batch_response_channel() -> (BatchResponseSender, BatchResponseReceiver) {
     crossbeam_channel::bounded(1)
 }
 
@@ -98,7 +117,7 @@ impl ShardEngine {
         if let Some(key) = cmd.key() {
             // Single-key command: route to owning shard
             let shard_id = shard_for_key(key, self.shard_count) as usize;
-            let _ = self.workers[shard_id].tx.send(ShardMessage {
+            let _ = self.workers[shard_id].tx.send(ShardMessage::Single {
                 command: cmd,
                 response_tx: tx,
             });
@@ -122,6 +141,84 @@ impl ShardEngine {
             .unwrap_or(CommandResponse::Error("ERR internal error".into()))
     }
 
+    /// Dispatch a batch of commands and block until all responses are received.
+    ///
+    /// Commands that target a single key are grouped per shard and executed in-order,
+    /// reducing response-channel overhead for pipelined workloads.
+    pub fn dispatch_batch_blocking(&self, commands: Vec<Command>) -> Vec<CommandResponse> {
+        let total = commands.len();
+        if total == 0 {
+            return Vec::new();
+        }
+
+        let mut responses = vec![None; total];
+        let mut segment = Vec::new();
+
+        for (idx, command) in commands.into_iter().enumerate() {
+            if command.key().is_some() {
+                segment.push((idx, command));
+            } else {
+                if !segment.is_empty() {
+                    self.execute_shard_batch(std::mem::take(&mut segment), &mut responses);
+                }
+                responses[idx] = Some(self.dispatch_blocking(command));
+            }
+        }
+
+        if !segment.is_empty() {
+            self.execute_shard_batch(segment, &mut responses);
+        }
+
+        responses
+            .into_iter()
+            .map(|resp| resp.unwrap_or(CommandResponse::Error("ERR internal error".into())))
+            .collect()
+    }
+
+    fn execute_shard_batch(
+        &self,
+        commands: Vec<(usize, Command)>,
+        responses: &mut [Option<CommandResponse>],
+    ) {
+        if commands.is_empty() {
+            return;
+        }
+
+        let mut shard_batches: Vec<Vec<(usize, Command)>> = vec![Vec::new(); self.shard_count];
+        for (idx, command) in commands {
+            let Some(key) = command.key() else {
+                responses[idx] = Some(self.dispatch_blocking(command));
+                continue;
+            };
+            let shard_id = shard_for_key(key, self.shard_count) as usize;
+            shard_batches[shard_id].push((idx, command));
+        }
+
+        let mut receivers = Vec::new();
+        for (shard_id, commands) in shard_batches.into_iter().enumerate() {
+            if commands.is_empty() {
+                continue;
+            }
+
+            let (resp_tx, resp_rx) = batch_response_channel();
+            let _ = self.workers[shard_id].tx.send(ShardMessage::Batch {
+                commands,
+                response_tx: resp_tx,
+            });
+            receivers.push(resp_rx);
+        }
+
+        for rx in receivers {
+            if let Ok(items) = rx.recv() {
+                for (idx, response) in items {
+                    if let Some(slot) = responses.get_mut(idx) {
+                        *slot = Some(response);
+                    }
+                }
+            }
+        }
+    }
+
     fn dispatch_multi_key(&self, cmd: Command, tx: ResponseSender) {
         match cmd {
             Command::MGet { keys } => {
@@ -141,7 +238,7 @@ impl ShardEngine {
                     let shard_keys: Vec<Vec<u8>> = reqs.iter().map(|(_, k)| k.clone()).collect();
                     let indices: Vec<usize> = reqs.iter().map(|(i, _)| *i).collect();
                     let (resp_tx, resp_rx) = response_channel();
-                    let _ = self.workers[shard_id].tx.send(ShardMessage {
+                    let _ = self.workers[shard_id].tx.send(ShardMessage::Single {
                         command: Command::MGet { keys: shard_keys },
                         response_tx: resp_tx,
                     });
@@ -172,7 +269,7 @@ impl ShardEngine {
                         continue;
                     }
                     let (resp_tx, resp_rx) = response_channel();
-                    let _ = self.workers[shard_id].tx.send(ShardMessage {
+                    let _ = self.workers[shard_id].tx.send(ShardMessage::Single {
                         command: Command::MSet { entries },
                         response_tx: resp_tx,
                     });
@@ -197,7 +294,7 @@ impl ShardEngine {
                         continue;
                     }
                     let (resp_tx, resp_rx) = response_channel();
-                    let _ = self.workers[shard_id].tx.send(ShardMessage {
+                    let _ = self.workers[shard_id].tx.send(ShardMessage::Single {
                         command: Command::Del { keys },
                         response_tx: resp_tx,
                     });
@@ -224,7 +321,7 @@ impl ShardEngine {
                         continue;
                     }
                     let (resp_tx, resp_rx) = response_channel();
-                    let _ = self.workers[shard_id].tx.send(ShardMessage {
+                    let _ = self.workers[shard_id].tx.send(ShardMessage::Single {
                         command: Command::Exists { keys },
                         response_tx: resp_tx,
                     });
@@ -259,7 +356,7 @@ impl ShardEngine {
         let mut receivers = Vec::with_capacity(self.shard_count);
         for worker in &self.workers {
             let (resp_tx, resp_rx) = response_channel();
-            let _ = worker.tx.send(ShardMessage {
+            let _ = worker.tx.send(ShardMessage::Single {
                 command: Command::VecQuery {
                     key: key.clone(),
                     k,
@@ -309,19 +406,15 @@ impl ShardEngine {
     }
 
     fn dispatch_keyless(&self, cmd: Command, tx: ResponseSender) {
-        if matches!(&cmd, Command::VecQuery { .. }) {
-            self.dispatch_vec_query(cmd, tx);
-            return;
-        }
-
-        match &cmd {
+        match cmd {
+            Command::VecQuery { .. } => self.dispatch_vec_query(cmd, tx),
             Command::DbSize => {
                 // Sum up db sizes from all shards
                 let mut total = 0i64;
                 let mut receivers = Vec::new();
                 for worker in &self.workers {
                     let (resp_tx, resp_rx) = response_channel();
-                    let _ = worker.tx.send(ShardMessage {
+                    let _ = worker.tx.send(ShardMessage::Single {
                         command: Command::DbSize,
                         response_tx: resp_tx,
                     });
@@ -338,7 +431,7 @@ impl ShardEngine {
                 let mut receivers = Vec::new();
                 for worker in &self.workers {
                     let (resp_tx, resp_rx) = response_channel();
-                    let _ = worker.tx.send(ShardMessage {
+                    let _ = worker.tx.send(ShardMessage::Single {
                         command: Command::FlushDb,
                         response_tx: resp_tx,
                     });
@@ -355,7 +448,7 @@ impl ShardEngine {
                 let mut receivers = Vec::new();
                 for worker in &self.workers {
                     let (resp_tx, resp_rx) = response_channel();
-                    let _ = worker.tx.send(ShardMessage {
+                    let _ = worker.tx.send(ShardMessage::Single {
                         command: Command::Dump,
                         response_tx: resp_tx,
                     });
@@ -368,14 +461,15 @@ impl ShardEngine {
                 }
                 let _ = tx.send(CommandResponse::Array(all_entries));
             }
-            Command::Keys { .. } | Command::Scan { .. } => {
-                // Broadcast to all shards, collect and merge results
+            Command::Keys { pattern } => {
                 let mut all_keys = Vec::new();
                 let mut receivers = Vec::new();
                 for worker in &self.workers {
                     let (resp_tx, resp_rx) = response_channel();
-                    let _ = worker.tx.send(ShardMessage {
-                        command: cmd.clone(),
+                    let _ = worker.tx.send(ShardMessage::Single {
+                        command: Command::Keys {
+                            pattern: pattern.clone(),
+                        },
                         response_tx: resp_tx,
                     });
                     receivers.push(resp_rx);
@@ -387,9 +481,125 @@ impl ShardEngine {
                 }
                 let _ = tx.send(CommandResponse::Array(all_keys));
             }
+            Command::Scan {
+                cursor,
+                pattern,
+                count,
+            } => {
+                let pattern = pattern.unwrap_or_else(|| "*".to_string());
+                let mut merged_keys: Vec<Vec<u8>> = Vec::new();
+                let mut receivers = Vec::new();
+                for worker in &self.workers {
+                    let (resp_tx, resp_rx) = response_channel();
+                    let _ = worker.tx.send(ShardMessage::Single {
+                        command: Command::Keys {
+                            pattern: pattern.clone(),
+                        },
+                        response_tx: resp_tx,
+                    });
+                    receivers.push(resp_rx);
+                }
+                for rx in receivers {
+                    if let Ok(CommandResponse::Array(keys)) = rx.recv() {
+                        for key in keys {
+                            if let CommandResponse::BulkString(raw) = key {
+                                merged_keys.push(raw);
+                            }
+                        }
+                    }
+                }
+
+                merged_keys.sort();
+                let start = cursor as usize;
+                let limit = count.unwrap_or(10).max(1);
+                if start >= merged_keys.len() {
+                    let _ = tx.send(CommandResponse::Array(vec![
+                        CommandResponse::BulkString(b"0".to_vec()),
+                        CommandResponse::Array(vec![]),
+                    ]));
+                    return;
+                }
+                let end = start.saturating_add(limit).min(merged_keys.len());
+                let result_keys: Vec<CommandResponse> = merged_keys[start..end]
+                    .iter()
+                    .map(|k| CommandResponse::BulkString(k.clone()))
+                    .collect();
+                let next_cursor = if end >= merged_keys.len() { 0 } else { end };
+                let _ = tx.send(CommandResponse::Array(vec![
+                    CommandResponse::BulkString(next_cursor.to_string().into_bytes()),
+                    CommandResponse::Array(result_keys),
+                ]));
+            }
+            Command::StatsHotkeys { count } => {
+                let mut all_hot: Vec<(Vec<u8>, i64)> = Vec::new();
+                let mut receivers = Vec::new();
+                for worker in &self.workers {
+                    let (resp_tx, resp_rx) = response_channel();
+                    let _ = worker.tx.send(ShardMessage::Single {
+                        command: Command::StatsHotkeys { count },
+                        response_tx: resp_tx,
+                    });
+                    receivers.push(resp_rx);
+                }
+                for rx in receivers {
+                    if let Ok(CommandResponse::Array(hotkeys)) = rx.recv() {
+                        for hotkey in hotkeys {
+                            if let CommandResponse::Array(pair) = hotkey {
+                                if pair.len() != 2 {
+                                    continue;
+                                }
+                                if let (
+                                    CommandResponse::BulkString(key),
+                                    CommandResponse::Integer(freq),
+                                ) = (&pair[0], &pair[1])
+                                {
+                                    all_hot.push((key.clone(), *freq));
+                                }
+                            }
+                        }
+                    }
+                }
+                all_hot.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                all_hot.truncate(count);
+                let items = all_hot
+                    .into_iter()
+                    .map(|(key, freq)| {
+                        CommandResponse::Array(vec![
+                            CommandResponse::BulkString(key),
+                            CommandResponse::Integer(freq),
+                        ])
+                    })
+                    .collect();
+                let _ = tx.send(CommandResponse::Array(items));
+            }
+            Command::StatsMemory { prefixes } => {
+                let mut totals = vec![0i64; prefixes.len()];
+                let mut receivers = Vec::new();
+                for worker in &self.workers {
+                    let (resp_tx, resp_rx) = response_channel();
+                    let _ = worker.tx.send(ShardMessage::Single {
+                        command: Command::StatsMemory {
+                            prefixes: prefixes.clone(),
+                        },
+                        response_tx: resp_tx,
+                    });
+                    receivers.push(resp_rx);
+                }
+                for rx in receivers {
+                    if let Ok(CommandResponse::Array(items)) = rx.recv() {
+                        for (idx, item) in items.into_iter().enumerate().take(totals.len()) {
+                            if let CommandResponse::Integer(val) = item {
+                                totals[idx] = totals[idx].saturating_add(val);
+                            }
+                        }
+                    }
+                }
+                let merged = totals.into_iter().map(CommandResponse::Integer).collect();
+                let _ = tx.send(CommandResponse::Array(merged));
+            }
             _ => {
                 // PING, ECHO, INFO — send to shard 0
-                let _ = self.workers[0].tx.send(ShardMessage {
+                let _ = self.workers[0].tx.send(ShardMessage::Single {
                     command: cmd,
                     response_tx: tx,
                 });
@@ -422,29 +632,61 @@ fn worker_loop(
     rx: &Receiver<ShardMessage>,
     mut wal_writer: Option<Box<dyn WalWriter>>,
 ) {
-    let mut ops_since_expire = 0u32;
-    while let Ok(msg) = rx.recv() {
-        ops_since_expire += 1;
-        if ops_since_expire >= 100 {
-            store.evict_expired();
-            ops_since_expire = 0;
-        }
+    const EXPIRE_SWEEP_INTERVAL_OPS: u32 = 4096;
+    const EXPIRE_SWEEP_SAMPLE_SIZE: usize = 64;
 
-        if let Some(ref mut writer) = wal_writer {
-            if msg.command.is_mutation() {
-                if let Some(record) = command_to_wal_record(&msg.command) {
+    fn maybe_sweep(store: &mut ShardStore, ops_since_expire: &mut u32) {
+        *ops_since_expire += 1;
+        if *ops_since_expire >= EXPIRE_SWEEP_INTERVAL_OPS {
+            let _ = store.evict_expired_sample(EXPIRE_SWEEP_SAMPLE_SIZE);
+            *ops_since_expire = 0;
+        }
+    }
+
+    fn execute_with_wal(
+        store: &mut ShardStore,
+        wal_writer: Option<&mut Box<dyn WalWriter>>,
+        command: Command,
+    ) -> CommandResponse {
+        if let Some(writer) = wal_writer {
+            if command.is_mutation() {
+                if let Some(record) = command_to_wal_record(&command) {
                     writer.append(&record);
                 }
             }
         }
+        store.execute(command)
+    }
 
-        let response = store.execute(msg.command);
-        let _ = msg.response_tx.send(response);
+    let mut ops_since_expire = 0u32;
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            ShardMessage::Single {
+                command,
+                response_tx,
+            } => {
+                maybe_sweep(store, &mut ops_since_expire);
+                let response = execute_with_wal(store, wal_writer.as_mut(), command);
+                let _ = response_tx.send(response);
+            }
+            ShardMessage::Batch {
+                commands,
+                response_tx,
+            } => {
+                let mut responses = Vec::with_capacity(commands.len());
+                for (idx, command) in commands {
+                    maybe_sweep(store, &mut ops_since_expire);
+                    let response = execute_with_wal(store, wal_writer.as_mut(), command);
+                    responses.push((idx, response));
+                }
+                let _ = response_tx.send(responses);
+            }
+        }
     }
 }
 
 /// Convert a `Command` to a `WalRecord` for WAL logging.
-fn command_to_wal_record(cmd: &Command) -> Option<WalRecord> {
+pub fn command_to_wal_record(cmd: &Command) -> Option<WalRecord> {
     match cmd {
         Command::Set {
             key, value, ex, px, ..
@@ -619,6 +861,28 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn test_dispatch_batch_blocking_preserves_barrier_order() {
+        let engine = ShardEngine::new(4);
+        let responses = engine.dispatch_batch_blocking(vec![
+            Command::Set {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                ex: None,
+                px: None,
+                nx: false,
+                xx: false,
+            },
+            Command::FlushDb,
+            Command::Get { key: b"k".to_vec() },
+        ]);
+
+        assert_eq!(responses.len(), 3);
+        assert!(matches!(responses[0], CommandResponse::Ok));
+        assert!(matches!(responses[1], CommandResponse::Ok));
+        assert!(matches!(responses[2], CommandResponse::Nil));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! lock-free parallelism for publishes to different channels. Pattern
 //! subscriptions are replicated to all shards since any publish could match.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use ahash::AHashMap;
@@ -28,7 +29,7 @@ struct Subscriber {
 
 struct PatternSubscriber {
     conn_id: u64,
-    pattern: Vec<u8>,
+    pattern: Arc<[u8]>,
     tx: Arc<dyn MessageSink>,
 }
 
@@ -53,6 +54,8 @@ impl ShardSubscriptions {
 pub struct PubSubBroker {
     shards: Vec<RwLock<ShardSubscriptions>>,
     shard_mask: usize,
+    hash_builder: ahash::RandomState,
+    total_subscriptions: AtomicUsize,
 }
 
 impl PubSubBroker {
@@ -67,11 +70,13 @@ impl PubSubBroker {
         Self {
             shards,
             shard_mask: num_shards - 1,
+            hash_builder: ahash::RandomState::with_seeds(0, 0, 0, 0),
+            total_subscriptions: AtomicUsize::new(0),
         }
     }
 
     fn shard_index(&self, channel: &[u8]) -> usize {
-        let hash = ahash::RandomState::with_seeds(0, 0, 0, 0).hash_one(channel);
+        let hash = self.hash_builder.hash_one(channel);
         (hash as usize) & self.shard_mask
     }
 
@@ -86,6 +91,7 @@ impl PubSubBroker {
             return;
         }
         subs.push(Subscriber { conn_id, tx });
+        self.total_subscriptions.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Unsubscribe a connection from an exact channel.
@@ -100,6 +106,9 @@ impl PubSubBroker {
         let before = subs.len();
         subs.retain(|s| s.conn_id != conn_id);
         let removed = subs.len() < before;
+        if removed {
+            self.total_subscriptions.fetch_sub(1, Ordering::Relaxed);
+        }
         if subs.is_empty() {
             shard.channels.remove(channel);
         }
@@ -115,7 +124,7 @@ impl PubSubBroker {
             .read()
             .patterns
             .iter()
-            .any(|p| p.conn_id == conn_id && p.pattern == pattern)
+            .any(|p| p.conn_id == conn_id && p.pattern.as_ref() == pattern)
         {
             return;
         }
@@ -123,10 +132,11 @@ impl PubSubBroker {
             let mut shard = shard_lock.write();
             shard.patterns.push(PatternSubscriber {
                 conn_id,
-                pattern: pattern.to_vec(),
+                pattern: Arc::from(pattern),
                 tx: tx.clone(),
             });
         }
+        self.total_subscriptions.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Unsubscribe a connection from a glob pattern.
@@ -139,10 +149,13 @@ impl PubSubBroker {
             let before = shard.patterns.len();
             shard
                 .patterns
-                .retain(|p| !(p.conn_id == conn_id && p.pattern == pattern));
+                .retain(|p| !(p.conn_id == conn_id && p.pattern.as_ref() == pattern));
             if shard.patterns.len() < before {
                 found = true;
             }
+        }
+        if found {
+            self.total_subscriptions.fetch_sub(1, Ordering::Relaxed);
         }
         found
     }
@@ -152,58 +165,98 @@ impl PubSubBroker {
     /// Returns the number of subscribers that received the message.
     /// Dead subscribers (where `send` returns `false`) are lazily cleaned up.
     pub fn publish(&self, channel: &[u8], data: &[u8]) -> usize {
+        if self.total_subscriptions.load(Ordering::Relaxed) == 0 {
+            return 0;
+        }
         let idx = self.shard_index(channel);
-        let channel_arc: Arc<[u8]> = Arc::from(channel);
-        let data_arc: Arc<[u8]> = Arc::from(data);
         let mut delivered = 0;
-        let mut dead_channel_conns = Vec::new();
-        let mut dead_pattern_indices = Vec::new();
+        let mut channel_arc: Option<Arc<[u8]>> = None;
+        let mut data_arc: Option<Arc<[u8]>> = None;
+        let mut dead_channel_conns: Option<Vec<u64>> = None;
+        let mut dead_pattern_indices: Option<Vec<usize>> = None;
 
         {
             let shard = self.shards[idx].read();
+            let channel_subs = shard.channels.get(channel);
+            if channel_subs.is_none() && shard.patterns.is_empty() {
+                return 0;
+            }
 
-            if let Some(subs) = shard.channels.get(channel) {
+            let mut ensure_payload = || {
+                let ch = channel_arc
+                    .get_or_insert_with(|| Arc::<[u8]>::from(channel))
+                    .clone();
+                let payload = data_arc
+                    .get_or_insert_with(|| Arc::<[u8]>::from(data))
+                    .clone();
+                (ch, payload)
+            };
+
+            if let Some(subs) = channel_subs {
                 for sub in subs {
+                    let (ch, payload) = ensure_payload();
                     if sub.tx.send(PubSubMessage::Message {
-                        channel: channel_arc.clone(),
-                        data: data_arc.clone(),
+                        channel: ch,
+                        data: payload,
                     }) {
                         delivered += 1;
                     } else {
-                        dead_channel_conns.push(sub.conn_id);
+                        dead_channel_conns
+                            .get_or_insert_with(Vec::new)
+                            .push(sub.conn_id);
                     }
                 }
             }
 
             for (i, psub) in shard.patterns.iter().enumerate() {
-                if glob_match(&psub.pattern, channel) {
+                if glob_match(psub.pattern.as_ref(), channel) {
+                    let (ch, payload) = ensure_payload();
                     if psub.tx.send(PubSubMessage::PatternMessage {
-                        pattern: Arc::from(psub.pattern.as_slice()),
-                        channel: channel_arc.clone(),
-                        data: data_arc.clone(),
+                        pattern: psub.pattern.clone(),
+                        channel: ch,
+                        data: payload,
                     }) {
                         delivered += 1;
                     } else {
-                        dead_pattern_indices.push(i);
+                        dead_pattern_indices.get_or_insert_with(Vec::new).push(i);
                     }
                 }
             }
         }
 
-        if !dead_channel_conns.is_empty() || !dead_pattern_indices.is_empty() {
+        if dead_channel_conns.is_some() || dead_pattern_indices.is_some() {
             let mut shard = self.shards[idx].write();
-            for conn_id in &dead_channel_conns {
+            let mut removed_exact = 0usize;
+            let mut removed_patterns = 0usize;
+
+            if let Some(ref dead) = dead_channel_conns {
                 if let Some(subs) = shard.channels.get_mut(channel) {
-                    subs.retain(|s| s.conn_id != *conn_id);
+                    let before = subs.len();
+                    if dead.len() == 1 {
+                        let dead_conn_id = dead[0];
+                        subs.retain(|s| s.conn_id != dead_conn_id);
+                    } else {
+                        let dead_set: ahash::AHashSet<u64> = dead.iter().copied().collect();
+                        subs.retain(|s| !dead_set.contains(&s.conn_id));
+                    }
+                    removed_exact = before.saturating_sub(subs.len());
                     if subs.is_empty() {
                         shard.channels.remove(channel);
                     }
                 }
             }
-            for &i in dead_pattern_indices.iter().rev() {
-                if i < shard.patterns.len() {
-                    shard.patterns.swap_remove(i);
+            if let Some(ref dead) = dead_pattern_indices {
+                for &i in dead.iter().rev() {
+                    if i < shard.patterns.len() {
+                        shard.patterns.swap_remove(i);
+                        removed_patterns += 1;
+                    }
                 }
+            }
+            let total_removed = removed_exact + removed_patterns;
+            if total_removed > 0 {
+                self.total_subscriptions
+                    .fetch_sub(total_removed, Ordering::Relaxed);
             }
         }
 
@@ -212,13 +265,28 @@ impl PubSubBroker {
 
     /// Remove all subscriptions (exact and pattern) for a connection.
     pub fn remove_connection(&self, conn_id: u64) {
+        let mut removed_channels = 0usize;
+        let mut removed_patterns = 0usize;
+        let mut first_shard = true;
         for shard_lock in &self.shards {
             let mut shard = shard_lock.write();
             for subs in shard.channels.values_mut() {
+                let before = subs.len();
                 subs.retain(|s| s.conn_id != conn_id);
+                removed_channels += before - subs.len();
             }
             shard.channels.retain(|_, subs| !subs.is_empty());
+            let pat_before = shard.patterns.len();
             shard.patterns.retain(|p| p.conn_id != conn_id);
+            if first_shard {
+                removed_patterns = pat_before - shard.patterns.len();
+                first_shard = false;
+            }
+        }
+        let total_removed = removed_channels + removed_patterns;
+        if total_removed > 0 {
+            self.total_subscriptions
+                .fetch_sub(total_removed, Ordering::Relaxed);
         }
     }
 }

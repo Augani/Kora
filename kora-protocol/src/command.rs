@@ -16,6 +16,111 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
         return Err(ProtocolError::InvalidData("empty command".into()));
     }
 
+    // Fast path for high-frequency pub/sub commands:
+    // avoid command-name normalization and argument cloning.
+    if is_command_name(&parts[0], b"PUBLISH") {
+        if parts.len() != 3 {
+            return Err(ProtocolError::WrongArity("PUBLISH".into()));
+        }
+        let mut iter = parts.into_iter();
+        let _ = iter.next();
+        let channel = extract_bytes_owned(iter.next().expect("len checked"))?;
+        let message = extract_bytes_owned(iter.next().expect("len checked"))?;
+        return Ok(Command::Publish { channel, message });
+    }
+
+    if is_command_name(&parts[0], b"SUBSCRIBE") {
+        if parts.len() < 2 {
+            return Err(ProtocolError::WrongArity("SUBSCRIBE".into()));
+        }
+        let mut iter = parts.into_iter();
+        let _ = iter.next();
+        let mut channels = Vec::with_capacity(iter.len());
+        for arg in iter {
+            channels.push(extract_bytes_owned(arg)?);
+        }
+        return Ok(Command::Subscribe { channels });
+    }
+
+    if is_command_name(&parts[0], b"UNSUBSCRIBE") {
+        let mut iter = parts.into_iter();
+        let _ = iter.next();
+        let mut channels = Vec::with_capacity(iter.len());
+        for arg in iter {
+            channels.push(extract_bytes_owned(arg)?);
+        }
+        return Ok(Command::Unsubscribe { channels });
+    }
+
+    if is_command_name(&parts[0], b"PSUBSCRIBE") {
+        if parts.len() < 2 {
+            return Err(ProtocolError::WrongArity("PSUBSCRIBE".into()));
+        }
+        let mut iter = parts.into_iter();
+        let _ = iter.next();
+        let mut patterns = Vec::with_capacity(iter.len());
+        for arg in iter {
+            patterns.push(extract_bytes_owned(arg)?);
+        }
+        return Ok(Command::PSubscribe { patterns });
+    }
+
+    if is_command_name(&parts[0], b"PUNSUBSCRIBE") {
+        let mut iter = parts.into_iter();
+        let _ = iter.next();
+        let mut patterns = Vec::with_capacity(iter.len());
+        for arg in iter {
+            patterns.push(extract_bytes_owned(arg)?);
+        }
+        return Ok(Command::PUnsubscribe { patterns });
+    }
+
+    // Fast path for common non-pubsub commands.
+    if is_command_name(&parts[0], b"GET") {
+        if parts.len() != 2 {
+            return Err(ProtocolError::WrongArity("GET".into()));
+        }
+        let mut iter = parts.into_iter();
+        let _ = iter.next();
+        let key = extract_bytes_owned(iter.next().expect("len checked"))?;
+        return Ok(Command::Get { key });
+    }
+
+    if is_command_name(&parts[0], b"PING") {
+        if parts.len() == 1 {
+            return Ok(Command::Ping { message: None });
+        }
+        if parts.len() == 2 {
+            let mut iter = parts.into_iter();
+            let _ = iter.next();
+            let message = extract_bytes_owned(iter.next().expect("len checked"))?;
+            return Ok(Command::Ping {
+                message: Some(message),
+            });
+        }
+        return Err(ProtocolError::WrongArity("PING".into()));
+    }
+
+    if is_command_name(&parts[0], b"SET") {
+        if parts.len() < 3 {
+            return Err(ProtocolError::WrongArity("SET".into()));
+        }
+        if parts.len() == 3 {
+            let mut iter = parts.into_iter();
+            let _ = iter.next();
+            let key = extract_bytes_owned(iter.next().expect("len checked"))?;
+            let value = extract_bytes_owned(iter.next().expect("len checked"))?;
+            return Ok(Command::Set {
+                key,
+                value,
+                ex: None,
+                px: None,
+                nx: false,
+                xx: false,
+            });
+        }
+    }
+
     let cmd_name = extract_string(&parts[0])?.to_ascii_uppercase();
     let args = &parts[1..];
 
@@ -833,6 +938,24 @@ fn extract_bytes(val: &RespValue) -> Result<Vec<u8>, ProtocolError> {
         RespValue::SimpleString(data) => Ok(data.clone()),
         RespValue::Integer(n) => Ok(n.to_string().into_bytes()),
         _ => Err(ProtocolError::InvalidData("expected bulk string".into())),
+    }
+}
+
+fn extract_bytes_owned(val: RespValue) -> Result<Vec<u8>, ProtocolError> {
+    match val {
+        RespValue::BulkString(Some(data)) => Ok(data),
+        RespValue::SimpleString(data) => Ok(data),
+        RespValue::Integer(n) => Ok(n.to_string().into_bytes()),
+        _ => Err(ProtocolError::InvalidData("expected bulk string".into())),
+    }
+}
+
+fn is_command_name(val: &RespValue, cmd: &[u8]) -> bool {
+    match val {
+        RespValue::BulkString(Some(data)) | RespValue::SimpleString(data) => {
+            data.eq_ignore_ascii_case(cmd)
+        }
+        _ => false,
     }
 }
 

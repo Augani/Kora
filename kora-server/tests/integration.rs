@@ -1,11 +1,14 @@
 //! TCP integration tests for kora-server Redis protocol compatibility.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use kora_server::{KoraServer, ServerConfig};
+use kora_storage::manager::StorageConfig;
+use kora_storage::wal::SyncPolicy;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -46,8 +49,7 @@ async fn start_server(port: u16) -> tokio::sync::watch::Sender<bool> {
     tokio::spawn(async move {
         let _ = server.run(rx).await;
     });
-    // Give the server a moment to bind.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     tx
 }
 
@@ -376,6 +378,25 @@ async fn test_pipelining() {
 }
 
 #[tokio::test]
+async fn test_pipeline_order_with_local_publish() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    // Mix deferred shard work (SET/GET) with local pub/sub handling (PUBLISH).
+    let mut pipeline = Vec::new();
+    pipeline.extend_from_slice(&resp_cmd(&["SET", "mix:key", "v1"]));
+    pipeline.extend_from_slice(&resp_cmd(&["PUBLISH", "mix:ch", "msg"]));
+    pipeline.extend_from_slice(&resp_cmd(&["GET", "mix:key"]));
+
+    let resp = send_and_read(&mut stream, &pipeline).await;
+    let expected = [&b"+OK\r\n"[..], b":0\r\n", b"$2\r\nv1\r\n"].concat();
+    assert_resp(&resp, &expected);
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
 async fn test_error_wrong_arity() {
     let port = free_port().await;
     let shutdown = start_server(port).await;
@@ -619,4 +640,158 @@ async fn test_pubsub_multiple_channels() {
     assert_resp(&buf, &expected);
 
     let _ = shutdown.send(true);
+}
+
+// ---------------------------------------------------------------------------
+// Persistence Tests
+// ---------------------------------------------------------------------------
+
+async fn start_server_with_storage(
+    port: u16,
+    data_dir: PathBuf,
+) -> tokio::sync::watch::Sender<bool> {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let config = ServerConfig {
+        bind_address: format!("127.0.0.1:{}", port),
+        worker_count: 2,
+        storage: Some(StorageConfig {
+            data_dir,
+            wal_sync_policy: SyncPolicy::EveryWrite,
+            wal_enabled: true,
+            rdb_enabled: true,
+            wal_max_bytes: 64 * 1024 * 1024,
+        }),
+        ..Default::default()
+    };
+    let server = KoraServer::new(config);
+    tokio::spawn(async move {
+        let _ = server.run(rx).await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tx
+}
+
+#[tokio::test]
+async fn test_wal_writes_persist_to_disk() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let data_dir = tmp_dir.path().to_path_buf();
+    let port = free_port().await;
+
+    let shutdown = start_server_with_storage(port, data_dir.clone()).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "persist:key1", "value1"]).await;
+    cmd(&mut stream, &["SET", "persist:key2", "value2"]).await;
+    cmd(&mut stream, &["INCR", "persist:counter"]).await;
+    cmd(&mut stream, &["LPUSH", "persist:list", "a"]).await;
+    cmd(&mut stream, &["HSET", "persist:hash", "f1", "v1"]).await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let resp = cmd(&mut stream, &["GET", "persist:key1"]).await;
+    assert_resp(&resp, b"$6\r\nvalue1\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "persist:counter"]).await;
+    assert_resp(&resp, b"$1\r\n1\r\n");
+
+    let _ = shutdown.send(true);
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let shard0_wal = data_dir.join("shard-0/shard.wal");
+    let shard1_wal = data_dir.join("shard-1/shard.wal");
+    assert!(
+        shard0_wal.exists() || shard1_wal.exists(),
+        "At least one shard WAL file should exist after writes"
+    );
+
+    let total_wal_size: u64 = [&shard0_wal, &shard1_wal]
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    assert!(
+        total_wal_size > 0,
+        "WAL files should contain data after writes"
+    );
+}
+
+#[tokio::test]
+async fn test_wal_replay_restores_data() {
+    use kora_storage::shard_storage::ShardStorage;
+    use kora_storage::wal::WalEntry;
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let data_dir = tmp_dir.path().to_path_buf();
+    let port = free_port().await;
+
+    let shutdown = start_server_with_storage(port, data_dir.clone()).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "replay:key1", "hello"]).await;
+    cmd(&mut stream, &["SET", "replay:key2", "world"]).await;
+    cmd(&mut stream, &["SET", "replay:key3", "test"]).await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = shutdown.send(true);
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut replayed_entries = Vec::new();
+    for shard_id in 0..2u16 {
+        if let Ok(storage) = ShardStorage::open_with_config(
+            shard_id,
+            &data_dir,
+            SyncPolicy::EveryWrite,
+            true,
+            true,
+            0,
+        ) {
+            let _ = storage.wal_replay(|entry| {
+                replayed_entries.push(entry);
+            });
+        }
+    }
+
+    let set_count = replayed_entries
+        .iter()
+        .filter(|e| matches!(e, WalEntry::Set { .. }))
+        .count();
+    assert!(
+        set_count >= 3,
+        "Expected at least 3 SET entries in WAL replay, got {}",
+        set_count
+    );
+
+    let has_key1 = replayed_entries.iter().any(|e| {
+        if let WalEntry::Set { key, value, .. } = e {
+            key == b"replay:key1" && value == b"hello"
+        } else {
+            false
+        }
+    });
+    assert!(has_key1, "WAL replay should contain replay:key1 = hello");
+}
+
+#[tokio::test]
+async fn test_bgsave_creates_rdb() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let data_dir = tmp_dir.path().to_path_buf();
+
+    let port = free_port().await;
+    let shutdown = start_server_with_storage(port, data_dir.clone()).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "restart:key", "persistent_value"]).await;
+
+    let resp = cmd(&mut stream, &["BGSAVE"]).await;
+    assert_resp(&resp, b"+Background saving started\r\n");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let _ = shutdown.send(true);
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let has_rdb = (0..2u16).any(|id| data_dir.join(format!("shard-{}/shard.rdb", id)).exists());
+    assert!(has_rdb, "RDB snapshot should exist after BGSAVE");
 }

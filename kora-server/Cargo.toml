@@ -7,7 +7,9 @@ rust-version.workspace = true
 description = "TCP/Unix socket server, connection handling, and command dispatch for Kōra"
 
 [dependencies]
+ahash.workspace = true
 bytes.workspace = true
+crossbeam-channel.workspace = true
 kora-core.workspace = true
 kora-protocol.workspace = true
 kora-pubsub.workspace = true
@@ -26,3 +28,5 @@ http-body-util.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 rand.workspace = true
+hdrhistogram.workspace = true
+tempfile.workspace = true

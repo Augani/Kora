@@ -29,6 +29,8 @@ pub struct FileConfig {
     pub port: Option<u16>,
     /// Number of worker threads.
     pub workers: Option<usize>,
+    /// Number of Tokio runtime worker threads.
+    pub runtime_workers: Option<usize>,
     /// Log level.
     pub log_level: Option<String>,
     /// Storage configuration.
@@ -41,6 +43,8 @@ pub struct FileConfig {
     pub metrics_port: Option<u16>,
     /// Optional Unix socket path.
     pub unix_socket: Option<String>,
+    /// Enable tenant resource-limit checks on command dispatch.
+    pub tenant_limits_enabled: Option<bool>,
 }
 
 /// Storage section of the config file.

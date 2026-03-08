@@ -603,10 +603,13 @@ impl Database {
 
     // ─── Hybrid mode ────────────────────────────────────────────
 
-    /// Start a TCP listener on the given address, sharing this database's engine.
+    /// Start a TCP listener on the given address.
     ///
     /// Returns a `JoinHandle` for the background server task. The server runs
     /// until the returned shutdown sender is signaled or the handle is dropped.
+    ///
+    /// Note: the server creates its own shard stores — data is not shared with
+    /// the embedded `Database` instance.
     ///
     /// Requires the `server` feature.
     #[cfg(feature = "server")]
@@ -614,13 +617,12 @@ impl Database {
         &self,
         addr: &str,
     ) -> Result<(JoinHandle<()>, tokio::sync::watch::Sender<bool>), String> {
-        let engine = self.engine.clone();
         let config = kora_server::ServerConfig {
             bind_address: addr.to_string(),
-            worker_count: engine.shard_count(),
+            worker_count: self.engine.shard_count(),
             ..Default::default()
         };
-        let server = kora_server::KoraServer::with_engine(engine, config);
+        let server = kora_server::KoraServer::new(config);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let handle = tokio::spawn(async move {

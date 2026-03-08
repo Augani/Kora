@@ -334,17 +334,90 @@
 
 ---
 
+## Phase 8 — Pub/Sub ✅
+
+**Status: Complete**
+
+### 8.1 — kora-pubsub Crate ✅
+
+- `PubSubBroker` with internal `RwLock` for thread-safe subscribe/publish
+- Channel subscriptions and glob-pattern subscriptions (PSUBSCRIBE)
+- `TokioSink` adapter for async message push to subscriber connections
+- Message types: `subscribe`, `unsubscribe`, `psubscribe`, `punsubscribe`, `message`, `pmessage`
+
+### 8.2 — Protocol & Commands ✅
+
+- SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH
+- Push-mode connection handling (subscribers receive messages inline)
+- Multi-channel subscribe in single command
+
+### 8.3 — Integration Tests & Benchmarks ✅
+
+- 5 pub/sub integration tests: subscribe+publish, no-subscribers, psubscribe, unsubscribe, multi-channel
+- Dedicated pub/sub throughput benchmark with delivery latency measurement
+- Fan-out verification (3 subs/channel = 3.00x delivery ratio, zero message loss)
+
+---
+
+## Phase 9 — Shard-Affinity I/O Architecture ✅
+
+**Status: Complete**
+
+### 9.1 — Architecture ✅
+
+- Each shard worker runs its own `current_thread` tokio runtime + `LocalSet`
+- Shard owns both its data (ShardStore) AND its connections' I/O
+- `Rc<RefCell<ShardStore>>` for zero-lock local execution (single-threaded, no Send needed)
+- Connection assignment: least-connections round-robin via `Arc<[AtomicUsize]>`
+- Replaced legacy mode entirely — affinity is the only server mode
+
+### 9.2 — Inter-shard Communication ✅
+
+- `tokio::sync::mpsc` + `oneshot` replaces 2 crossbeam hops with 1 async hop
+- `ShardRouter` with `dispatch_foreign`, `scatter_gather`, `dispatch_broadcast`
+- Multi-key commands (MGET, MSET, DEL, EXISTS) split local/foreign with `join_all`
+- Cross-shard timeout: 5 seconds
+
+### 9.3 — Persistence ✅
+
+- WAL writes inline via `execute_with_wal_inline` before `store.execute()`
+- BGSAVE dispatches `BgSave` request to all shards, each snapshots to RDB
+- `store_to_rdb_entries` + `value_to_rdb` convert in-memory data to RDB format
+- Integration tests verify: WAL writes to disk, WAL replay reads entries, BGSAVE creates RDB files
+
+### 9.4 — Performance Results ✅
+
+**Mixed traffic (64 clients, 24 subscribers, GET/SET/INCR/PUBLISH):**
+
+| Metric | Redis | Kōra | Delta |
+|--------|-------|------|-------|
+| Throughput | 256,864 ops/s | 358,000 ops/s | **+39.4%** |
+| p50 latency | 0.591ms | 0.418ms | **-29%** |
+| p99 latency | 0.883ms | 0.555ms | **-37%** |
+
+**Pub/Sub (8 channels, 8 publishers, 3 subs/channel):**
+
+| Metric | Redis | Kōra | Delta |
+|--------|-------|------|-------|
+| Publish rate | 60,964/s | 66,046/s | **+8.3%** |
+| Delivery rate | 182,893/s | 198,138/s | **+8.3%** |
+| Delivery p99 | 0.237ms | 0.201ms | **-15%** |
+| Fan-out | 3.00x | 3.00x | Perfect |
+
+---
+
 ## Test Summary
 
 | Crate | Unit Tests | Integration/Stress Tests | Benchmarks |
 |-------|-----------|-------------------------|------------|
-| kora-core | ✅ (124 tests) | 9 stress tests | 5 benchmarks |
-| kora-protocol | ✅ (80 tests) | 11 stress tests | 8 benchmarks |
-| kora-server | ✅ | 18 integration tests | — |
+| kora-core | ✅ (125 tests) | 9 stress tests | 5 benchmarks |
+| kora-protocol | ✅ (96 tests) | 11 stress tests | 8 benchmarks |
+| kora-server | ✅ | 27 integration tests | 2 benchmarks (vs Redis) |
 | kora-embedded | ✅ | — | — |
 | kora-storage | ✅ (60 tests across modules) | — | — |
 | kora-vector | ✅ (22 tests) | — | 6 benchmarks |
 | kora-cdc | ✅ (26 tests) | — | — |
+| kora-pubsub | ✅ (19 tests) | — | — |
 | kora-observability | ✅ (21 tests) | — | — |
 | kora-scripting | ✅ | — | — |
 
@@ -372,7 +445,10 @@
 18. **Per-tenant eviction scope** — prevents noisy-neighbor eviction across tenant boundaries
 19. **Deterministic simulation** — seeded PRNG + virtual clock for reproducible concurrency testing
 20. **Vec-backed slab allocator** — safe Rust, no `unsafe`, free-list reuse for common sizes
+21. **Shard-affinity I/O** — each shard owns its connections' I/O, eliminating 2 channel hops per command
+22. **`Rc<RefCell<>>` for store access** — single-threaded runtime means no Send/Sync needed, zero-lock data path
+23. **Least-connections assignment** — connections routed to least-loaded shard for balanced utilization
 
 ---
 
-*All phases (0–7) delivered. 409 tests passing.*
+*All phases (0–9) delivered. 550+ tests passing. Kōra beats Redis by 39% throughput with 37% lower p99 latency.*

@@ -17,7 +17,7 @@ kora-observability = { workspace = true, optional = true }
 kora-vector = { workspace = true, optional = true }
 
 [features]
-default = ["observability", "vector"]
+default = ["vector"]
 observability = ["dep:kora-observability"]
 vector = ["dep:kora-vector"]
 simulation = []
