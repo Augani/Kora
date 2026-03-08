@@ -33,6 +33,14 @@ struct Args {
     #[arg(short, long)]
     workers: Option<usize>,
 
+    /// Address to bind the optional memcached listener.
+    #[arg(long)]
+    memcached_bind: Option<String>,
+
+    /// Port for the optional memcached listener.
+    #[arg(long)]
+    memcached_port: Option<u16>,
+
     /// Log level (trace, debug, info, warn, error).
     #[arg(long)]
     log_level: Option<String>,
@@ -40,6 +48,14 @@ struct Args {
     /// Data directory for persistence.
     #[arg(long)]
     data_dir: Option<String>,
+
+    /// Automatic snapshot interval in seconds.
+    #[arg(long)]
+    snapshot_interval_secs: Option<u64>,
+
+    /// Number of timestamped snapshots to retain per shard.
+    #[arg(long)]
+    snapshot_retain: Option<usize>,
 
     /// CDC ring buffer capacity per shard (0 = disabled).
     #[arg(long)]
@@ -74,6 +90,8 @@ fn main() -> anyhow::Result<()> {
         .or(file_config.bind)
         .unwrap_or_else(|| "127.0.0.1".into());
     let port = args.port.or(file_config.port).unwrap_or(6379);
+    let memcached_bind = args.memcached_bind.or(file_config.memcached_bind);
+    let memcached_port = args.memcached_port.or(file_config.memcached_port);
     let log_level = args
         .log_level
         .or(file_config.log_level)
@@ -108,6 +126,13 @@ fn main() -> anyhow::Result<()> {
             wal_sync_policy: wal_sync,
             wal_enabled: file_config.storage.wal_enabled.unwrap_or(true),
             rdb_enabled: file_config.storage.rdb_enabled.unwrap_or(true),
+            snapshot_interval_secs: args
+                .snapshot_interval_secs
+                .or(file_config.storage.snapshot_interval_secs),
+            snapshot_retain: args
+                .snapshot_retain
+                .or(file_config.storage.snapshot_retain)
+                .or(Some(24)),
             wal_max_bytes: file_config
                 .storage
                 .wal_max_bytes
@@ -126,11 +151,16 @@ fn main() -> anyhow::Result<()> {
         .unix_socket
         .or(file_config.unix_socket)
         .map(PathBuf::from);
+    let memcached_bind_address = memcached_port.map(|port| {
+        let host = memcached_bind.unwrap_or_else(|| bind.clone());
+        format!("{}:{}", host, port)
+    });
     let tenant_limits_enabled =
         args.tenant_limits || file_config.tenant_limits_enabled.unwrap_or(false);
 
     let config = ServerConfig {
         bind_address: format!("{}:{}", bind, port),
+        memcached_bind_address,
         worker_count,
         storage,
         cdc_capacity,

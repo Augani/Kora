@@ -659,6 +659,8 @@ async fn start_server_with_storage(
             wal_sync_policy: SyncPolicy::EveryWrite,
             wal_enabled: true,
             rdb_enabled: true,
+            snapshot_interval_secs: None,
+            snapshot_retain: Some(24),
             wal_max_bytes: 64 * 1024 * 1024,
         }),
         ..Default::default()
@@ -794,4 +796,69 @@ async fn test_bgsave_creates_rdb() {
 
     let has_rdb = (0..2u16).any(|id| data_dir.join(format!("shard-{}/shard.rdb", id)).exists());
     assert!(has_rdb, "RDB snapshot should exist after BGSAVE");
+}
+
+#[tokio::test]
+async fn test_periodic_snapshots_create_backups_and_prune_retention() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let data_dir = tmp_dir.path().to_path_buf();
+    let port = free_port().await;
+
+    let (shutdown, rx) = tokio::sync::watch::channel(false);
+    let config = ServerConfig {
+        bind_address: format!("127.0.0.1:{}", port),
+        worker_count: 2,
+        storage: Some(StorageConfig {
+            data_dir: data_dir.clone(),
+            wal_sync_policy: SyncPolicy::EveryWrite,
+            wal_enabled: true,
+            rdb_enabled: true,
+            snapshot_interval_secs: Some(1),
+            snapshot_retain: Some(2),
+            wal_max_bytes: 64 * 1024 * 1024,
+        }),
+        ..Default::default()
+    };
+    let server = KoraServer::new(config);
+    tokio::spawn(async move {
+        let _ = server.run(rx).await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut stream = connect(port).await;
+    cmd(&mut stream, &["SET", "autosnap:key", "value"]).await;
+
+    tokio::time::sleep(Duration::from_millis(3300)).await;
+
+    let mut snapshot_count = 0usize;
+    let mut found_latest = false;
+    for shard in 0..2u16 {
+        let shard_dir = data_dir.join(format!("shard-{}", shard));
+        if shard_dir.join("shard.rdb").exists() {
+            found_latest = true;
+        }
+        let snapshot_dir = shard_dir.join("snapshots");
+        if snapshot_dir.exists() {
+            let count = std::fs::read_dir(&snapshot_dir)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry.path().extension().and_then(|ext| ext.to_str()) == Some("rdb")
+                })
+                .count();
+            assert!(
+                count <= 2,
+                "expected retention pruning to keep at most 2 backups"
+            );
+            snapshot_count += count;
+        }
+    }
+
+    assert!(found_latest, "latest shard snapshot should exist");
+    assert!(
+        snapshot_count > 0,
+        "expected at least one timestamped snapshot backup"
+    );
+
+    let _ = shutdown.send(true);
 }

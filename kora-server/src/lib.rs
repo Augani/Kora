@@ -20,6 +20,8 @@ use kora_storage::shard_storage::ShardStorage;
 pub struct ServerConfig {
     /// Address to bind to (e.g., "127.0.0.1:6379").
     pub bind_address: String,
+    /// Optional dedicated memcached listener address (e.g., "127.0.0.1:11211").
+    pub memcached_bind_address: Option<String>,
     /// Number of shard worker threads.
     pub worker_count: usize,
     /// Optional storage configuration for persistence.
@@ -55,6 +57,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_address: "127.0.0.1:6379".into(),
+            memcached_bind_address: None,
             worker_count: optimal_worker_count(),
             storage: None,
             cdc_capacity: 0,
@@ -119,6 +122,7 @@ impl KoraServer {
             config.tenant_limits_enabled,
             config.storage,
             bind_address,
+            config.memcached_bind_address.clone(),
             unix_socket,
         );
 

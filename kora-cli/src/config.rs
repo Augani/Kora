@@ -13,6 +13,8 @@
 //! [storage]
 //! data_dir = "/var/lib/kora"
 //! wal_sync = "every_second"   # every_write | every_second | os_managed
+//! snapshot_interval_secs = 300
+//! snapshot_retain = 24
 //! ```
 
 use std::path::Path;
@@ -29,6 +31,10 @@ pub struct FileConfig {
     pub port: Option<u16>,
     /// Number of worker threads.
     pub workers: Option<usize>,
+    /// Address for the optional memcached listener.
+    pub memcached_bind: Option<String>,
+    /// Port for the optional memcached listener.
+    pub memcached_port: Option<u16>,
     /// Number of Tokio runtime worker threads.
     pub runtime_workers: Option<usize>,
     /// Log level.
@@ -59,6 +65,10 @@ pub struct StorageFileConfig {
     pub wal_enabled: Option<bool>,
     /// Enable RDB snapshots.
     pub rdb_enabled: Option<bool>,
+    /// Automatic snapshot interval in seconds.
+    pub snapshot_interval_secs: Option<u64>,
+    /// Number of timestamped snapshots to retain per shard.
+    pub snapshot_retain: Option<usize>,
     /// Maximum WAL size in bytes before auto-rotation.
     pub wal_max_bytes: Option<u64>,
 }
@@ -86,6 +96,8 @@ mod tests {
 bind = "0.0.0.0"
 port = 7379
 workers = 8
+memcached_bind = "0.0.0.0"
+memcached_port = 11211
 log_level = "debug"
 
 [storage]
@@ -93,15 +105,21 @@ data_dir = "/var/lib/kora"
 wal_sync = "every_write"
 wal_enabled = true
 rdb_enabled = true
+snapshot_interval_secs = 300
+snapshot_retain = 24
 wal_max_bytes = 134217728
 "#;
         let config: FileConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.bind, Some("0.0.0.0".into()));
         assert_eq!(config.port, Some(7379));
         assert_eq!(config.workers, Some(8));
+        assert_eq!(config.memcached_bind, Some("0.0.0.0".into()));
+        assert_eq!(config.memcached_port, Some(11211));
         assert_eq!(config.log_level, Some("debug".into()));
         assert_eq!(config.storage.data_dir, Some("/var/lib/kora".into()));
         assert_eq!(config.storage.wal_sync, Some("every_write".into()));
+        assert_eq!(config.storage.snapshot_interval_secs, Some(300));
+        assert_eq!(config.storage.snapshot_retain, Some(24));
         assert_eq!(config.storage.wal_max_bytes, Some(134217728));
     }
 
@@ -112,6 +130,7 @@ wal_max_bytes = 134217728
         assert_eq!(config.port, Some(8080));
         assert_eq!(config.bind, None);
         assert_eq!(config.workers, None);
+        assert_eq!(config.memcached_port, None);
     }
 
     #[test]

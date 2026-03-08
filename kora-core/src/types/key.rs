@@ -101,6 +101,8 @@ pub struct KeyEntry {
     pub last_access: u32,
     /// Encoding hints, dirty bit, tier marker.
     pub flags: u8,
+    /// Protocol/client-visible item flags.
+    pub client_flags: u32,
     /// Per-key xorshift PRNG state for LFU probabilistic increment.
     pub lfu_seed: u32,
     /// The tenant that owns this key.
@@ -120,6 +122,7 @@ impl KeyEntry {
             lfu_counter: 5,
             last_access: 0,
             flags: 0,
+            client_flags: 0,
             lfu_seed: seed,
             tenant_id: TenantId(0),
         }
@@ -137,6 +140,7 @@ impl KeyEntry {
             lfu_counter: 5,
             last_access: 0,
             flags: 0,
+            client_flags: 0,
             lfu_seed: seed,
             tenant_id,
         }

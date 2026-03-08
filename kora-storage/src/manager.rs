@@ -25,6 +25,10 @@ pub struct StorageConfig {
     pub wal_enabled: bool,
     /// Enable RDB snapshots.
     pub rdb_enabled: bool,
+    /// Periodic snapshot interval in seconds. `None` disables automatic snapshots.
+    pub snapshot_interval_secs: Option<u64>,
+    /// Number of timestamped snapshot backups to retain per shard. `None` keeps all.
+    pub snapshot_retain: Option<usize>,
     /// Maximum WAL size before auto-rotation (bytes). 0 = no limit.
     pub wal_max_bytes: u64,
 }
@@ -36,6 +40,8 @@ impl Default for StorageConfig {
             wal_sync_policy: SyncPolicy::EverySecond,
             wal_enabled: true,
             rdb_enabled: true,
+            snapshot_interval_secs: None,
+            snapshot_retain: Some(24),
             wal_max_bytes: 64 * 1024 * 1024, // 64 MB
         }
     }
@@ -199,6 +205,8 @@ mod tests {
             wal_sync_policy: SyncPolicy::OsManaged,
             wal_enabled: true,
             rdb_enabled: true,
+            snapshot_interval_secs: None,
+            snapshot_retain: Some(24),
             wal_max_bytes: 0,
         }
     }

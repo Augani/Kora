@@ -271,7 +271,7 @@ fn process_simple_command(
     store: &Rc<RefCell<ShardStore>>,
     wal_writer: &Rc<RefCell<Option<Box<dyn WalWriter>>>>,
     router: &ShardRouter,
-    shared: &AffinitySharedState,
+    shared: &Arc<AffinitySharedState>,
     conn: &mut ConnState,
     slots: &mut Vec<ResponseSlot>,
 ) {
@@ -311,7 +311,7 @@ fn process_hot_command(
     store: &Rc<RefCell<ShardStore>>,
     wal_writer: &Rc<RefCell<Option<Box<dyn WalWriter>>>>,
     router: &ShardRouter,
-    shared: &AffinitySharedState,
+    shared: &Arc<AffinitySharedState>,
     _conn: &mut ConnState,
     slots: &mut Vec<ResponseSlot>,
 ) {
@@ -371,7 +371,7 @@ fn process_hot_command(
 
 fn try_handle_local_affinity(
     cmd: &Command,
-    shared: &AffinitySharedState,
+    shared: &Arc<AffinitySharedState>,
     conn: &mut ConnState,
 ) -> Option<CommandResponse> {
     match cmd {
@@ -486,19 +486,11 @@ fn handle_hello(version: &Option<u8>, conn: &mut ConnState) -> CommandResponse {
     CommandResponse::Map(info)
 }
 
-fn handle_bgsave_affinity(shared: &AffinitySharedState) -> CommandResponse {
-    let sc = match shared.storage_config {
-        Some(ref s) => s.clone(),
-        None => return CommandResponse::Error("ERR persistence not configured".into()),
-    };
-    for sender in shared.router.shard_senders.iter() {
-        let (tx, _rx) = tokio::sync::oneshot::channel();
-        let _ = sender.try_send(super::ShardRequest::BgSave {
-            data_dir: sc.data_dir.clone(),
-            response_tx: tx,
-        });
+fn handle_bgsave_affinity(shared: &Arc<AffinitySharedState>) -> CommandResponse {
+    match super::start_manual_snapshot(shared) {
+        Ok(()) => CommandResponse::SimpleString("Background saving started".into()),
+        Err(err) => CommandResponse::Error(err),
     }
-    CommandResponse::SimpleString("Background saving started".into())
 }
 
 fn handle_cdc_poll(rings: &[Mutex<CdcRing>], cursor: u64, count: usize) -> CommandResponse {
