@@ -38,14 +38,24 @@ pub struct ServerConfig {
     pub tenant_limits_enabled: bool,
 }
 
+/// Returns the optimal shard worker count for the current machine.
+///
+/// - 1-2 cores: 1 worker (single shard, zero cross-shard overhead — matches
+///   Redis's single-threaded model while keeping inline execution advantage).
+/// - 3+ cores: N workers (multi-shard with SO\_REUSEPORT, scales linearly).
+pub fn optimal_worker_count() -> usize {
+    match std::thread::available_parallelism().map(|n| n.get()) {
+        Ok(1) | Ok(2) => 1,
+        Ok(n) => n,
+        Err(_) => 1,
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
-        let worker_count = std::thread::available_parallelism()
-            .map(|n| (n.get() / 3).max(1))
-            .unwrap_or(4);
         Self {
             bind_address: "127.0.0.1:6379".into(),
-            worker_count,
+            worker_count: optimal_worker_count(),
             storage: None,
             cdc_capacity: 0,
             script_max_fuel: 0,
@@ -60,8 +70,6 @@ impl Default for ServerConfig {
 /// The Kōra TCP server.
 pub struct KoraServer {
     engine: shard_io::ShardIoEngine,
-    bind_address: String,
-    unix_socket: Option<std::path::PathBuf>,
 }
 
 fn create_shard_storage(config: &ServerConfig) -> Vec<Option<Box<dyn WalWriter>>> {
@@ -110,19 +118,15 @@ impl KoraServer {
             config.password.clone(),
             config.tenant_limits_enabled,
             config.storage,
-        );
-
-        Self {
-            engine,
             bind_address,
             unix_socket,
-        }
+        );
+
+        Self { engine }
     }
 
     /// Run the server, accepting connections until the shutdown signal.
     pub async fn run(&self, shutdown: tokio::sync::watch::Receiver<bool>) -> std::io::Result<()> {
-        self.engine
-            .run(&self.bind_address, self.unix_socket.as_ref(), shutdown)
-            .await
+        self.engine.run(shutdown).await
     }
 }

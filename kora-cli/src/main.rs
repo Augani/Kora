@@ -29,13 +29,9 @@ struct Args {
     #[arg(short, long)]
     port: Option<u16>,
 
-    /// Number of shard worker threads (defaults to cores/3, minimum 1).
+    /// Number of shard worker threads (defaults to available CPU cores).
     #[arg(short, long)]
     workers: Option<usize>,
-
-    /// Number of Tokio runtime worker threads.
-    #[arg(long)]
-    runtime_workers: Option<usize>,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(long)]
@@ -82,15 +78,10 @@ fn main() -> anyhow::Result<()> {
         .log_level
         .or(file_config.log_level)
         .unwrap_or_else(|| "info".into());
-    let worker_count = args.workers.or(file_config.workers).unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| (n.get() / 3).max(1))
-            .unwrap_or(4)
-    });
-    let runtime_worker_count = args
-        .runtime_workers
-        .or(file_config.runtime_workers)
-        .unwrap_or(2);
+    let worker_count = args
+        .workers
+        .or(file_config.workers)
+        .unwrap_or_else(kora_server::optimal_worker_count);
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -156,8 +147,7 @@ fn main() -> anyhow::Result<()> {
         worker_count,
     );
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(runtime_worker_count)
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
 
