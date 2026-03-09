@@ -800,6 +800,47 @@ pub enum Command {
         /// External document ID.
         doc_id: Vec<u8>,
     },
+    /// DOC.CREATEINDEX collection field type — create a secondary index.
+    DocCreateIndex {
+        /// Collection name.
+        collection: Vec<u8>,
+        /// Dotted field path.
+        field: Vec<u8>,
+        /// Index type string (hash, sorted, array, unique).
+        index_type: Vec<u8>,
+    },
+    /// DOC.DROPINDEX collection field — drop a secondary index.
+    DocDropIndex {
+        /// Collection name.
+        collection: Vec<u8>,
+        /// Dotted field path.
+        field: Vec<u8>,
+    },
+    /// DOC.INDEXES collection — list indexes.
+    DocIndexes {
+        /// Collection name.
+        collection: Vec<u8>,
+    },
+    /// DOC.FIND collection WHERE expr \[PROJECT f1 f2 ...\] \[LIMIT n\] \[OFFSET n\]
+    DocFind {
+        /// Collection name.
+        collection: Vec<u8>,
+        /// WHERE expression string.
+        where_clause: Vec<u8>,
+        /// Optional projection field paths.
+        fields: Vec<Vec<u8>>,
+        /// Optional result limit.
+        limit: Option<usize>,
+        /// Result offset (default 0).
+        offset: usize,
+    },
+    /// DOC.COUNT collection WHERE expr
+    DocCount {
+        /// Collection name.
+        collection: Vec<u8>,
+        /// WHERE expression string.
+        where_clause: Vec<u8>,
+    },
 
     // -- CDC commands --
     /// CDCPOLL cursor count — poll CDC events from a shard.
@@ -1849,6 +1890,11 @@ impl Command {
                 | Command::DocUpdate { .. }
                 | Command::DocDel { .. }
                 | Command::DocExists { .. }
+                | Command::DocCreateIndex { .. }
+                | Command::DocDropIndex { .. }
+                | Command::DocIndexes { .. }
+                | Command::DocFind { .. }
+                | Command::DocCount { .. }
         )
     }
 
@@ -1936,6 +1982,8 @@ impl Command {
                 | Command::DocMSet { .. }
                 | Command::DocUpdate { .. }
                 | Command::DocDel { .. }
+                | Command::DocCreateIndex { .. }
+                | Command::DocDropIndex { .. }
         )
     }
 
@@ -2082,7 +2130,12 @@ impl Command {
             | Command::DocMGet { .. }
             | Command::DocUpdate { .. }
             | Command::DocDel { .. }
-            | Command::DocExists { .. } => 50,
+            | Command::DocExists { .. }
+            | Command::DocCreateIndex { .. }
+            | Command::DocDropIndex { .. }
+            | Command::DocIndexes { .. }
+            | Command::DocFind { .. }
+            | Command::DocCount { .. } => 50,
             _ => 32,
         }
     }
@@ -2127,12 +2180,17 @@ pub const SUPPORTED_COMMAND_NAMES: &[&str] = &[
     "decrby",
     "del",
     "discard",
+    "doc.count",
     "doc.create",
+    "doc.createindex",
     "doc.del",
     "doc.dictinfo",
     "doc.drop",
+    "doc.dropindex",
     "doc.exists",
+    "doc.find",
     "doc.get",
+    "doc.indexes",
     "doc.info",
     "doc.mget",
     "doc.mset",

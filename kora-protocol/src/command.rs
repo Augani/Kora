@@ -180,6 +180,22 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
                 doc_id: extract_bytes(&args[1])?,
             })
         }
+        b"DOC.CREATEINDEX" => parse_doc_createindex(args),
+        b"DOC.DROPINDEX" => {
+            check_arity("DOC.DROPINDEX", args, 2)?;
+            Ok(Command::DocDropIndex {
+                collection: extract_bytes(&args[0])?,
+                field: extract_bytes(&args[1])?,
+            })
+        }
+        b"DOC.INDEXES" => {
+            check_arity("DOC.INDEXES", args, 1)?;
+            Ok(Command::DocIndexes {
+                collection: extract_bytes(&args[0])?,
+            })
+        }
+        b"DOC.FIND" => parse_doc_find(args),
+        b"DOC.COUNT" => parse_doc_count(args),
 
         // String commands
         b"GET" => {
@@ -2124,6 +2140,140 @@ fn parse_doc_update(args: &[RespValue]) -> Result<Command, ProtocolError> {
         collection,
         doc_id,
         mutations,
+    })
+}
+
+fn parse_doc_createindex(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_arity("DOC.CREATEINDEX", args, 3)?;
+    let index_type_raw = extract_string(&args[2])?.to_ascii_lowercase();
+    match index_type_raw.as_slice() {
+        b"hash" | b"sorted" | b"array" | b"unique" => {}
+        _ => {
+            return Err(ProtocolError::InvalidData(
+                "DOC.CREATEINDEX type must be hash|sorted|array|unique".into(),
+            ));
+        }
+    }
+    Ok(Command::DocCreateIndex {
+        collection: extract_bytes(&args[0])?,
+        field: extract_bytes(&args[1])?,
+        index_type: index_type_raw,
+    })
+}
+
+fn parse_doc_find(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    if args.len() < 3 {
+        return Err(ProtocolError::WrongArity("DOC.FIND".into()));
+    }
+
+    let collection = extract_bytes(&args[0])?;
+    let where_kw = extract_string(&args[1])?.to_ascii_uppercase();
+    if where_kw.as_slice() != b"WHERE" {
+        return Err(ProtocolError::InvalidData(
+            "DOC.FIND expects WHERE keyword".into(),
+        ));
+    }
+
+    let mut where_parts: Vec<Vec<u8>> = Vec::new();
+    let mut idx = 2usize;
+    while idx < args.len() {
+        let token = extract_string(&args[idx])?.to_ascii_uppercase();
+        if token.as_slice() == b"PROJECT"
+            || token.as_slice() == b"LIMIT"
+            || token.as_slice() == b"OFFSET"
+        {
+            break;
+        }
+        where_parts.push(extract_bytes(&args[idx])?);
+        idx += 1;
+    }
+
+    if where_parts.is_empty() {
+        return Err(ProtocolError::InvalidData(
+            "DOC.FIND WHERE clause is empty".into(),
+        ));
+    }
+
+    let where_clause = where_parts.join(&b' ');
+
+    let mut fields: Vec<Vec<u8>> = Vec::new();
+    let mut limit: Option<usize> = None;
+    let mut offset: usize = 0;
+
+    while idx < args.len() {
+        let kw = extract_string(&args[idx])?.to_ascii_uppercase();
+        idx += 1;
+        match kw.as_slice() {
+            b"PROJECT" => {
+                while idx < args.len() {
+                    let peek = extract_string(&args[idx])?.to_ascii_uppercase();
+                    if peek.as_slice() == b"LIMIT" || peek.as_slice() == b"OFFSET" {
+                        break;
+                    }
+                    fields.push(extract_bytes(&args[idx])?);
+                    idx += 1;
+                }
+            }
+            b"LIMIT" => {
+                if idx >= args.len() {
+                    return Err(ProtocolError::WrongArity("DOC.FIND".into()));
+                }
+                limit = Some(parse_u64(&args[idx])? as usize);
+                idx += 1;
+            }
+            b"OFFSET" => {
+                if idx >= args.len() {
+                    return Err(ProtocolError::WrongArity("DOC.FIND".into()));
+                }
+                offset = parse_u64(&args[idx])? as usize;
+                idx += 1;
+            }
+            _ => {
+                return Err(ProtocolError::InvalidData(
+                    "DOC.FIND unexpected keyword after WHERE clause".into(),
+                ));
+            }
+        }
+    }
+
+    Ok(Command::DocFind {
+        collection,
+        where_clause,
+        fields,
+        limit,
+        offset,
+    })
+}
+
+fn parse_doc_count(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    if args.len() < 3 {
+        return Err(ProtocolError::WrongArity("DOC.COUNT".into()));
+    }
+
+    let collection = extract_bytes(&args[0])?;
+    let where_kw = extract_string(&args[1])?.to_ascii_uppercase();
+    if where_kw.as_slice() != b"WHERE" {
+        return Err(ProtocolError::InvalidData(
+            "DOC.COUNT expects WHERE keyword".into(),
+        ));
+    }
+
+    let where_parts: Vec<Vec<u8>> = args[2..]
+        .iter()
+        .map(extract_bytes)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if where_parts.is_empty() {
+        return Err(ProtocolError::InvalidData(
+            "DOC.COUNT WHERE clause is empty".into(),
+        ));
+    }
+
+    let where_clause = where_parts.join(&b' ');
+
+    Ok(Command::DocCount {
+        collection,
+        where_clause,
     })
 }
 

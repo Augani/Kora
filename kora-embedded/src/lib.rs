@@ -13,8 +13,8 @@ use std::time::Duration;
 use kora_core::command::{Command, CommandResponse};
 use kora_core::shard::ShardEngine;
 use kora_doc::{
-    CollectionConfig, CollectionInfo, DictionaryInfo, DocEngine, DocError, DocMutation, SetResult,
-    StorageInfo,
+    CollectionConfig, CollectionInfo, DictionaryInfo, DocEngine, DocError, DocMutation, IndexType,
+    SetResult, StorageInfo,
 };
 use parking_lot::RwLock;
 use serde_json::Value;
@@ -187,6 +187,60 @@ impl Database {
     /// Check if one document exists.
     pub fn doc_exists(&self, collection: &str, doc_id: &str) -> Result<bool, DocError> {
         self.doc_engine.read().exists(collection, doc_id)
+    }
+
+    /// Create a secondary index on a collection field.
+    pub fn doc_create_index(
+        &self,
+        collection: &str,
+        field: &str,
+        index_type: &str,
+    ) -> Result<(), DocError> {
+        let idx_type = parse_index_type_str(index_type)?;
+        self.doc_engine
+            .write()
+            .create_index(collection, field, idx_type)
+    }
+
+    /// Drop a secondary index from a collection field.
+    pub fn doc_drop_index(&self, collection: &str, field: &str) -> Result<(), DocError> {
+        self.doc_engine.write().drop_index(collection, field)
+    }
+
+    /// List all indexes for a collection as `(field_path, index_type_name)` pairs.
+    pub fn doc_indexes(&self, collection: &str) -> Result<Vec<(String, String)>, DocError> {
+        let indexes = self.doc_engine.read().indexes(collection)?;
+        Ok(indexes
+            .into_iter()
+            .map(|(path, idx_type)| {
+                let type_name = match idx_type {
+                    IndexType::Hash => "hash",
+                    IndexType::Sorted => "sorted",
+                    IndexType::Array => "array",
+                    IndexType::Unique => "unique",
+                };
+                (path, type_name.to_string())
+            })
+            .collect())
+    }
+
+    /// Find documents matching a WHERE clause with optional projection, limit, and offset.
+    pub fn doc_find(
+        &self,
+        collection: &str,
+        where_clause: &str,
+        projection: Option<&[&str]>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<Value>, DocError> {
+        self.doc_engine
+            .read()
+            .find(collection, where_clause, projection, limit, offset)
+    }
+
+    /// Count documents matching a WHERE clause.
+    pub fn doc_count(&self, collection: &str, where_clause: &str) -> Result<u64, DocError> {
+        self.doc_engine.read().count(collection, where_clause)
     }
 
     // ─── String operations ───────────────────────────────────────
@@ -764,6 +818,19 @@ impl Database {
         });
 
         Ok((handle, shutdown_tx))
+    }
+}
+
+fn parse_index_type_str(raw: &str) -> Result<IndexType, DocError> {
+    match raw.to_ascii_lowercase().as_str() {
+        "hash" => Ok(IndexType::Hash),
+        "sorted" => Ok(IndexType::Sorted),
+        "array" => Ok(IndexType::Array),
+        "unique" => Ok(IndexType::Unique),
+        _ => Err(DocError::InvalidMutation(format!(
+            "unknown index type '{}' (expected hash|sorted|array|unique)",
+            raw
+        ))),
     }
 }
 

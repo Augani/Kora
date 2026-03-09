@@ -3869,3 +3869,226 @@ async fn test_stream_consumer_group_full_workflow() {
 
     let _ = shutdown.send(true);
 }
+
+#[tokio::test]
+async fn test_doc_createindex_and_find() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["DOC.CREATE", "people"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "DOC.SET",
+            "people",
+            "p:1",
+            r#"{"name":"Kofi","city":"Accra","age":30}"#,
+        ],
+    )
+    .await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "DOC.SET",
+            "people",
+            "p:2",
+            r#"{"name":"Ama","city":"Kumasi","age":25}"#,
+        ],
+    )
+    .await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "DOC.SET",
+            "people",
+            "p:3",
+            r#"{"name":"Yaw","city":"Accra","age":28}"#,
+        ],
+    )
+    .await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["DOC.CREATEINDEX", "people", "city", "hash"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &["DOC.FIND", "people", "WHERE", "city", "=", r#""Accra""#],
+    )
+    .await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.contains("Kofi"), "should find Kofi in Accra");
+    assert!(resp_str.contains("Yaw"), "should find Yaw in Accra");
+    assert!(!resp_str.contains("Ama"), "should not find Ama (Kumasi)");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_doc_count_query() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["DOC.CREATE", "people"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    for (id, city) in &[("p:1", "Accra"), ("p:2", "Kumasi"), ("p:3", "Accra")] {
+        let json = format!(r#"{{"city":"{}"}}"#, city);
+        let resp = cmd(&mut stream, &["DOC.SET", "people", id, &json]).await;
+        assert_resp(&resp, b"+OK\r\n");
+    }
+
+    let resp = cmd(&mut stream, &["DOC.CREATEINDEX", "people", "city", "hash"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &["DOC.COUNT", "people", "WHERE", "city", "=", r#""Accra""#],
+    )
+    .await;
+    assert_resp(&resp, b":2\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_doc_indexes_lists_created() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["DOC.CREATE", "people"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &["DOC.SET", "people", "p:1", r#"{"city":"Accra","age":30}"#],
+    )
+    .await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["DOC.CREATEINDEX", "people", "city", "hash"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["DOC.CREATEINDEX", "people", "age", "sorted"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["DOC.INDEXES", "people"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.contains("age"), "should list age index");
+    assert!(resp_str.contains("sorted"), "should list sorted type");
+    assert!(resp_str.contains("city"), "should list city index");
+    assert!(resp_str.contains("hash"), "should list hash type");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_doc_dropindex_removes() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["DOC.CREATE", "people"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &["DOC.SET", "people", "p:1", r#"{"city":"Accra"}"#],
+    )
+    .await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["DOC.CREATEINDEX", "people", "city", "hash"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["DOC.INDEXES", "people"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.contains("city"), "index should exist before drop");
+
+    let resp = cmd(&mut stream, &["DOC.DROPINDEX", "people", "city"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["DOC.INDEXES", "people"]).await;
+    assert_resp(&resp, b"*0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_doc_find_with_limit_offset() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["DOC.CREATE", "people"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    for i in 1..=5 {
+        let id = format!("p:{}", i);
+        let json = format!(r#"{{"city":"Accra","seq":{}}}"#, i);
+        let resp = cmd(&mut stream, &["DOC.SET", "people", &id, &json]).await;
+        assert_resp(&resp, b"+OK\r\n");
+    }
+
+    let resp = cmd(&mut stream, &["DOC.CREATEINDEX", "people", "city", "hash"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "DOC.FIND",
+            "people",
+            "WHERE",
+            "city",
+            "=",
+            r#""Accra""#,
+            "LIMIT",
+            "2",
+        ],
+    )
+    .await;
+    let frame = parse_resp_frame(&resp);
+    if let RespValue::Array(Some(items)) = frame {
+        assert_eq!(items.len(), 2, "LIMIT 2 should return exactly 2 results");
+    } else {
+        panic!("expected array response from DOC.FIND");
+    }
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "DOC.FIND",
+            "people",
+            "WHERE",
+            "city",
+            "=",
+            r#""Accra""#,
+            "LIMIT",
+            "2",
+            "OFFSET",
+            "3",
+        ],
+    )
+    .await;
+    let frame = parse_resp_frame(&resp);
+    if let RespValue::Array(Some(items)) = frame {
+        assert_eq!(
+            items.len(),
+            2,
+            "LIMIT 2 OFFSET 3 should return 2 results (items 4 and 5)"
+        );
+    } else {
+        panic!("expected array response from DOC.FIND with OFFSET");
+    }
+
+    let _ = shutdown.send(true);
+}

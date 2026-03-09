@@ -985,6 +985,11 @@ impl ShardStore {
             | Command::DocUpdate { .. }
             | Command::DocDel { .. }
             | Command::DocExists { .. }
+            | Command::DocCreateIndex { .. }
+            | Command::DocDropIndex { .. }
+            | Command::DocIndexes { .. }
+            | Command::DocFind { .. }
+            | Command::DocCount { .. }
             | Command::Subscribe { .. }
             | Command::Unsubscribe { .. }
             | Command::PSubscribe { .. }

@@ -15,7 +15,7 @@ use kora_core::command::{
 };
 use kora_core::shard::{ShardStore, WalRecord, WalWriter};
 use kora_core::tenant::TenantId;
-use kora_doc::{CollectionConfig, CompressionProfile, DocEngine, DocMutation};
+use kora_doc::{CollectionConfig, CompressionProfile, DocEngine, DocMutation, IndexType};
 use kora_protocol::{parse_command, serialize_response_versioned, HotCommandRef, RespParser};
 use kora_pubsub::{MessageSink, PubSubMessage};
 use parking_lot::Mutex;
@@ -1278,6 +1278,44 @@ fn try_handle_local_affinity(
         Command::DocExists { collection, doc_id } => {
             Some(handle_doc_exists(&shared.doc_engine, collection, doc_id))
         }
+        Command::DocCreateIndex {
+            collection,
+            field,
+            index_type,
+        } => Some(handle_doc_createindex(
+            &shared.doc_engine,
+            collection,
+            field,
+            index_type,
+        )),
+        Command::DocDropIndex { collection, field } => {
+            Some(handle_doc_dropindex(&shared.doc_engine, collection, field))
+        }
+        Command::DocIndexes { collection } => {
+            Some(handle_doc_indexes(&shared.doc_engine, collection))
+        }
+        Command::DocFind {
+            collection,
+            where_clause,
+            fields,
+            limit,
+            offset,
+        } => Some(handle_doc_find(
+            &shared.doc_engine,
+            collection,
+            where_clause,
+            fields,
+            *limit,
+            *offset,
+        )),
+        Command::DocCount {
+            collection,
+            where_clause,
+        } => Some(handle_doc_count(
+            &shared.doc_engine,
+            collection,
+            where_clause,
+        )),
         Command::CdcPoll { cursor, count } => {
             Some(handle_cdc_poll(&shared.cdc_rings, *cursor, *count))
         }
@@ -1804,6 +1842,165 @@ fn handle_doc_exists(
     match doc_engine.lock().exists(&collection, &doc_id) {
         Ok(true) => CommandResponse::Integer(1),
         Ok(false) => CommandResponse::Integer(0),
+        Err(err) => CommandResponse::Error(format!("ERR {}", err)),
+    }
+}
+
+fn parse_index_type(raw: &[u8]) -> Result<IndexType, CommandResponse> {
+    let value = parse_utf8_arg(raw, "index_type")?;
+    match value.to_ascii_lowercase().as_str() {
+        "hash" => Ok(IndexType::Hash),
+        "sorted" => Ok(IndexType::Sorted),
+        "array" => Ok(IndexType::Array),
+        "unique" => Ok(IndexType::Unique),
+        _ => Err(CommandResponse::Error(
+            "ERR invalid index type (expected hash|sorted|array|unique)".into(),
+        )),
+    }
+}
+
+fn index_type_name(idx_type: IndexType) -> &'static str {
+    match idx_type {
+        IndexType::Hash => "hash",
+        IndexType::Sorted => "sorted",
+        IndexType::Array => "array",
+        IndexType::Unique => "unique",
+    }
+}
+
+fn handle_doc_createindex(
+    doc_engine: &Mutex<DocEngine>,
+    collection: &[u8],
+    field: &[u8],
+    index_type: &[u8],
+) -> CommandResponse {
+    let collection = match parse_utf8_arg(collection, "collection") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let field = match parse_utf8_arg(field, "field") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let idx_type = match parse_index_type(index_type) {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+
+    match doc_engine
+        .lock()
+        .create_index(&collection, &field, idx_type)
+    {
+        Ok(()) => CommandResponse::Ok,
+        Err(err) => CommandResponse::Error(format!("ERR {}", err)),
+    }
+}
+
+fn handle_doc_dropindex(
+    doc_engine: &Mutex<DocEngine>,
+    collection: &[u8],
+    field: &[u8],
+) -> CommandResponse {
+    let collection = match parse_utf8_arg(collection, "collection") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let field = match parse_utf8_arg(field, "field") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+
+    match doc_engine.lock().drop_index(&collection, &field) {
+        Ok(()) => CommandResponse::Ok,
+        Err(err) => CommandResponse::Error(format!("ERR {}", err)),
+    }
+}
+
+fn handle_doc_indexes(doc_engine: &Mutex<DocEngine>, collection: &[u8]) -> CommandResponse {
+    let collection = match parse_utf8_arg(collection, "collection") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+
+    let indexes = match doc_engine.lock().indexes(&collection) {
+        Ok(value) => value,
+        Err(err) => return CommandResponse::Error(format!("ERR {}", err)),
+    };
+
+    let entries: Vec<CommandResponse> = indexes
+        .into_iter()
+        .map(|(field_path, idx_type)| {
+            CommandResponse::Array(vec![
+                CommandResponse::BulkString(field_path.into_bytes()),
+                CommandResponse::BulkString(index_type_name(idx_type).as_bytes().to_vec()),
+            ])
+        })
+        .collect();
+
+    CommandResponse::Array(entries)
+}
+
+fn handle_doc_find(
+    doc_engine: &Mutex<DocEngine>,
+    collection: &[u8],
+    where_clause: &[u8],
+    fields: &[Vec<u8>],
+    limit: Option<usize>,
+    offset: usize,
+) -> CommandResponse {
+    let collection = match parse_utf8_arg(collection, "collection") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let where_clause = match parse_utf8_arg(where_clause, "where_clause") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let field_strings = match parse_utf8_args(fields, "field") {
+        Ok(values) => values,
+        Err(err) => return err,
+    };
+    let projection = (!field_strings.is_empty())
+        .then(|| field_strings.iter().map(String::as_str).collect::<Vec<_>>());
+
+    let docs = match doc_engine.lock().find(
+        &collection,
+        &where_clause,
+        projection.as_deref(),
+        limit,
+        offset,
+    ) {
+        Ok(value) => value,
+        Err(err) => return CommandResponse::Error(format!("ERR {}", err)),
+    };
+
+    let results: Vec<CommandResponse> = docs
+        .into_iter()
+        .map(|value| match serde_json::to_vec(&value) {
+            Ok(bytes) => CommandResponse::BulkString(bytes),
+            Err(err) => CommandResponse::Error(format!("ERR JSON serialization failed: {}", err)),
+        })
+        .collect();
+
+    CommandResponse::Array(results)
+}
+
+fn handle_doc_count(
+    doc_engine: &Mutex<DocEngine>,
+    collection: &[u8],
+    where_clause: &[u8],
+) -> CommandResponse {
+    let collection = match parse_utf8_arg(collection, "collection") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let where_clause = match parse_utf8_arg(where_clause, "where_clause") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+
+    match doc_engine.lock().count(&collection, &where_clause) {
+        Ok(count) => CommandResponse::Integer(count as i64),
         Err(err) => CommandResponse::Error(format!("ERR {}", err)),
     }
 }
