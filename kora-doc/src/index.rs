@@ -245,10 +245,13 @@ impl SortedIndex {
     }
 }
 
-/// Unique constraint index mapping a single hash bucket key to exactly one document.
+/// Unique-constraint helper index mapping hash bucket keys to sorted doc ID candidates.
+///
+/// Collisions are expected with 32-bit hashes; caller-side value verification must enforce
+/// exact-value uniqueness before insert.
 #[derive(Debug, Default)]
 pub struct UniqueIndex {
-    entries: HashMap<u32, DocId>,
+    entries: HashMap<u32, Vec<DocId>>,
 }
 
 impl UniqueIndex {
@@ -258,31 +261,31 @@ impl UniqueIndex {
         Self::default()
     }
 
-    /// Add a document to the unique index. Returns `UniqueViolation` if the hash bucket
-    /// is already occupied by a different document.
-    pub fn add(&mut self, hash: u32, doc_id: DocId) -> Result<(), IndexError> {
-        if let Some(&existing) = self.entries.get(&hash) {
-            if existing != doc_id {
-                return Err(IndexError::UniqueViolation {
-                    hash,
-                    existing_doc_id: existing,
-                });
-            }
-            return Ok(());
+    /// Add a document candidate to a hash bucket, maintaining sorted order.
+    pub fn add(&mut self, hash: u32, doc_id: DocId) {
+        let bucket = self.entries.entry(hash).or_default();
+        match bucket.binary_search(&doc_id) {
+            Ok(_) => {}
+            Err(pos) => bucket.insert(pos, doc_id),
         }
-        self.entries.insert(hash, doc_id);
-        Ok(())
     }
 
-    /// Remove a document from the unique index. No-op if not present.
-    pub fn remove(&mut self, hash: u32) {
-        self.entries.remove(&hash);
+    /// Remove a document from a hash bucket. No-op if not present.
+    pub fn remove(&mut self, hash: u32, doc_id: DocId) {
+        if let Some(bucket) = self.entries.get_mut(&hash) {
+            if let Ok(pos) = bucket.binary_search(&doc_id) {
+                bucket.remove(pos);
+            }
+            if bucket.is_empty() {
+                self.entries.remove(&hash);
+            }
+        }
     }
 
-    /// Look up the document occupying a hash bucket.
+    /// Look up all candidate documents occupying a hash bucket.
     #[must_use]
-    pub fn lookup(&self, hash: u32) -> Option<DocId> {
-        self.entries.get(&hash).copied()
+    pub fn lookup(&self, hash: u32) -> &[DocId] {
+        self.entries.get(&hash).map_or(&[], Vec::as_slice)
     }
 
     /// Remove all entries from the index.
@@ -477,33 +480,35 @@ mod tests {
     #[test]
     fn unique_index_add_lookup() {
         let mut idx = UniqueIndex::new();
-        idx.add(42, 1).expect("first add should succeed");
-        assert_eq!(idx.lookup(42), Some(1));
+        idx.add(42, 1);
+        assert_eq!(idx.lookup(42), &[1]);
     }
 
     #[test]
-    fn unique_index_violation_on_different_doc_id() {
+    fn unique_index_allows_hash_collisions() {
         let mut idx = UniqueIndex::new();
-        idx.add(42, 1).expect("first add should succeed");
-        let err = idx
-            .add(42, 2)
-            .expect_err("different doc_id same hash must fail");
-        assert!(matches!(
-            err,
-            IndexError::UniqueViolation {
-                hash: 42,
-                existing_doc_id: 1,
-            }
-        ));
+        idx.add(42, 1);
+        idx.add(42, 2);
+        assert_eq!(idx.lookup(42), &[1, 2]);
     }
 
     #[test]
     fn unique_index_same_doc_id_same_hash_is_ok() {
         let mut idx = UniqueIndex::new();
-        idx.add(42, 1).expect("first add should succeed");
-        idx.add(42, 1)
-            .expect("same doc_id same hash should succeed");
-        assert_eq!(idx.lookup(42), Some(1));
+        idx.add(42, 1);
+        idx.add(42, 1);
+        assert_eq!(idx.lookup(42), &[1]);
+    }
+
+    #[test]
+    fn unique_index_remove_doc_id_only() {
+        let mut idx = UniqueIndex::new();
+        idx.add(42, 1);
+        idx.add(42, 2);
+        idx.remove(42, 1);
+        assert_eq!(idx.lookup(42), &[2]);
+        idx.remove(42, 2);
+        assert_eq!(idx.lookup(42), &[] as &[DocId]);
     }
 
     #[test]

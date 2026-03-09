@@ -2205,6 +2205,7 @@ fn parse_doc_find(args: &[RespValue]) -> Result<Command, ProtocolError> {
         idx += 1;
         match kw.as_slice() {
             b"PROJECT" => {
+                let project_start = idx;
                 while idx < args.len() {
                     let peek = extract_string(&args[idx])?.to_ascii_uppercase();
                     if peek.as_slice() == b"LIMIT" || peek.as_slice() == b"OFFSET" {
@@ -2212,6 +2213,9 @@ fn parse_doc_find(args: &[RespValue]) -> Result<Command, ProtocolError> {
                     }
                     fields.push(extract_bytes(&args[idx])?);
                     idx += 1;
+                }
+                if idx == project_start {
+                    return Err(ProtocolError::WrongArity("DOC.FIND".into()));
                 }
             }
             b"LIMIT" => {
@@ -3779,6 +3783,21 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(matches!(err, ProtocolError::InvalidData(_)));
+    }
+
+    #[test]
+    fn test_parse_doc_find_project_requires_fields() {
+        let err = parse_command(make_cmd(&[
+            b"DOC.FIND",
+            b"users",
+            b"WHERE",
+            b"city",
+            b"=",
+            br#""Accra""#,
+            b"PROJECT",
+        ]))
+        .unwrap_err();
+        assert!(matches!(err, ProtocolError::WrongArity(_)));
     }
 
     #[test]

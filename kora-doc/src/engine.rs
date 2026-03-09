@@ -411,6 +411,8 @@ impl DocEngine {
             &self.registry,
             &state.index_config,
             &state.indexes,
+            &state.dictionary,
+            &state.docs_by_internal_id,
             collection_id,
             internal_id,
             json,
@@ -647,16 +649,42 @@ impl DocEngine {
         for (&doc_id, packed) in docs {
             let json = Recomposer::recompose(packed, registry, dictionary, collection_id)?;
             if let Some(field_value) = resolve_json_path(&json, field_path) {
+                if index_type == IndexType::Unique {
+                    let Some(hashed) = value_to_hash(field_value) else {
+                        continue;
+                    };
+                    if let Some(existing) = find_unique_conflict(
+                        registry,
+                        dictionary,
+                        docs,
+                        collection_id,
+                        field_path,
+                        field_value,
+                        doc_id,
+                        indexes
+                            .unique(field_id)
+                            .map(|unique_idx| unique_idx.lookup(hashed))
+                            .unwrap_or(&[]),
+                    )? {
+                        return Err(DocError::Index(IndexError::UniqueViolation {
+                            hash: hashed,
+                            existing_doc_id: existing,
+                        }));
+                    }
+                }
                 add_single_field_entry(indexes, field_id, index_type, doc_id, field_value)?;
             }
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn check_unique_constraints(
         registry: &IdRegistry,
         index_config: &IndexConfig,
         indexes: &CollectionIndexes,
+        dictionary: &ValueDictionary,
+        docs: &HashMap<DocId, PackedDoc>,
         collection_id: CollectionId,
         doc_id: DocId,
         json: &Value,
@@ -680,13 +708,20 @@ impl DocEngine {
                 continue;
             };
             if let Some(unique_idx) = indexes.unique(field_id) {
-                if let Some(existing) = unique_idx.lookup(hashed) {
-                    if existing != doc_id {
-                        return Err(DocError::Index(IndexError::UniqueViolation {
-                            hash: hashed,
-                            existing_doc_id: existing,
-                        }));
-                    }
+                if let Some(existing) = find_unique_conflict(
+                    registry,
+                    dictionary,
+                    docs,
+                    collection_id,
+                    path,
+                    field_value,
+                    doc_id,
+                    unique_idx.lookup(hashed),
+                )? {
+                    return Err(DocError::Index(IndexError::UniqueViolation {
+                        hash: hashed,
+                        existing_doc_id: existing,
+                    }));
                 }
             }
         }
@@ -844,21 +879,22 @@ impl DocEngine {
                 let Some(hashed) = expr_value_to_hash(value) else {
                     return self.fallback_scan(collection_id, state, expr);
                 };
-                Ok(state
+                let candidates = state
                     .indexes
                     .hash(fid)
-                    .map_or_else(Vec::new, |idx| idx.lookup(hashed).to_vec()))
+                    .map_or_else(Vec::new, |idx| idx.lookup(hashed).to_vec());
+                self.filter_candidates_by_expr(collection_id, state, expr, candidates)
             }
 
             (Expr::Eq(_, value), Some(IndexType::Unique), Some(fid)) => {
                 let Some(hashed) = expr_value_to_hash(value) else {
                     return self.fallback_scan(collection_id, state, expr);
                 };
-                Ok(state
+                let candidates = state
                     .indexes
                     .unique(fid)
-                    .and_then(|idx| idx.lookup(hashed))
-                    .map_or_else(Vec::new, |doc_id| vec![doc_id]))
+                    .map_or_else(Vec::new, |idx| idx.lookup(hashed).to_vec());
+                self.filter_candidates_by_expr(collection_id, state, expr, candidates)
             }
 
             (Expr::Eq(_, ExprValue::Number(n)), Some(IndexType::Sorted), Some(fid)) => Ok(state
@@ -910,10 +946,11 @@ impl DocEngine {
                 let Some(hashed) = expr_value_to_hash(value) else {
                     return self.fallback_scan(collection_id, state, expr);
                 };
-                Ok(state
+                let candidates = state
                     .indexes
                     .array(fid)
-                    .map_or_else(Vec::new, |idx| idx.lookup(hashed).to_vec()))
+                    .map_or_else(Vec::new, |idx| idx.lookup(hashed).to_vec());
+                self.filter_candidates_by_expr(collection_id, state, expr, candidates)
             }
 
             _ => self.fallback_scan(collection_id, state, expr),
@@ -945,6 +982,27 @@ impl DocEngine {
             }
         }
         Ok(result)
+    }
+
+    fn filter_candidates_by_expr(
+        &self,
+        collection_id: CollectionId,
+        state: &CollectionState,
+        expr: &Expr,
+        candidates: Vec<DocId>,
+    ) -> Result<Vec<DocId>, DocError> {
+        let mut filtered = Vec::with_capacity(candidates.len());
+        for doc_id in candidates {
+            let Some(packed) = state.docs_by_internal_id.get(&doc_id) else {
+                continue;
+            };
+            let json =
+                Recomposer::recompose(packed, &self.registry, &state.dictionary, collection_id)?;
+            if eval_expr_on_json(&json, expr) {
+                filtered.push(doc_id);
+            }
+        }
+        Ok(filtered)
     }
 
     fn fallback_scan(
@@ -1007,6 +1065,36 @@ fn value_to_score(value: &Value) -> Option<f64> {
     value.as_f64()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn find_unique_conflict(
+    registry: &IdRegistry,
+    dictionary: &ValueDictionary,
+    docs: &HashMap<DocId, PackedDoc>,
+    collection_id: CollectionId,
+    field_path: &str,
+    field_value: &Value,
+    current_doc_id: DocId,
+    candidates: &[DocId],
+) -> Result<Option<DocId>, DocError> {
+    for &candidate_id in candidates {
+        if candidate_id == current_doc_id {
+            continue;
+        }
+        let Some(candidate_packed) = docs.get(&candidate_id) else {
+            continue;
+        };
+        let candidate_json =
+            Recomposer::recompose(candidate_packed, registry, dictionary, collection_id)?;
+        let Some(candidate_value) = resolve_json_path(&candidate_json, field_path) else {
+            continue;
+        };
+        if candidate_value == field_value {
+            return Ok(Some(candidate_id));
+        }
+    }
+    Ok(None)
+}
+
 fn add_single_field_entry(
     indexes: &mut CollectionIndexes,
     field_id: FieldId,
@@ -1041,7 +1129,7 @@ fn add_single_field_entry(
         }
         IndexType::Unique => {
             if let Some(hashed) = value_to_hash(value) {
-                indexes.get_or_create_unique(field_id).add(hashed, doc_id)?;
+                indexes.get_or_create_unique(field_id).add(hashed, doc_id);
             }
         }
     }
@@ -1082,7 +1170,9 @@ fn remove_single_field_entry(
         }
         IndexType::Unique => {
             if let Some(hashed) = value_to_hash(value) {
-                indexes.get_or_create_unique(field_id).remove(hashed);
+                indexes
+                    .get_or_create_unique(field_id)
+                    .remove(hashed, doc_id);
             }
         }
     }
@@ -1832,6 +1922,29 @@ mod tests {
     }
 
     #[test]
+    fn unique_constraint_allows_hash_collision_with_distinct_values() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create should work");
+
+        engine
+            .create_index("users", "email", IndexType::Unique)
+            .expect("create_index should work");
+
+        let first = "BpEAYkE2SftJ";
+        let second = "xSDGJoKxB";
+        assert_eq!(hash32(first.as_bytes()), hash32(second.as_bytes()));
+
+        engine
+            .set("users", "doc:1", &json!({"email": first}))
+            .expect("first set should work");
+        engine
+            .set("users", "doc:2", &json!({"email": second}))
+            .expect("hash collision with different value should be allowed");
+    }
+
+    #[test]
     fn drop_index_clears_data() {
         let mut engine = DocEngine::new();
         engine
@@ -1944,6 +2057,34 @@ mod tests {
     }
 
     #[test]
+    fn find_by_hash_index_filters_hash_collisions() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create should work");
+        engine
+            .create_index("users", "city", IndexType::Hash)
+            .expect("index should work");
+
+        let first = "BpEAYkE2SftJ";
+        let second = "xSDGJoKxB";
+        assert_eq!(hash32(first.as_bytes()), hash32(second.as_bytes()));
+
+        engine
+            .set("users", "d1", &json!({"name": "First", "city": first}))
+            .expect("set");
+        engine
+            .set("users", "d2", &json!({"name": "Second", "city": second}))
+            .expect("set");
+
+        let results = engine
+            .find("users", &format!("city = \"{}\"", first), None, None, 0)
+            .expect("find should work");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["city"], first);
+    }
+
+    #[test]
     fn find_by_sorted_index_range() {
         let mut engine = DocEngine::new();
         engine
@@ -2015,6 +2156,40 @@ mod tests {
             let tags = doc["tags"].as_array().unwrap();
             assert!(tags.contains(&json!("rust")));
         }
+    }
+
+    #[test]
+    fn find_by_array_index_filters_hash_collisions() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("posts", CollectionConfig::default())
+            .expect("create");
+        engine
+            .create_index("posts", "tags", IndexType::Array)
+            .expect("index");
+
+        let first = "BpEAYkE2SftJ";
+        let second = "xSDGJoKxB";
+        assert_eq!(hash32(first.as_bytes()), hash32(second.as_bytes()));
+
+        engine
+            .set("posts", "p1", &json!({"title": "A", "tags": [first]}))
+            .expect("set");
+        engine
+            .set("posts", "p2", &json!({"title": "B", "tags": [second]}))
+            .expect("set");
+
+        let results = engine
+            .find(
+                "posts",
+                &format!("tags CONTAINS \"{}\"", first),
+                None,
+                None,
+                0,
+            )
+            .expect("find should work");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["tags"], json!([first]));
     }
 
     #[test]
