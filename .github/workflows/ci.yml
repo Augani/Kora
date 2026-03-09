@@ -49,3 +49,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+
+  redis-compat:
+    name: Redis Compatibility
+    runs-on: ubuntu-latest
+    needs: [check, clippy, test]
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Redis comparison tests
+        run: cargo test -p kora-server --test real_app_traffic -- --ignored
+        continue-on-error: true

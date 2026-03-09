@@ -3568,3 +3568,323 @@ async fn test_stream_consumer_group_full_workflow() {
 
     let _ = shutdown.send(true);
 }
+
+// ---------------------------------------------------------------------------
+// WATCH / UNWATCH / Transaction conflict tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_watch_no_conflict_exec_succeeds() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "wkey", "hello"]).await;
+    cmd(&mut stream, &["WATCH", "wkey"]).await;
+    cmd(&mut stream, &["MULTI"]).await;
+    let resp = cmd(&mut stream, &["SET", "wkey", "world"]).await;
+    assert_resp(&resp, b"+QUEUED\r\n");
+    let resp = cmd(&mut stream, &["EXEC"]).await;
+    assert!(
+        resp.starts_with(b"*1\r\n"),
+        "EXEC should return array, got: {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    let resp = cmd(&mut stream, &["GET", "wkey"]).await;
+    assert_resp(&resp, b"$5\r\nworld\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_watch_conflict_exec_returns_nil() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut c1 = connect(port).await;
+    let mut c2 = connect(port).await;
+
+    cmd(&mut c1, &["SET", "wkey2", "original"]).await;
+    cmd(&mut c1, &["WATCH", "wkey2"]).await;
+    cmd(&mut c1, &["MULTI"]).await;
+    cmd(&mut c1, &["SET", "wkey2", "from_c1"]).await;
+
+    cmd(&mut c2, &["SET", "wkey2", "from_c2"]).await;
+
+    let resp = cmd(&mut c1, &["EXEC"]).await;
+    assert_resp(&resp, b"*-1\r\n");
+
+    let resp = cmd(&mut c1, &["GET", "wkey2"]).await;
+    assert_resp(&resp, b"$7\r\nfrom_c2\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_watch_key_deleted_conflict() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut c1 = connect(port).await;
+    let mut c2 = connect(port).await;
+
+    cmd(&mut c1, &["SET", "wdel", "exists"]).await;
+    cmd(&mut c1, &["WATCH", "wdel"]).await;
+    cmd(&mut c1, &["MULTI"]).await;
+    cmd(&mut c1, &["GET", "wdel"]).await;
+
+    cmd(&mut c2, &["DEL", "wdel"]).await;
+
+    let resp = cmd(&mut c1, &["EXEC"]).await;
+    assert_resp(&resp, b"*-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_watch_nonexistent_key_created_conflict() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut c1 = connect(port).await;
+    let mut c2 = connect(port).await;
+
+    cmd(&mut c1, &["DEL", "wnew"]).await;
+    cmd(&mut c1, &["WATCH", "wnew"]).await;
+    cmd(&mut c1, &["MULTI"]).await;
+    cmd(&mut c1, &["SET", "wnew", "from_c1"]).await;
+
+    cmd(&mut c2, &["SET", "wnew", "from_c2"]).await;
+
+    let resp = cmd(&mut c1, &["EXEC"]).await;
+    assert_resp(&resp, b"*-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_watch_inside_multi_rejected() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["MULTI"]).await;
+    let resp = cmd(&mut stream, &["WATCH", "somekey"]).await;
+    assert_resp_prefix(&resp, b"-ERR WATCH inside MULTI is not allowed");
+    cmd(&mut stream, &["DISCARD"]).await;
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_unwatch_clears_watch_state() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut c1 = connect(port).await;
+    let mut c2 = connect(port).await;
+
+    cmd(&mut c1, &["SET", "wun", "v1"]).await;
+    cmd(&mut c1, &["WATCH", "wun"]).await;
+
+    cmd(&mut c2, &["SET", "wun", "v2"]).await;
+
+    cmd(&mut c1, &["UNWATCH"]).await;
+    cmd(&mut c1, &["MULTI"]).await;
+    cmd(&mut c1, &["SET", "wun", "v3"]).await;
+    let resp = cmd(&mut c1, &["EXEC"]).await;
+    assert!(
+        resp.starts_with(b"*1\r\n"),
+        "EXEC should succeed after UNWATCH, got: {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    let resp = cmd(&mut c1, &["GET", "wun"]).await;
+    assert_resp(&resp, b"$2\r\nv3\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_watch_multiple_keys_accumulate() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut c1 = connect(port).await;
+    let mut c2 = connect(port).await;
+
+    cmd(&mut c1, &["SET", "wm1", "a"]).await;
+    cmd(&mut c1, &["SET", "wm2", "b"]).await;
+    cmd(&mut c1, &["WATCH", "wm1"]).await;
+    cmd(&mut c1, &["WATCH", "wm2"]).await;
+    cmd(&mut c1, &["MULTI"]).await;
+    cmd(&mut c1, &["SET", "wm1", "aa"]).await;
+
+    cmd(&mut c2, &["SET", "wm2", "bb"]).await;
+
+    let resp = cmd(&mut c1, &["EXEC"]).await;
+    assert_resp(&resp, b"*-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_discard_clears_watch_state() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut c1 = connect(port).await;
+    let mut c2 = connect(port).await;
+
+    cmd(&mut c1, &["SET", "wdisc", "v1"]).await;
+    cmd(&mut c1, &["WATCH", "wdisc"]).await;
+    cmd(&mut c1, &["MULTI"]).await;
+
+    cmd(&mut c2, &["SET", "wdisc", "v2"]).await;
+
+    cmd(&mut c1, &["DISCARD"]).await;
+
+    cmd(&mut c1, &["MULTI"]).await;
+    cmd(&mut c1, &["SET", "wdisc", "v3"]).await;
+    let resp = cmd(&mut c1, &["EXEC"]).await;
+    assert!(
+        resp.starts_with(b"*1\r\n"),
+        "EXEC should succeed after DISCARD cleared watches, got: {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    let _ = shutdown.send(true);
+}
+
+// ---------------------------------------------------------------------------
+// SELECT behavior matrix tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_select_db0_ok() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["SELECT", "0"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_select_db1_error() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["SELECT", "1"]).await;
+    assert_resp_prefix(&resp, b"-ERR DB index is out of range");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_select_negative_error() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["SELECT", "-1"]).await;
+    assert_resp_prefix(&resp, b"-ERR DB index is out of range");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_select_large_index_error() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["SELECT", "16"]).await;
+    assert_resp_prefix(&resp, b"-ERR DB index is out of range");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_select_non_integer_error() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["SELECT", "abc"]).await;
+    assert_resp_prefix(&resp, b"-ERR");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_blpop_event_driven_wakeup() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+
+    let mut blocker = connect(port).await;
+    let mut pusher = connect(port).await;
+
+    blocker
+        .write_all(&resp_cmd(&["BLPOP", "waketest", "5"]))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let push_resp = cmd(&mut pusher, &["LPUSH", "waketest", "hello"]).await;
+    assert_resp(&push_resp, b":1\r\n");
+
+    let start = std::time::Instant::now();
+    let mut buf = vec![0u8; 8192];
+    let n = tokio::time::timeout(Duration::from_secs(3), blocker.read(&mut buf))
+        .await
+        .expect("blpop should unblock within 3s")
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    let resp = &buf[..n];
+    assert!(
+        resp.starts_with(b"*2\r\n"),
+        "expected array response, got: {:?}",
+        String::from_utf8_lossy(resp),
+    );
+    assert!(
+        resp.windows(5).any(|w| w == b"hello"),
+        "response should contain 'hello'"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "event-driven wakeup should be near-instant, took {:?}",
+        elapsed,
+    );
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_blpop_timeout_returns_nil() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    stream
+        .write_all(&resp_cmd(&["BLPOP", "nokey", "1"]))
+        .await
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    let mut buf = vec![0u8; 8192];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("blpop should timeout within 5s")
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert_resp(&buf[..n], b"$-1\r\n");
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "should wait ~1s for timeout, only waited {:?}",
+        elapsed,
+    );
+
+    let _ = shutdown.send(true);
+}

@@ -1034,6 +1034,28 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
                     check_arity("COMMAND HELP", &args[1..], 0)?;
                     Ok(Command::CommandHelp)
                 }
+                b"GETKEYS" => {
+                    if args.len() < 3 {
+                        return Err(ProtocolError::WrongArity("COMMAND GETKEYS".into()));
+                    }
+                    Ok(Command::CommandGetKeys {
+                        args: args[1..]
+                            .iter()
+                            .map(extract_bytes)
+                            .collect::<Result<_, _>>()?,
+                    })
+                }
+                b"GETKEYSANDFLAGS" => {
+                    if args.len() < 3 {
+                        return Err(ProtocolError::WrongArity("COMMAND GETKEYSANDFLAGS".into()));
+                    }
+                    Ok(Command::CommandGetKeysAndFlags {
+                        args: args[1..]
+                            .iter()
+                            .map(extract_bytes)
+                            .collect::<Result<_, _>>()?,
+                    })
+                }
                 _ => Err(ProtocolError::InvalidData(format!(
                     "unknown COMMAND subcommand '{}'. Try COMMAND HELP.",
                     String::from_utf8_lossy(&subcmd).to_ascii_lowercase()

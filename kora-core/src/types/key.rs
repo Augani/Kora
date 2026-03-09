@@ -114,6 +114,8 @@ pub struct KeyEntry {
     pub lfu_seed: u32,
     /// The tenant that owns this key.
     pub tenant_id: TenantId,
+    /// Monotonic mutation version for WATCH optimistic locking.
+    pub version: u64,
 }
 
 impl KeyEntry {
@@ -132,6 +134,7 @@ impl KeyEntry {
             client_flags: 0,
             lfu_seed: seed,
             tenant_id: TenantId(0),
+            version: 0,
         }
     }
 
@@ -150,6 +153,7 @@ impl KeyEntry {
             client_flags: 0,
             lfu_seed: seed,
             tenant_id,
+            version: 0,
         }
     }
 

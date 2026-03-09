@@ -653,13 +653,18 @@ pub enum Command {
     Exec,
     /// DISCARD — discard all queued commands in a transaction.
     Discard,
-    /// WATCH key \[key ...\] — optimistic locking (accepted, not enforced).
+    /// WATCH key \[key ...\] — optimistic locking for transactions.
     Watch {
         /// Keys to watch.
         keys: Vec<Vec<u8>>,
     },
     /// UNWATCH — clear all watched keys.
     Unwatch,
+    /// Internal: query a key's mutation version for WATCH conflict detection.
+    KeyVersion {
+        /// The key to query.
+        key: Vec<u8>,
+    },
 
     // -- Server commands (Phase 5) --
     /// CONFIG GET pattern
@@ -715,6 +720,16 @@ pub enum Command {
     CommandDocs {
         /// Optional command names to fetch docs for. Empty means all commands.
         names: Vec<Vec<u8>>,
+    },
+    /// COMMAND GETKEYS command arg \[arg ...\] — extract keys from a command.
+    CommandGetKeys {
+        /// The full command arguments to extract keys from.
+        args: Vec<Vec<u8>>,
+    },
+    /// COMMAND GETKEYSANDFLAGS command arg \[arg ...\] — extract keys with read/write flags.
+    CommandGetKeysAndFlags {
+        /// The full command arguments to extract keys from.
+        args: Vec<Vec<u8>>,
     },
 
     // -- CDC commands --
@@ -1616,7 +1631,8 @@ impl Command {
             | Command::XAutoClaim { key, .. }
             | Command::XInfoStream { key }
             | Command::XInfoGroups { key }
-            | Command::XDel { key, .. } => Some(key),
+            | Command::XDel { key, .. }
+            | Command::KeyVersion { key } => Some(key),
             Command::PfCount { keys } => {
                 if keys.len() == 1 {
                     Some(&keys[0])
@@ -1715,6 +1731,8 @@ impl Command {
                 | Command::CommandList
                 | Command::CommandHelp
                 | Command::CommandDocs { .. }
+                | Command::CommandGetKeys { .. }
+                | Command::CommandGetKeysAndFlags { .. }
         )
     }
 
@@ -1797,6 +1815,54 @@ impl Command {
                 | Command::XAutoClaim { .. }
                 | Command::XDel { .. }
         )
+    }
+
+    /// Collect all keys that may be mutated by this command.
+    ///
+    /// Used for WATCH optimistic locking version stamping.
+    pub fn collect_mutation_keys(&self) -> Vec<&[u8]> {
+        match self {
+            Command::Del { keys }
+            | Command::Unlink { keys }
+            | Command::BLPop { keys, .. }
+            | Command::BRPop { keys, .. } => keys.iter().map(|k| k.as_slice()).collect(),
+            Command::MSet { entries } | Command::MSetNx { entries } => {
+                entries.iter().map(|(k, _)| k.as_slice()).collect()
+            }
+            Command::RPopLPush {
+                source,
+                destination,
+            }
+            | Command::LMove {
+                source,
+                destination,
+                ..
+            }
+            | Command::BLMove {
+                source,
+                destination,
+                ..
+            } => vec![source.as_slice(), destination.as_slice()],
+            Command::Rename { key, newkey } | Command::RenameNx { key, newkey } => {
+                vec![key.as_slice(), newkey.as_slice()]
+            }
+            Command::Copy {
+                source,
+                destination,
+                ..
+            } => vec![source.as_slice(), destination.as_slice()],
+            Command::SMove {
+                source,
+                destination,
+                ..
+            } => vec![source.as_slice(), destination.as_slice()],
+            Command::PfMerge { destkey, .. } => vec![destkey.as_slice()],
+            Command::BitOp { destkey, .. } => vec![destkey.as_slice()],
+            Command::BZPopMin { keys, .. } | Command::BZPopMax { keys, .. } => {
+                keys.iter().map(|k| k.as_slice()).collect()
+            }
+            _ => self.key().into_iter().collect(),
+        }
     }
 
     /// Return a numeric type index for stats tracking.
@@ -1898,7 +1964,8 @@ impl Command {
             | Command::Exec
             | Command::Discard
             | Command::Watch { .. }
-            | Command::Unwatch => 46,
+            | Command::Unwatch
+            | Command::KeyVersion { .. } => 46,
             Command::ConfigGet { .. }
             | Command::ConfigSet { .. }
             | Command::ConfigResetStat
@@ -1914,7 +1981,9 @@ impl Command {
             | Command::CommandCount
             | Command::CommandList
             | Command::CommandHelp
-            | Command::CommandDocs { .. } => 47,
+            | Command::CommandDocs { .. }
+            | Command::CommandGetKeys { .. }
+            | Command::CommandGetKeysAndFlags { .. } => 47,
             Command::BLPop { .. }
             | Command::BRPop { .. }
             | Command::BLMove { .. }
@@ -2144,6 +2213,10 @@ pub const COMMAND_HELP_LINES: &[&str] = &[
     "    Return details about multiple Kora commands.",
     "DOCS [<command-name> ...]",
     "    Return documentation details about multiple Kora commands.",
+    "GETKEYS <command> <arg> [<arg> ...]",
+    "    Extract keys from the given command and arguments.",
+    "GETKEYSANDFLAGS <command> <arg> [<arg> ...]",
+    "    Extract keys and their access flags from the given command and arguments.",
     "HELP",
     "    Print this help.",
 ];
@@ -2263,6 +2336,217 @@ pub fn command_help_response() -> CommandResponse {
     )
 }
 
+struct KeySpec {
+    first: usize,
+    last: i32,
+    step: usize,
+    write: bool,
+}
+
+fn key_spec_for(name: &str) -> Option<KeySpec> {
+    match name {
+        "get" | "strlen" | "getrange" | "ttl" | "pttl" | "type" | "exists" | "llen" | "lrange"
+        | "lindex" | "lpos" | "hget" | "hgetall" | "hlen" | "hexists" | "hmget" | "hkeys"
+        | "hvals" | "hrandfield" | "hscan" | "smembers" | "sismember" | "scard" | "srandmember"
+        | "smismember" | "sscan" | "zcard" | "zcount" | "zlexcount" | "zrange" | "zrevrange"
+        | "zrangebyscore" | "zrevrangebyscore" | "zrangebylex" | "zrevrangebylex" | "zrank"
+        | "zrevrank" | "zscore" | "zmscore" | "zrandmember" | "zscan" | "xlen" | "xrange"
+        | "xrevrange" | "object" | "getbit" | "bitcount" | "bitpos" | "bitfield" | "geodist"
+        | "geohash" | "geopos" | "geosearch" | "pfcount" | "dump" | "touch" | "persist" => {
+            Some(KeySpec {
+                first: 0,
+                last: 0,
+                step: 1,
+                write: false,
+            })
+        }
+
+        "set" | "setnx" | "setrange" | "getset" | "getdel" | "getex" | "append" | "incr"
+        | "decr" | "incrby" | "decrby" | "incrbyfloat" | "expire" | "pexpire" | "expireat"
+        | "pexpireat" | "lpush" | "rpush" | "lpop" | "rpop" | "lset" | "linsert" | "lrem"
+        | "ltrim" | "hset" | "hdel" | "hincrby" | "hsetnx" | "hincrbyfloat" | "sadd" | "srem"
+        | "spop" | "zadd" | "zrem" | "zincrby" | "zpopmin" | "zpopmax" | "xadd" | "xtrim"
+        | "setbit" | "geoadd" | "pfadd" | "xgroupcreate" | "xgroupdestroy"
+        | "xgroupdelconsumer" | "xack" | "xpending" | "xclaim" | "xautoclaim"
+        | "xinfostreamkey" | "xinfogroups" | "xdel" => Some(KeySpec {
+            first: 0,
+            last: 0,
+            step: 1,
+            write: true,
+        }),
+
+        "del" | "unlink" => Some(KeySpec {
+            first: 0,
+            last: -1,
+            step: 1,
+            write: true,
+        }),
+
+        "mget" => Some(KeySpec {
+            first: 0,
+            last: -1,
+            step: 1,
+            write: false,
+        }),
+
+        "mset" | "msetnx" => Some(KeySpec {
+            first: 0,
+            last: -1,
+            step: 2,
+            write: true,
+        }),
+
+        "rename" | "renamenx" => Some(KeySpec {
+            first: 0,
+            last: 1,
+            step: 1,
+            write: true,
+        }),
+
+        "rpoplpush" | "lmove" | "blmove" | "smove" => Some(KeySpec {
+            first: 0,
+            last: 1,
+            step: 1,
+            write: true,
+        }),
+
+        "copy" => Some(KeySpec {
+            first: 0,
+            last: 1,
+            step: 1,
+            write: true,
+        }),
+
+        "blpop" | "brpop" => Some(KeySpec {
+            first: 0,
+            last: -2,
+            step: 1,
+            write: true,
+        }),
+
+        "xread" => None,
+
+        "bitop" => Some(KeySpec {
+            first: 1,
+            last: -1,
+            step: 1,
+            write: true,
+        }),
+
+        _ => None,
+    }
+}
+
+fn extract_keys_from_args(args: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    if args.is_empty() {
+        return Vec::new();
+    }
+
+    let name = String::from_utf8_lossy(&args[0]).to_ascii_lowercase();
+    let rest = &args[1..];
+
+    let spec = match key_spec_for(&name) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+
+    if rest.is_empty() {
+        return Vec::new();
+    }
+
+    let last_idx = if spec.last < 0 {
+        let candidate = rest.len() as i32 + spec.last;
+        if candidate < spec.first as i32 {
+            return Vec::new();
+        }
+        candidate as usize
+    } else {
+        let l = spec.last as usize;
+        if l >= rest.len() {
+            return Vec::new();
+        }
+        l
+    };
+
+    if spec.first > last_idx || spec.first >= rest.len() {
+        return Vec::new();
+    }
+
+    let mut keys = Vec::new();
+    let mut idx = spec.first;
+    while idx <= last_idx && idx < rest.len() {
+        keys.push(rest[idx].clone());
+        idx += spec.step;
+    }
+    keys
+}
+
+fn is_write_command(name: &str) -> bool {
+    key_spec_for(name).is_some_and(|s| s.write)
+}
+
+/// Build a `COMMAND GETKEYS` response from raw subcommand arguments.
+///
+/// The first element of `args` is the command name; the rest are its arguments.
+/// Returns an array of keys extracted from the command, or an error when the
+/// command is unrecognised or takes no keys.
+pub fn command_getkeys_response(args: &[Vec<u8>]) -> CommandResponse {
+    if args.is_empty() {
+        return CommandResponse::Error("ERR Invalid arguments".into());
+    }
+
+    let name = String::from_utf8_lossy(&args[0]).to_ascii_lowercase();
+    if key_spec_for(&name).is_none() {
+        return CommandResponse::Error("ERR The command has no key arguments".into());
+    }
+
+    let keys = extract_keys_from_args(args);
+    CommandResponse::Array(keys.into_iter().map(CommandResponse::BulkString).collect())
+}
+
+/// Build a `COMMAND GETKEYSANDFLAGS` response from raw subcommand arguments.
+///
+/// Each element of the returned array is a two-element sub-array:
+/// `[key, [flag …]]`. Write commands get `["RW", "OW", "update"]` flags;
+/// read commands get `["RO", "access"]`.
+pub fn command_getkeysandflags_response(args: &[Vec<u8>]) -> CommandResponse {
+    if args.is_empty() {
+        return CommandResponse::Error("ERR Invalid arguments".into());
+    }
+
+    let name = String::from_utf8_lossy(&args[0]).to_ascii_lowercase();
+    if key_spec_for(&name).is_none() {
+        return CommandResponse::Error("ERR The command has no key arguments".into());
+    }
+
+    let write = is_write_command(&name);
+    let keys = extract_keys_from_args(args);
+
+    let flags = if write {
+        vec![
+            CommandResponse::BulkString(b"RW".to_vec()),
+            CommandResponse::BulkString(b"OW".to_vec()),
+            CommandResponse::BulkString(b"update".to_vec()),
+        ]
+    } else {
+        vec![
+            CommandResponse::BulkString(b"RO".to_vec()),
+            CommandResponse::BulkString(b"access".to_vec()),
+        ]
+    };
+
+    CommandResponse::Array(
+        keys.into_iter()
+            .map(|key| {
+                CommandResponse::Array(vec![
+                    CommandResponse::BulkString(key),
+                    CommandResponse::Array(flags.clone()),
+                ])
+            })
+            .collect(),
+    )
+}
+
 /// Response from executing a command on a shard.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandResponse {
@@ -2270,6 +2554,8 @@ pub enum CommandResponse {
     Ok,
     /// Null bulk string ($-1)
     Nil,
+    /// Null array (*-1) — used for EXEC abort on WATCH conflict.
+    NilArray,
     /// Integer reply
     Integer(i64),
     /// Bulk string

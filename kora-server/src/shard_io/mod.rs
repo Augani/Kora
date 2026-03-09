@@ -250,6 +250,7 @@ pub(crate) struct AffinitySharedState {
     pub router: ShardRouter,
     #[allow(dead_code)]
     pub conn_counts: Arc<[AtomicUsize]>,
+    pub key_event_notify: tokio::sync::Notify,
 }
 
 pub(crate) struct ShardIoEngine {
@@ -345,6 +346,7 @@ impl ShardIoEngine {
             next_conn_id: AtomicU64::new(1),
             router: router.clone(),
             conn_counts: conn_counts.clone(),
+            key_event_notify: tokio::sync::Notify::new(),
         });
 
         let mut thread_handles = Vec::with_capacity(shard_count);
@@ -694,12 +696,16 @@ fn handle_shard_request(
             );
             let execute_start = Instant::now();
             maybe_sweep_inline(store, ops_since_expire);
+            let wake = is_wake_trigger(&command);
             let resp = execute_with_wal_inline(store, wal_writer, command);
             shared.batch_stage_metrics.record(
                 BatchStage::RemoteExecute,
                 execute_start.elapsed().as_nanos() as u64,
             );
             let _ = response_tx.send(resp);
+            if wake {
+                shared.key_event_notify.notify_waiters();
+            }
         }
         ShardRequest::ExecuteMemcache {
             request,
@@ -730,10 +736,14 @@ fn handle_shard_request(
                 queued_at.elapsed().as_nanos() as u64,
             );
             let execute_start = Instant::now();
+            let mut had_wake_trigger = false;
             let results: Vec<_> = commands
                 .into_iter()
                 .map(|(idx, cmd)| {
                     maybe_sweep_inline(store, ops_since_expire);
+                    if is_wake_trigger(&cmd) {
+                        had_wake_trigger = true;
+                    }
                     let resp = execute_with_wal_inline(store, wal_writer, cmd);
                     (idx, resp)
                 })
@@ -743,6 +753,9 @@ fn handle_shard_request(
                 execute_start.elapsed().as_nanos() as u64,
             );
             let _ = response_tx.send((flush_id, Instant::now(), results));
+            if had_wake_trigger {
+                shared.key_event_notify.notify_waiters();
+            }
         }
         ShardRequest::BgSave {
             request,
@@ -881,6 +894,19 @@ async fn run_periodic_snapshot_scheduler(
             }
         }
     }
+}
+
+pub(crate) fn is_wake_trigger(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::LPush { .. }
+            | Command::RPush { .. }
+            | Command::ZAdd { .. }
+            | Command::RPopLPush { .. }
+            | Command::LMove { .. }
+            | Command::Rename { .. }
+            | Command::RenameNx { .. }
+    )
 }
 
 pub(crate) fn execute_with_wal_inline(

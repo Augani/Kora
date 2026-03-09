@@ -10,8 +10,9 @@ use bytes::BytesMut;
 use kora_cdc::consumer::ConsumerGroupManager;
 use kora_cdc::ring::CdcRing;
 use kora_core::command::{
-    command_docs_response, command_help_response, command_info_response, command_list_response,
-    supported_command_count, Command, CommandResponse,
+    command_docs_response, command_getkeys_response, command_getkeysandflags_response,
+    command_help_response, command_info_response, command_list_response, supported_command_count,
+    Command, CommandResponse,
 };
 use kora_core::shard::{ShardStore, WalRecord, WalWriter};
 use kora_core::tenant::TenantId;
@@ -23,7 +24,9 @@ use tokio::sync::mpsc;
 
 use super::dispatch;
 use super::stage_metrics::{format_stage_metrics_info, BatchStage, BatchStageMetrics};
-use super::{execute_with_wal_inline, AffinitySharedState, ShardRouter, CROSS_SHARD_TIMEOUT};
+use super::{
+    execute_with_wal_inline, is_wake_trigger, AffinitySharedState, ShardRouter, CROSS_SHARD_TIMEOUT,
+};
 
 const PUBSUB_CHANNEL_CAPACITY: usize = 8192;
 
@@ -50,6 +53,7 @@ struct ConnState {
     subscribed_patterns: AHashSet<Vec<u8>>,
     in_multi: bool,
     multi_queue: Vec<Command>,
+    watched_keys: Vec<(Vec<u8>, u64)>,
     client_name: Option<Vec<u8>>,
     quit_requested: bool,
 }
@@ -77,21 +81,11 @@ fn internal_shard_error() -> CommandResponse {
     CommandResponse::Error("ERR internal error".into())
 }
 
-async fn handle_wait_command(numreplicas: i64, timeout: i64) -> CommandResponse {
+fn handle_wait_command(numreplicas: i64, timeout: i64) -> CommandResponse {
     if timeout < 0 {
         return CommandResponse::Error("ERR timeout is negative".into());
     }
-
-    if numreplicas <= 0 {
-        return CommandResponse::Integer(0);
-    }
-
-    if timeout == 0 {
-        std::future::pending::<()>().await;
-        unreachable!("pending future should never resolve");
-    }
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(timeout as u64)).await;
+    let _ = numreplicas;
     CommandResponse::Integer(0)
 }
 
@@ -166,6 +160,7 @@ pub(crate) async fn handle_connection_affinity<S: AsyncReadExt + AsyncWriteExt +
         subscribed_patterns: AHashSet::new(),
         in_multi: false,
         multi_queue: Vec::new(),
+        watched_keys: Vec::new(),
         client_name: None,
         quit_requested: false,
     };
@@ -358,6 +353,7 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                                     .serialize_ns
                                     .saturating_add(flush_durations.serialize_ns);
 
+                                let wake = is_wake_trigger(&cmd);
                                 let execute_start = maybe_now(track_stages);
                                 let resp = dispatch::handle_complex_command(
                                     cmd,
@@ -369,6 +365,9 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                                 .await;
                                 maybe_elapsed(execute_start, &mut stage_durations.execute_ns);
                                 push_ready_response(&mut responses, resp);
+                                if wake {
+                                    shared.key_event_notify.notify_waiters();
+                                }
                             } else {
                                 process_simple_command(
                                     cmd,
@@ -465,6 +464,55 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     }
 }
 
+async fn query_key_versions(
+    keys: &[Vec<u8>],
+    local_shard: u16,
+    store: &Rc<RefCell<ShardStore>>,
+    router: &ShardRouter,
+) -> Vec<u64> {
+    let mut versions = Vec::with_capacity(keys.len());
+    let mut pending: Vec<(usize, tokio::sync::oneshot::Receiver<CommandResponse>)> = Vec::new();
+
+    for (idx, key) in keys.iter().enumerate() {
+        let target_shard = router.shard_for_key(key);
+        if target_shard == local_shard {
+            let ver = store.borrow().key_version(key);
+            versions.push((idx, ver));
+        } else {
+            let cmd = Command::KeyVersion { key: key.clone() };
+            match router.try_dispatch_foreign(target_shard, cmd) {
+                Ok(rx) => pending.push((idx, rx)),
+                Err(_) => versions.push((idx, 0)),
+            }
+        }
+    }
+
+    for (idx, rx) in pending {
+        let ver = match tokio::time::timeout(CROSS_SHARD_TIMEOUT, rx).await {
+            Ok(Ok(CommandResponse::Integer(v))) => v as u64,
+            _ => 0,
+        };
+        versions.push((idx, ver));
+    }
+
+    versions.sort_by_key(|(idx, _)| *idx);
+    versions.into_iter().map(|(_, v)| v).collect()
+}
+
+async fn check_watched_keys_dirty(
+    watched: &[(Vec<u8>, u64)],
+    local_shard: u16,
+    store: &Rc<RefCell<ShardStore>>,
+    router: &ShardRouter,
+) -> bool {
+    let keys: Vec<Vec<u8>> = watched.iter().map(|(k, _)| k.clone()).collect();
+    let current_versions = query_key_versions(&keys, local_shard, store, router).await;
+    watched
+        .iter()
+        .zip(current_versions.iter())
+        .any(|((_, watched_ver), current_ver)| watched_ver != current_ver)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn try_handle_connection_command(
     cmd: &Command,
@@ -499,6 +547,7 @@ async fn try_handle_connection_command(
             }
             conn.in_multi = false;
             let queued = mem::take(&mut conn.multi_queue);
+            let watched = mem::take(&mut conn.watched_keys);
             let flush_durations = flush_pending_responses(
                 router,
                 &shared.batch_stage_metrics,
@@ -518,6 +567,13 @@ async fn try_handle_connection_command(
             stage_durations.serialize_ns = stage_durations
                 .serialize_ns
                 .saturating_add(flush_durations.serialize_ns);
+
+            if !watched.is_empty() {
+                let dirty = check_watched_keys_dirty(&watched, conn.shard_id, store, router).await;
+                if dirty {
+                    return Some(CommandResponse::NilArray);
+                }
+            }
 
             let mut exec_results = Vec::with_capacity(queued.len());
             for queued_cmd in queued {
@@ -541,17 +597,24 @@ async fn try_handle_connection_command(
             }
             conn.in_multi = false;
             conn.multi_queue.clear();
+            conn.watched_keys.clear();
             Some(CommandResponse::Ok)
         }
-        Command::Watch { .. } => {
+        Command::Watch { keys } => {
             if conn.in_multi {
                 return Some(CommandResponse::Error(
                     "ERR WATCH inside MULTI is not allowed".into(),
                 ));
             }
+            let versions = query_key_versions(keys, conn.shard_id, store, router).await;
+            conn.watched_keys
+                .extend(keys.iter().cloned().zip(versions.into_iter()));
             Some(CommandResponse::Ok)
         }
-        Command::Unwatch => Some(CommandResponse::Ok),
+        Command::Unwatch => {
+            conn.watched_keys.clear();
+            Some(CommandResponse::Ok)
+        }
         Command::Quit => {
             conn.quit_requested = true;
             Some(CommandResponse::Ok)
@@ -571,22 +634,28 @@ async fn try_handle_connection_command(
                 .as_ref()
                 .map(|n| String::from_utf8_lossy(n).into_owned())
                 .unwrap_or_default();
+            let multi_val: i64 = if conn.in_multi {
+                conn.multi_queue.len() as i64
+            } else {
+                -1
+            };
             let info = format!(
-                "id={} fd=0 name={} db=0 flags=N\r\n",
-                conn.conn_id, name_str
+                "id={} addr=127.0.0.1:0 laddr=127.0.0.1:0 fd=0 name={} db=0 sub={} psub={} multi={} watch={} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 tot-mem=0 obl=0 oll=0 events=r cmd=unknown user=default lib-name= lib-ver= flags=N\r\n",
+                conn.conn_id,
+                name_str,
+                conn.subscription_count,
+                conn.pattern_count,
+                multi_val,
+                conn.watched_keys.len(),
             );
             Some(CommandResponse::BulkString(info.into_bytes()))
         }
         Command::Select { db } => {
-            if *db < 0 {
-                Some(CommandResponse::Error(
-                    "ERR DB index is out of range".into(),
-                ))
-            } else if *db == 0 {
+            if *db == 0 {
                 Some(CommandResponse::Ok)
             } else {
                 Some(CommandResponse::Error(
-                    "ERR SELECT is not allowed in cluster mode".into(),
+                    "ERR DB index is out of range".into(),
                 ))
             }
         }
@@ -605,12 +674,16 @@ async fn try_handle_connection_command(
         Command::Wait {
             numreplicas,
             timeout,
-        } => Some(handle_wait_command(*numreplicas, *timeout).await),
+        } => Some(handle_wait_command(*numreplicas, *timeout)),
         Command::CommandInfo { names } => Some(command_info_response(names)),
         Command::CommandCount => Some(CommandResponse::Integer(supported_command_count())),
         Command::CommandList => Some(command_list_response()),
         Command::CommandHelp => Some(command_help_response()),
         Command::CommandDocs { names } => Some(command_docs_response(names)),
+        Command::CommandGetKeys { ref args } => Some(command_getkeys_response(args)),
+        Command::CommandGetKeysAndFlags { ref args } => {
+            Some(command_getkeysandflags_response(args))
+        }
         Command::ConfigGet { pattern } => Some(handle_config_get(pattern, shared)),
         Command::ConfigSet { parameter, value } => Some(handle_config_set(parameter, value)),
         Command::ConfigResetStat => Some(CommandResponse::Ok),
@@ -656,10 +729,7 @@ async fn try_handle_connection_command(
             let deadline =
                 tokio::time::Instant::now() + tokio::time::Duration::from_secs_f64(timeout_secs);
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                if tokio::time::Instant::now() >= deadline {
-                    return Some(CommandResponse::Nil);
-                }
+                let notified = shared.key_event_notify.notified();
                 let retry_resp = if is_complex_command(cmd) {
                     dispatch::handle_complex_command(
                         cmd.clone(),
@@ -674,6 +744,12 @@ async fn try_handle_connection_command(
                 };
                 if !matches!(retry_resp, CommandResponse::Nil) {
                     return Some(retry_resp);
+                }
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep_until(deadline) => {
+                        return Some(CommandResponse::Nil);
+                    }
                 }
             }
         }
@@ -695,18 +771,18 @@ async fn execute_single_command(
         timeout,
     } = &cmd
     {
-        return handle_wait_command(*numreplicas, *timeout).await;
+        return handle_wait_command(*numreplicas, *timeout);
     }
 
     if let Some(resp) = try_handle_local_affinity(&cmd, shared, conn) {
         return resp;
     }
 
-    if is_complex_command(&cmd) {
-        return dispatch::handle_complex_command(cmd, shard_id, store, wal_writer, router).await;
-    }
+    let wake = is_wake_trigger(&cmd);
 
-    if let Some(key) = cmd.key() {
+    let resp = if is_complex_command(&cmd) {
+        dispatch::handle_complex_command(cmd, shard_id, store, wal_writer, router).await
+    } else if let Some(key) = cmd.key() {
         let target_shard = router.shard_for_key(key);
         if target_shard == shard_id {
             execute_with_wal_inline(store, wal_writer, cmd)
@@ -721,7 +797,12 @@ async fn execute_single_command(
         }
     } else {
         store.borrow_mut().execute(cmd)
+    };
+
+    if wake {
+        shared.key_event_notify.notify_waiters();
     }
+    resp
 }
 
 fn handle_config_get(pattern: &str, _shared: &Arc<AffinitySharedState>) -> CommandResponse {
@@ -739,21 +820,43 @@ fn handle_config_get(pattern: &str, _shared: &Arc<AffinitySharedState>) -> Comma
         name == pat
     };
 
-    if matches_pattern("bind") {
-        result.push(CommandResponse::BulkString(b"bind".to_vec()));
-        result.push(CommandResponse::BulkString(b"127.0.0.1".to_vec()));
-    }
-    if matches_pattern("maxmemory") {
-        result.push(CommandResponse::BulkString(b"maxmemory".to_vec()));
-        result.push(CommandResponse::BulkString(b"0".to_vec()));
-    }
-    if matches_pattern("save") {
-        result.push(CommandResponse::BulkString(b"save".to_vec()));
-        result.push(CommandResponse::BulkString(b"".to_vec()));
-    }
-    if matches_pattern("dir") {
-        result.push(CommandResponse::BulkString(b"dir".to_vec()));
-        result.push(CommandResponse::BulkString(b".".to_vec()));
+    let config_entries: &[(&str, &[u8])] = &[
+        ("activedefrag", b"no"),
+        ("appendonly", b"no"),
+        ("bind", b"127.0.0.1"),
+        ("databases", b"1"),
+        ("dbfilename", b"dump.rdb"),
+        ("dir", b"."),
+        ("hash-max-ziplist-entries", b"128"),
+        ("hash-max-ziplist-value", b"64"),
+        ("hz", b"10"),
+        ("lazyfree-lazy-eviction", b"no"),
+        ("lazyfree-lazy-expire", b"no"),
+        ("lazyfree-lazy-server-del", b"no"),
+        ("list-max-ziplist-size", b"-2"),
+        ("logfile", b""),
+        ("loglevel", b"notice"),
+        ("maxmemory", b"0"),
+        ("maxmemory-policy", b"noeviction"),
+        ("port", b"6379"),
+        ("proto-max-bulk-len", b"512000000"),
+        ("replica-lazy-flush", b"no"),
+        ("requirepass", b""),
+        ("save", b""),
+        ("set-max-intset-entries", b"512"),
+        ("slave-lazy-flush", b"no"),
+        ("tcp-backlog", b"511"),
+        ("tcp-keepalive", b"300"),
+        ("timeout", b"0"),
+        ("zset-max-ziplist-entries", b"128"),
+        ("zset-max-ziplist-value", b"64"),
+    ];
+
+    for &(name, value) in config_entries {
+        if matches_pattern(name) {
+            result.push(CommandResponse::BulkString(name.as_bytes().to_vec()));
+            result.push(CommandResponse::BulkString(value.to_vec()));
+        }
     }
 
     CommandResponse::Array(result)
@@ -762,7 +865,16 @@ fn handle_config_get(pattern: &str, _shared: &Arc<AffinitySharedState>) -> Comma
 fn handle_config_set(parameter: &str, _value: &str) -> CommandResponse {
     let param_lower = parameter.to_ascii_lowercase();
     match param_lower.as_str() {
-        "maxmemory" => CommandResponse::Ok,
+        "maxmemory"
+        | "maxmemory-policy"
+        | "hz"
+        | "timeout"
+        | "tcp-keepalive"
+        | "loglevel"
+        | "lazyfree-lazy-eviction"
+        | "lazyfree-lazy-expire"
+        | "lazyfree-lazy-server-del"
+        | "activedefrag" => CommandResponse::Ok,
         _ => CommandResponse::Error(format!("ERR Unsupported CONFIG parameter: {}", parameter)),
     }
 }
@@ -1042,6 +1154,7 @@ fn process_simple_command(
         }
     }
 
+    let wake = is_wake_trigger(&cmd);
     if let Some(key) = cmd.key() {
         let route_start = maybe_now(track_stages);
         let target_shard = router.shard_for_key(key);
@@ -1059,6 +1172,9 @@ fn process_simple_command(
         let resp = store.borrow_mut().execute(cmd);
         maybe_elapsed(execute_start, &mut stage_durations.execute_ns);
         push_ready_response(responses, resp);
+    }
+    if wake {
+        shared.key_event_notify.notify_waiters();
     }
 }
 
@@ -1118,9 +1234,12 @@ fn process_hot_command(
             if target == shard_id {
                 let execute_start = maybe_now(track_stages);
                 append_wal_set(wal_writer, key, value, None);
-                let resp = store
-                    .borrow_mut()
-                    .set_bytes(key, value, None, None, false, false);
+                let resp = {
+                    let mut s = store.borrow_mut();
+                    let r = s.set_bytes(key, value, None, None, false, false);
+                    s.stamp_key_version(key);
+                    r
+                };
                 maybe_elapsed(execute_start, &mut stage_durations.execute_ns);
                 push_ready_response(responses, resp);
             } else {
@@ -1151,7 +1270,12 @@ fn process_hot_command(
             maybe_elapsed(route_start, &mut stage_durations.route_ns);
             if target == shard_id {
                 let execute_start = maybe_now(track_stages);
-                let resp = store.borrow_mut().incr_by_bytes(key, 1);
+                let resp = {
+                    let mut s = store.borrow_mut();
+                    let r = s.incr_by_bytes(key, 1);
+                    s.stamp_key_version(key);
+                    r
+                };
                 maybe_elapsed(execute_start, &mut stage_durations.execute_ns);
                 push_ready_response(responses, resp);
             } else {
@@ -1222,6 +1346,10 @@ fn try_handle_local_affinity(
         Command::CommandList => Some(command_list_response()),
         Command::CommandHelp => Some(command_help_response()),
         Command::CommandDocs { names } => Some(command_docs_response(names)),
+        Command::CommandGetKeys { ref args } => Some(command_getkeys_response(args)),
+        Command::CommandGetKeysAndFlags { ref args } => {
+            Some(command_getkeysandflags_response(args))
+        }
         Command::CdcPoll { cursor, count } => {
             Some(handle_cdc_poll(&shared.cdc_rings, *cursor, *count))
         }

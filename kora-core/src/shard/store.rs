@@ -6,9 +6,10 @@ use std::time::Duration;
 use ahash::AHashMap;
 
 use crate::command::{
-    command_docs_response, command_help_response, command_info_response, command_list_response,
-    supported_command_count, BitFieldEncoding, BitFieldOffset, BitFieldOperation, BitFieldOverflow,
-    BitOperation, Command, CommandResponse, GeoUnit,
+    command_docs_response, command_getkeys_response, command_getkeysandflags_response,
+    command_help_response, command_info_response, command_list_response, supported_command_count,
+    BitFieldEncoding, BitFieldOffset, BitFieldOperation, BitFieldOverflow, BitOperation, Command,
+    CommandResponse, GeoUnit,
 };
 use crate::shard::allocator::ShardAllocator;
 use crate::tenant::TenantId;
@@ -39,6 +40,9 @@ pub struct ShardStore {
     allocator: ShardAllocator,
     tenant_memory: AHashMap<TenantId, usize>,
     current_tenant: TenantId,
+    mutation_version: u64,
+    key_deletion_versions: AHashMap<CompactKey, u64>,
+    last_flush_version: u64,
     #[cfg(feature = "observability")]
     stats: ShardStats,
     #[cfg(feature = "observability")]
@@ -61,6 +65,9 @@ impl ShardStore {
             allocator: ShardAllocator::new(),
             tenant_memory: AHashMap::new(),
             current_tenant: TenantId(0),
+            mutation_version: 0,
+            key_deletion_versions: AHashMap::new(),
+            last_flush_version: 0,
             #[cfg(feature = "observability")]
             stats: ShardStats::new(),
             #[cfg(feature = "observability")]
@@ -96,6 +103,40 @@ impl ShardStore {
     /// Get a mutable reference to the per-shard slab allocator.
     pub fn allocator_mut(&mut self) -> &mut ShardAllocator {
         &mut self.allocator
+    }
+
+    /// Query a key's mutation version for WATCH conflict detection.
+    ///
+    /// Returns the version at which the key was last mutated, or the
+    /// most recent deletion/flush version if the key no longer exists.
+    pub fn key_version(&self, key: &[u8]) -> u64 {
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) if !entry.is_expired() => entry.version,
+            _ => {
+                let del_ver = self
+                    .key_deletion_versions
+                    .get(&compact)
+                    .copied()
+                    .unwrap_or(0);
+                del_ver.max(self.last_flush_version)
+            }
+        }
+    }
+
+    /// Stamp mutation version on a key for WATCH tracking.
+    ///
+    /// Called by hot-path operations that bypass [`execute`] to ensure
+    /// WATCH conflict detection still works.
+    pub fn stamp_key_version(&mut self, key: &[u8]) {
+        self.mutation_version += 1;
+        let ver = self.mutation_version;
+        let compact = CompactKey::new(key);
+        if let Some(entry) = self.entries.get_mut(&compact) {
+            entry.version = ver;
+        } else {
+            self.key_deletion_versions.insert(compact, ver);
+        }
     }
 
     /// Get the number of keys in this shard.
@@ -273,6 +314,11 @@ impl ShardStore {
         }
         self.expire_scan_cursor = self.expire_scan_cursor.wrapping_add(examined);
 
+        if self.key_deletion_versions.len() > 10_000 {
+            let cutoff = self.mutation_version.saturating_sub(100_000);
+            self.key_deletion_versions.retain(|_, v| *v > cutoff);
+        }
+
         expired_keys.len()
     }
 
@@ -283,6 +329,9 @@ impl ShardStore {
         self.tenant_memory.clear();
         self.expire_scan_cursor = 0;
         self.stream_groups.clear();
+        self.mutation_version += 1;
+        self.last_flush_version = self.mutation_version;
+        self.key_deletion_versions.clear();
     }
 
     /// Execute a command on this shard and return the response.
@@ -302,12 +351,21 @@ impl ShardStore {
             None
         };
 
-        if cmd.is_mutation() {
+        let is_mut = cmd.is_mutation();
+        let mutation_keys: Vec<CompactKey> = if is_mut {
+            cmd.collect_mutation_keys()
+                .iter()
+                .map(|k| CompactKey::new(k))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        if is_mut {
             self.maybe_evict();
         }
 
-        // LFU touches are only needed when eviction is active (max_memory > 0).
-        let should_touch_lfu = !cmd.is_mutation() && self.max_memory > 0;
+        let should_touch_lfu = !is_mut && self.max_memory > 0;
         let cmd_key = if should_touch_lfu {
             cmd.key().map(CompactKey::new)
         } else {
@@ -315,6 +373,18 @@ impl ShardStore {
         };
 
         let response = self.execute_inner(cmd);
+
+        if !mutation_keys.is_empty() {
+            self.mutation_version += 1;
+            let ver = self.mutation_version;
+            for key in mutation_keys {
+                if let Some(entry) = self.entries.get_mut(&key) {
+                    entry.version = ver;
+                } else {
+                    self.key_deletion_versions.insert(key, ver);
+                }
+            }
+        }
 
         if let Some(key) = cmd_key {
             self.touch_key(&key);
@@ -901,6 +971,10 @@ impl ShardStore {
                 withhash,
             ),
 
+            Command::KeyVersion { ref key } => {
+                CommandResponse::Integer(self.key_version(key) as i64)
+            }
+
             // Transaction commands — handled at connection level
             Command::Multi
             | Command::Exec
@@ -938,12 +1012,10 @@ impl ShardStore {
                 ])
             }
             Command::Select { db } => {
-                if db < 0 {
-                    CommandResponse::Error("ERR DB index is out of range".into())
-                } else if db == 0 {
+                if db == 0 {
                     CommandResponse::Ok
                 } else {
-                    CommandResponse::Error("ERR SELECT is not allowed in cluster mode".into())
+                    CommandResponse::Error("ERR DB index is out of range".into())
                 }
             }
             Command::Quit => CommandResponse::Ok,
@@ -958,6 +1030,8 @@ impl ShardStore {
             Command::CommandList => command_list_response(),
             Command::CommandHelp => command_help_response(),
             Command::CommandDocs { names } => command_docs_response(&names),
+            Command::CommandGetKeys { args } => command_getkeys_response(&args),
+            Command::CommandGetKeysAndFlags { args } => command_getkeysandflags_response(&args),
 
             // Commands handled at server/engine level — should not reach here
             Command::BgSave
@@ -4813,6 +4887,9 @@ impl ShardStore {
         self.memory_used = self.memory_used.saturating_sub(removed_size);
         let tenant_mem = self.tenant_memory.entry(removed.tenant_id).or_insert(0);
         *tenant_mem = tenant_mem.saturating_sub(removed_size);
+        self.mutation_version += 1;
+        self.key_deletion_versions
+            .insert(key.clone(), self.mutation_version);
         Some(removed)
     }
 

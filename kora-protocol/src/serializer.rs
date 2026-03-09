@@ -18,6 +18,9 @@ pub fn serialize_response_versioned(resp: &CommandResponse, buf: &mut BytesMut, 
                 buf.extend_from_slice(b"$-1\r\n");
             }
         }
+        CommandResponse::NilArray => {
+            buf.extend_from_slice(b"*-1\r\n");
+        }
         CommandResponse::Integer(n) => {
             let _ = write!(buf, ":{}\r\n", n);
         }
