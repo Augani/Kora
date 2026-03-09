@@ -9,7 +9,10 @@ use thiserror::Error;
 use crate::collection::{Collection, CollectionConfig, CollectionError, CompressionProfile};
 use crate::decompose::{DecomposeError, Decomposer};
 use crate::dictionary::{ValueDictionary, ValueDictionaryConfig};
-use crate::index::{hash32, CollectionIndexes, IndexConfig, IndexError, IndexType};
+use crate::expr::{parse_where, Expr, ExprValue};
+use crate::index::{
+    hash32, intersect_sorted, union_sorted, CollectionIndexes, IndexConfig, IndexError, IndexType,
+};
 use crate::packed::PackedDoc;
 use crate::recompose::{RecomposeError, Recomposer};
 use crate::registry::{CollectionId, DocId, FieldId, IdRegistry, RegistryError};
@@ -145,6 +148,9 @@ pub enum DocError {
     /// Index operation failed.
     #[error(transparent)]
     Index(#[from] IndexError),
+    /// WHERE expression parse error.
+    #[error("invalid WHERE expression: {0}")]
+    InvalidExpression(String),
 }
 
 #[derive(Debug)]
@@ -732,6 +738,229 @@ impl DocEngine {
             remove_single_field_entry(indexes, field_id, idx_type, doc_id, field_value);
         }
     }
+
+    /// Execute a WHERE query and return matching documents.
+    pub fn find(
+        &self,
+        collection: &str,
+        where_clause: &str,
+        projection: Option<&[&str]>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<Value>, DocError> {
+        let collection_id = self.collection_id(collection)?;
+        let state = self
+            .collections
+            .get(&collection_id)
+            .ok_or_else(|| DocError::UnknownCollection(collection.to_string()))?;
+
+        let expr = parse_where(where_clause)
+            .map_err(|err| DocError::InvalidExpression(err.to_string()))?;
+
+        let doc_ids = self.execute_expr(collection_id, state, &expr)?;
+
+        let end = match limit {
+            Some(lim) => (offset.saturating_add(lim)).min(doc_ids.len()),
+            None => doc_ids.len(),
+        };
+        let start = offset.min(doc_ids.len());
+        let page = &doc_ids[start..end];
+
+        let mut results = Vec::with_capacity(page.len());
+        for &doc_id in page {
+            let Some(packed) = state.docs_by_internal_id.get(&doc_id) else {
+                continue;
+            };
+            let value = match projection {
+                Some(paths) => {
+                    let field_ids = self.resolve_field_ids(collection_id, paths);
+                    Recomposer::project(
+                        packed,
+                        &field_ids,
+                        &self.registry,
+                        &state.dictionary,
+                        collection_id,
+                    )?
+                }
+                None => {
+                    Recomposer::recompose(packed, &self.registry, &state.dictionary, collection_id)?
+                }
+            };
+            results.push(value);
+        }
+
+        Ok(results)
+    }
+
+    /// Count documents matching a WHERE clause.
+    pub fn count(&self, collection: &str, where_clause: &str) -> Result<u64, DocError> {
+        let collection_id = self.collection_id(collection)?;
+        let state = self
+            .collections
+            .get(&collection_id)
+            .ok_or_else(|| DocError::UnknownCollection(collection.to_string()))?;
+
+        let expr = parse_where(where_clause)
+            .map_err(|err| DocError::InvalidExpression(err.to_string()))?;
+
+        let doc_ids = self.execute_expr(collection_id, state, &expr)?;
+        Ok(doc_ids.len() as u64)
+    }
+
+    fn execute_expr(
+        &self,
+        collection_id: CollectionId,
+        state: &CollectionState,
+        expr: &Expr,
+    ) -> Result<Vec<DocId>, DocError> {
+        match expr {
+            Expr::And(left, right) => {
+                let left_ids = self.execute_expr(collection_id, state, left)?;
+                let right_ids = self.execute_expr(collection_id, state, right)?;
+                Ok(intersect_sorted(&left_ids, &right_ids))
+            }
+            Expr::Or(left, right) => {
+                let left_ids = self.execute_expr(collection_id, state, left)?;
+                let right_ids = self.execute_expr(collection_id, state, right)?;
+                Ok(union_sorted(&left_ids, &right_ids))
+            }
+            _ => self.execute_leaf(collection_id, state, expr),
+        }
+    }
+
+    fn execute_leaf(
+        &self,
+        collection_id: CollectionId,
+        state: &CollectionState,
+        expr: &Expr,
+    ) -> Result<Vec<DocId>, DocError> {
+        let field_path = expr_field(expr);
+        let segment = self.registry.segment(collection_id);
+        let field_id = segment.and_then(|seg| seg.field_id(field_path));
+        let index_type = field_id.and_then(|fid| state.index_config.lookup(fid));
+
+        match (expr, index_type, field_id) {
+            (Expr::Eq(_, ExprValue::Null), _, _) => Ok(Vec::new()),
+
+            (Expr::Eq(_, value), Some(IndexType::Hash), Some(fid)) => {
+                let Some(hashed) = expr_value_to_hash(value) else {
+                    return Ok(Vec::new());
+                };
+                Ok(state
+                    .indexes
+                    .hash(fid)
+                    .map_or_else(Vec::new, |idx| idx.lookup(hashed).to_vec()))
+            }
+
+            (Expr::Eq(_, ExprValue::Number(n)), Some(IndexType::Sorted), Some(fid)) => Ok(state
+                .indexes
+                .sorted(fid)
+                .map_or_else(Vec::new, |idx| idx.range_query(*n, *n))),
+
+            (Expr::Gte(_, n), Some(IndexType::Sorted), Some(fid)) => Ok(state
+                .indexes
+                .sorted(fid)
+                .map_or_else(Vec::new, |idx| idx.range_query(*n, f64::MAX))),
+
+            (Expr::Lte(_, n), Some(IndexType::Sorted), Some(fid)) => Ok(state
+                .indexes
+                .sorted(fid)
+                .map_or_else(Vec::new, |idx| idx.range_query(f64::MIN, *n))),
+
+            (Expr::Gt(_, n), Some(IndexType::Sorted), Some(fid)) => {
+                let candidates = state
+                    .indexes
+                    .sorted(fid)
+                    .map_or_else(Vec::new, |idx| idx.range_query(*n, f64::MAX));
+                self.filter_numeric_boundary(
+                    collection_id,
+                    state,
+                    field_path,
+                    candidates,
+                    *n,
+                    |v, boundary| v > boundary,
+                )
+            }
+
+            (Expr::Lt(_, n), Some(IndexType::Sorted), Some(fid)) => {
+                let candidates = state
+                    .indexes
+                    .sorted(fid)
+                    .map_or_else(Vec::new, |idx| idx.range_query(f64::MIN, *n));
+                self.filter_numeric_boundary(
+                    collection_id,
+                    state,
+                    field_path,
+                    candidates,
+                    *n,
+                    |v, boundary| v < boundary,
+                )
+            }
+
+            (Expr::Contains(_, value), Some(IndexType::Array), Some(fid)) => {
+                let Some(hashed) = expr_value_to_hash(value) else {
+                    return Ok(Vec::new());
+                };
+                Ok(state
+                    .indexes
+                    .array(fid)
+                    .map_or_else(Vec::new, |idx| idx.lookup(hashed).to_vec()))
+            }
+
+            _ => self.fallback_scan(collection_id, state, expr),
+        }
+    }
+
+    fn filter_numeric_boundary(
+        &self,
+        collection_id: CollectionId,
+        state: &CollectionState,
+        field_path: &str,
+        candidates: Vec<DocId>,
+        boundary: f64,
+        cmp: fn(f64, f64) -> bool,
+    ) -> Result<Vec<DocId>, DocError> {
+        let mut result = Vec::with_capacity(candidates.len());
+        for doc_id in candidates {
+            let Some(packed) = state.docs_by_internal_id.get(&doc_id) else {
+                continue;
+            };
+            let json =
+                Recomposer::recompose(packed, &self.registry, &state.dictionary, collection_id)?;
+            if let Some(field_val) = resolve_json_path(&json, field_path) {
+                if let Some(num) = field_val.as_f64() {
+                    if cmp(num, boundary) {
+                        result.push(doc_id);
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn fallback_scan(
+        &self,
+        collection_id: CollectionId,
+        state: &CollectionState,
+        expr: &Expr,
+    ) -> Result<Vec<DocId>, DocError> {
+        let mut result = Vec::new();
+        let mut doc_ids: Vec<DocId> = state.docs_by_internal_id.keys().copied().collect();
+        doc_ids.sort_unstable();
+
+        for doc_id in doc_ids {
+            let Some(packed) = state.docs_by_internal_id.get(&doc_id) else {
+                continue;
+            };
+            let json =
+                Recomposer::recompose(packed, &self.registry, &state.dictionary, collection_id)?;
+            if eval_expr_on_json(&json, expr) {
+                result.push(doc_id);
+            }
+        }
+
+        Ok(result)
+    }
 }
 
 impl Default for DocEngine {
@@ -846,6 +1075,77 @@ fn remove_single_field_entry(
                 indexes.get_or_create_unique(field_id).remove(hashed);
             }
         }
+    }
+}
+
+fn expr_field(expr: &Expr) -> &str {
+    match expr {
+        Expr::Eq(f, _)
+        | Expr::Neq(f, _)
+        | Expr::Gt(f, _)
+        | Expr::Gte(f, _)
+        | Expr::Lt(f, _)
+        | Expr::Lte(f, _)
+        | Expr::Contains(f, _) => f.as_str(),
+        Expr::And(_, _) | Expr::Or(_, _) => "",
+    }
+}
+
+fn expr_value_to_hash(value: &ExprValue) -> Option<u32> {
+    match value {
+        ExprValue::String(s) => Some(hash32(s.as_bytes())),
+        ExprValue::Bool(true) => Some(hash32(b"true")),
+        ExprValue::Bool(false) => Some(hash32(b"false")),
+        ExprValue::Number(_) | ExprValue::Null => None,
+    }
+}
+
+fn eval_expr_on_json(doc: &Value, expr: &Expr) -> bool {
+    match expr {
+        Expr::Eq(path, value) => {
+            let Some(field_val) = resolve_json_path(doc, path) else {
+                return false;
+            };
+            json_matches_expr_value(field_val, value)
+        }
+        Expr::Neq(path, value) => {
+            let Some(field_val) = resolve_json_path(doc, path) else {
+                return true;
+            };
+            !json_matches_expr_value(field_val, value)
+        }
+        Expr::Gt(path, n) => resolve_json_path(doc, path)
+            .and_then(|v| v.as_f64())
+            .is_some_and(|v| v > *n),
+        Expr::Gte(path, n) => resolve_json_path(doc, path)
+            .and_then(|v| v.as_f64())
+            .is_some_and(|v| v >= *n),
+        Expr::Lt(path, n) => resolve_json_path(doc, path)
+            .and_then(|v| v.as_f64())
+            .is_some_and(|v| v < *n),
+        Expr::Lte(path, n) => resolve_json_path(doc, path)
+            .and_then(|v| v.as_f64())
+            .is_some_and(|v| v <= *n),
+        Expr::Contains(path, value) => {
+            let Some(Value::Array(items)) = resolve_json_path(doc, path) else {
+                return false;
+            };
+            items
+                .iter()
+                .any(|item| json_matches_expr_value(item, value))
+        }
+        Expr::And(left, right) => eval_expr_on_json(doc, left) && eval_expr_on_json(doc, right),
+        Expr::Or(left, right) => eval_expr_on_json(doc, left) || eval_expr_on_json(doc, right),
+    }
+}
+
+fn json_matches_expr_value(json_val: &Value, expr_val: &ExprValue) -> bool {
+    match (json_val, expr_val) {
+        (Value::String(a), ExprValue::String(b)) => a == b,
+        (Value::Number(a), ExprValue::Number(b)) => a.as_f64().is_some_and(|v| v == *b),
+        (Value::Bool(a), ExprValue::Bool(b)) => a == b,
+        (Value::Null, ExprValue::Null) => true,
+        _ => false,
     }
 }
 
@@ -1601,5 +1901,317 @@ mod tests {
 
         let range_high = sorted_idx.range_query(40.0, 100.0);
         assert_eq!(range_high.len(), 1);
+    }
+
+    #[test]
+    fn find_by_hash_index() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create should work");
+        engine
+            .create_index("users", "city", IndexType::Hash)
+            .expect("index should work");
+
+        engine
+            .set("users", "d1", &json!({"name": "Kwame", "city": "Accra"}))
+            .expect("set");
+        engine
+            .set("users", "d2", &json!({"name": "Ama", "city": "Kumasi"}))
+            .expect("set");
+        engine
+            .set("users", "d3", &json!({"name": "Kofi", "city": "Accra"}))
+            .expect("set");
+
+        let results = engine
+            .find("users", r#"city = "Accra""#, None, None, 0)
+            .expect("find should work");
+        assert_eq!(results.len(), 2);
+        for doc in &results {
+            assert_eq!(doc["city"], "Accra");
+        }
+    }
+
+    #[test]
+    fn find_by_sorted_index_range() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create");
+        engine
+            .create_index("users", "age", IndexType::Sorted)
+            .expect("index");
+
+        engine
+            .set("users", "d1", &json!({"name": "A", "age": 20}))
+            .expect("set");
+        engine
+            .set("users", "d2", &json!({"name": "B", "age": 25}))
+            .expect("set");
+        engine
+            .set("users", "d3", &json!({"name": "C", "age": 30}))
+            .expect("set");
+        engine
+            .set("users", "d4", &json!({"name": "D", "age": 35}))
+            .expect("set");
+        engine
+            .set("users", "d5", &json!({"name": "E", "age": 40}))
+            .expect("set");
+
+        let results = engine
+            .find("users", "age >= 25 AND age <= 35", None, None, 0)
+            .expect("find should work");
+        assert_eq!(results.len(), 3);
+        for doc in &results {
+            let age = doc["age"].as_f64().unwrap();
+            assert!((25.0..=35.0).contains(&age));
+        }
+    }
+
+    #[test]
+    fn find_by_array_index() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("posts", CollectionConfig::default())
+            .expect("create");
+        engine
+            .create_index("posts", "tags", IndexType::Array)
+            .expect("index");
+
+        engine
+            .set(
+                "posts",
+                "p1",
+                &json!({"title": "A", "tags": ["rust", "systems"]}),
+            )
+            .expect("set");
+        engine
+            .set("posts", "p2", &json!({"title": "B", "tags": ["go", "web"]}))
+            .expect("set");
+        engine
+            .set(
+                "posts",
+                "p3",
+                &json!({"title": "C", "tags": ["rust", "wasm"]}),
+            )
+            .expect("set");
+
+        let results = engine
+            .find("posts", r#"tags CONTAINS "rust""#, None, None, 0)
+            .expect("find should work");
+        assert_eq!(results.len(), 2);
+        for doc in &results {
+            let tags = doc["tags"].as_array().unwrap();
+            assert!(tags.contains(&json!("rust")));
+        }
+    }
+
+    #[test]
+    fn find_compound_and() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create");
+        engine
+            .create_index("users", "city", IndexType::Hash)
+            .expect("index");
+        engine
+            .create_index("users", "age", IndexType::Sorted)
+            .expect("index");
+
+        engine
+            .set("users", "d1", &json!({"city": "Accra", "age": 20}))
+            .expect("set");
+        engine
+            .set("users", "d2", &json!({"city": "Accra", "age": 30}))
+            .expect("set");
+        engine
+            .set("users", "d3", &json!({"city": "Lagos", "age": 30}))
+            .expect("set");
+        engine
+            .set("users", "d4", &json!({"city": "Accra", "age": 40}))
+            .expect("set");
+
+        let results = engine
+            .find("users", r#"city = "Accra" AND age >= 25"#, None, None, 0)
+            .expect("find should work");
+        assert_eq!(results.len(), 2);
+        for doc in &results {
+            assert_eq!(doc["city"], "Accra");
+            assert!(doc["age"].as_f64().unwrap() >= 25.0);
+        }
+    }
+
+    #[test]
+    fn find_compound_or() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create");
+        engine
+            .create_index("users", "city", IndexType::Hash)
+            .expect("index");
+
+        engine
+            .set("users", "d1", &json!({"city": "Accra"}))
+            .expect("set");
+        engine
+            .set("users", "d2", &json!({"city": "Lagos"}))
+            .expect("set");
+        engine
+            .set("users", "d3", &json!({"city": "Kumasi"}))
+            .expect("set");
+        engine
+            .set("users", "d4", &json!({"city": "Lagos"}))
+            .expect("set");
+
+        let results = engine
+            .find(
+                "users",
+                r#"city = "Accra" OR city = "Lagos""#,
+                None,
+                None,
+                0,
+            )
+            .expect("find should work");
+        assert_eq!(results.len(), 3);
+        for doc in &results {
+            let city = doc["city"].as_str().unwrap();
+            assert!(city == "Accra" || city == "Lagos");
+        }
+    }
+
+    #[test]
+    fn find_with_projection() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create");
+        engine
+            .create_index("users", "city", IndexType::Hash)
+            .expect("index");
+
+        engine
+            .set(
+                "users",
+                "d1",
+                &json!({"name": "Kwame", "city": "Accra", "age": 30}),
+            )
+            .expect("set");
+        engine
+            .set(
+                "users",
+                "d2",
+                &json!({"name": "Ama", "city": "Accra", "age": 25}),
+            )
+            .expect("set");
+
+        let results = engine
+            .find("users", r#"city = "Accra""#, Some(&["name"]), None, 0)
+            .expect("find should work");
+        assert_eq!(results.len(), 2);
+        for doc in &results {
+            assert!(doc.get("name").is_some());
+            assert!(doc.get("city").is_none());
+            assert!(doc.get("age").is_none());
+        }
+    }
+
+    #[test]
+    fn find_with_limit_offset() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create");
+        engine
+            .create_index("users", "active", IndexType::Hash)
+            .expect("index");
+
+        for idx in 0..5 {
+            engine
+                .set(
+                    "users",
+                    &format!("d{idx}"),
+                    &json!({"n": idx, "active": true}),
+                )
+                .expect("set");
+        }
+
+        let results = engine
+            .find("users", "active = true", None, Some(2), 1)
+            .expect("find should work");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn count_query() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create");
+        engine
+            .create_index("users", "city", IndexType::Hash)
+            .expect("index");
+
+        engine
+            .set("users", "d1", &json!({"city": "Accra"}))
+            .expect("set");
+        engine
+            .set("users", "d2", &json!({"city": "Accra"}))
+            .expect("set");
+        engine
+            .set("users", "d3", &json!({"city": "Lagos"}))
+            .expect("set");
+
+        let count = engine
+            .count("users", r#"city = "Accra""#)
+            .expect("count should work");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn find_unindexed_falls_back_to_scan() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create");
+
+        engine
+            .set("users", "d1", &json!({"name": "Kwame", "city": "Accra"}))
+            .expect("set");
+        engine
+            .set("users", "d2", &json!({"name": "Ama", "city": "Kumasi"}))
+            .expect("set");
+        engine
+            .set("users", "d3", &json!({"name": "Kofi", "city": "Accra"}))
+            .expect("set");
+
+        let results = engine
+            .find("users", r#"city = "Accra""#, None, None, 0)
+            .expect("find should work");
+        assert_eq!(results.len(), 2);
+        for doc in &results {
+            assert_eq!(doc["city"], "Accra");
+        }
+    }
+
+    #[test]
+    fn find_empty_result() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create");
+        engine
+            .create_index("users", "city", IndexType::Hash)
+            .expect("index");
+
+        engine
+            .set("users", "d1", &json!({"city": "Accra"}))
+            .expect("set");
+
+        let results = engine
+            .find("users", r#"city = "NonExistent""#, None, None, 0)
+            .expect("find should work");
+        assert!(results.is_empty());
     }
 }
