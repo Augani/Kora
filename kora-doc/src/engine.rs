@@ -9,10 +9,10 @@ use thiserror::Error;
 use crate::collection::{Collection, CollectionConfig, CollectionError, CompressionProfile};
 use crate::decompose::{DecomposeError, Decomposer};
 use crate::dictionary::{ValueDictionary, ValueDictionaryConfig};
-use crate::index::{CollectionIndexes, IndexConfig};
+use crate::index::{hash32, CollectionIndexes, IndexConfig, IndexError, IndexType};
 use crate::packed::PackedDoc;
 use crate::recompose::{RecomposeError, Recomposer};
-use crate::registry::{CollectionId, DocId, IdRegistry, RegistryError};
+use crate::registry::{CollectionId, DocId, FieldId, IdRegistry, RegistryError};
 
 /// Result of a successful `set` operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +142,9 @@ pub enum DocError {
     /// Mutation payload or target path is invalid.
     #[error("invalid document mutation: {0}")]
     InvalidMutation(String),
+    /// Index operation failed.
+    #[error(transparent)]
+    Index(#[from] IndexError),
 }
 
 #[derive(Debug)]
@@ -292,6 +295,93 @@ impl DocEngine {
         })
     }
 
+    /// Create a secondary index on a collection field.
+    ///
+    /// Backfills all existing documents. For `Unique` indexes, if a duplicate
+    /// value is detected during backfill the index is rolled back and an error
+    /// is returned.
+    pub fn create_index(
+        &mut self,
+        collection: &str,
+        field_path: &str,
+        index_type: IndexType,
+    ) -> Result<(), DocError> {
+        let collection_id = self.collection_id(collection)?;
+        let field_id = self
+            .registry
+            .get_or_create_field_id(collection_id, field_path)?;
+
+        let state = self
+            .collections
+            .get_mut(&collection_id)
+            .ok_or_else(|| DocError::UnknownCollection(collection.to_string()))?;
+
+        state.index_config.add(field_id, index_type)?;
+
+        if let Err(err) = Self::backfill_index(
+            &self.registry,
+            &state.dictionary,
+            &state.docs_by_internal_id,
+            &mut state.indexes,
+            collection_id,
+            field_id,
+            field_path,
+            index_type,
+        ) {
+            state.index_config.remove(field_id).ok();
+            state.indexes.remove_field(field_id);
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    /// Remove a secondary index from a collection field.
+    pub fn drop_index(&mut self, collection: &str, field_path: &str) -> Result<(), DocError> {
+        let collection_id = self.collection_id(collection)?;
+        let state = self
+            .collections
+            .get_mut(&collection_id)
+            .ok_or_else(|| DocError::UnknownCollection(collection.to_string()))?;
+
+        let segment = self
+            .registry
+            .segment(collection_id)
+            .ok_or_else(|| DocError::UnknownCollection(collection.to_string()))?;
+
+        let field_id = segment
+            .field_id(field_path)
+            .ok_or(IndexError::NotFound(0))?;
+
+        state.index_config.remove(field_id)?;
+        state.indexes.remove_field(field_id);
+
+        Ok(())
+    }
+
+    /// Return all configured indexes for a collection.
+    pub fn indexes(&self, collection: &str) -> Result<Vec<(String, IndexType)>, DocError> {
+        let collection_id = self.collection_id(collection)?;
+        let state = self
+            .collections
+            .get(&collection_id)
+            .ok_or_else(|| DocError::UnknownCollection(collection.to_string()))?;
+
+        let segment = self
+            .registry
+            .segment(collection_id)
+            .ok_or_else(|| DocError::UnknownCollection(collection.to_string()))?;
+
+        let mut result = Vec::new();
+        for (&field_id, &idx_type) in state.index_config.entries() {
+            if let Some(path) = segment.field_path(field_id) {
+                result.push((path.to_string(), idx_type));
+            }
+        }
+        result.sort_by(|(a, _), (b, _)| a.cmp(b));
+        Ok(result)
+    }
+
     /// Insert or replace one JSON document.
     pub fn set(
         &mut self,
@@ -303,6 +393,42 @@ impl DocEngine {
         let internal_id = self
             .registry
             .get_or_create_doc_internal_id(collection_id, external_doc_id)?;
+
+        let state = self
+            .collections
+            .get_mut(&collection_id)
+            .ok_or_else(|| DocError::UnknownCollection(collection.to_string()))?;
+
+        let is_update = state.docs_by_internal_id.contains_key(&internal_id);
+
+        Self::check_unique_constraints(
+            &self.registry,
+            &state.index_config,
+            &state.indexes,
+            collection_id,
+            internal_id,
+            json,
+        )?;
+
+        if is_update {
+            if let Some(old_packed) = state.docs_by_internal_id.get(&internal_id) {
+                if let Ok(old_json) = Recomposer::recompose(
+                    old_packed,
+                    &self.registry,
+                    &state.dictionary,
+                    collection_id,
+                ) {
+                    Self::remove_index_entries(
+                        &self.registry,
+                        &state.index_config,
+                        &mut state.indexes,
+                        collection_id,
+                        internal_id,
+                        &old_json,
+                    );
+                }
+            }
+        }
 
         let (registry, collections) = (&mut self.registry, &mut self.collections);
         let state = collections
@@ -324,6 +450,15 @@ impl DocEngine {
         if created {
             state.collection.increment_doc_count();
         }
+
+        Self::add_index_entries(
+            &self.registry,
+            &state.index_config,
+            &mut state.indexes,
+            collection_id,
+            internal_id,
+            json,
+        );
 
         Ok(SetResult {
             internal_id,
@@ -437,6 +572,21 @@ impl DocEngine {
             return Ok(false);
         };
 
+        if let Some(packed) = state.docs_by_internal_id.get(&internal_id) {
+            if let Ok(old_json) =
+                Recomposer::recompose(packed, &self.registry, &state.dictionary, collection_id)
+            {
+                Self::remove_index_entries(
+                    &self.registry,
+                    &state.index_config,
+                    &mut state.indexes,
+                    collection_id,
+                    internal_id,
+                    &old_json,
+                );
+            }
+        }
+
         let removed = state.docs_by_internal_id.remove(&internal_id).is_some();
         if removed {
             state.collection.decrement_doc_count();
@@ -476,6 +626,112 @@ impl DocEngine {
             .filter_map(|path| segment.field_id(path))
             .collect()
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn backfill_index(
+        registry: &IdRegistry,
+        dictionary: &ValueDictionary,
+        docs: &HashMap<DocId, PackedDoc>,
+        indexes: &mut CollectionIndexes,
+        collection_id: CollectionId,
+        field_id: FieldId,
+        field_path: &str,
+        index_type: IndexType,
+    ) -> Result<(), DocError> {
+        for (&doc_id, packed) in docs {
+            let json = Recomposer::recompose(packed, registry, dictionary, collection_id)?;
+            if let Some(field_value) = resolve_json_path(&json, field_path) {
+                add_single_field_entry(indexes, field_id, index_type, doc_id, field_value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_unique_constraints(
+        registry: &IdRegistry,
+        index_config: &IndexConfig,
+        indexes: &CollectionIndexes,
+        collection_id: CollectionId,
+        doc_id: DocId,
+        json: &Value,
+    ) -> Result<(), DocError> {
+        let Some(segment) = registry.segment(collection_id) else {
+            return Ok(());
+        };
+
+        for (&field_id, &idx_type) in index_config.entries() {
+            if idx_type != IndexType::Unique {
+                continue;
+            }
+            let Some(path) = segment.field_path(field_id) else {
+                continue;
+            };
+            let Some(field_value) = resolve_json_path(json, path) else {
+                continue;
+            };
+            let hashed = value_to_hash(field_value);
+            let Some(hashed) = hashed else {
+                continue;
+            };
+            if let Some(unique_idx) = indexes.unique(field_id) {
+                if let Some(existing) = unique_idx.lookup(hashed) {
+                    if existing != doc_id {
+                        return Err(DocError::Index(IndexError::UniqueViolation {
+                            hash: hashed,
+                            existing_doc_id: existing,
+                        }));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn add_index_entries(
+        registry: &IdRegistry,
+        index_config: &IndexConfig,
+        indexes: &mut CollectionIndexes,
+        collection_id: CollectionId,
+        doc_id: DocId,
+        json: &Value,
+    ) {
+        let Some(segment) = registry.segment(collection_id) else {
+            return;
+        };
+
+        for (&field_id, &idx_type) in index_config.entries() {
+            let Some(path) = segment.field_path(field_id) else {
+                continue;
+            };
+            let Some(field_value) = resolve_json_path(json, path) else {
+                continue;
+            };
+            let _ = add_single_field_entry(indexes, field_id, idx_type, doc_id, field_value);
+        }
+    }
+
+    fn remove_index_entries(
+        registry: &IdRegistry,
+        index_config: &IndexConfig,
+        indexes: &mut CollectionIndexes,
+        collection_id: CollectionId,
+        doc_id: DocId,
+        json: &Value,
+    ) {
+        let Some(segment) = registry.segment(collection_id) else {
+            return;
+        };
+
+        for (&field_id, &idx_type) in index_config.entries() {
+            let Some(path) = segment.field_path(field_id) else {
+                continue;
+            };
+            let Some(field_value) = resolve_json_path(json, path) else {
+                continue;
+            };
+            remove_single_field_entry(indexes, field_id, idx_type, doc_id, field_value);
+        }
+    }
 }
 
 impl Default for DocEngine {
@@ -489,6 +745,108 @@ fn current_unix_seconds_u32() -> u32 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
     u32::try_from(seconds).unwrap_or(u32::MAX)
+}
+
+fn resolve_json_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = root;
+    for part in path.split('.') {
+        current = current.as_object()?.get(part)?;
+    }
+    Some(current)
+}
+
+fn value_to_hash(value: &Value) -> Option<u32> {
+    match value {
+        Value::String(s) => Some(hash32(s.as_bytes())),
+        Value::Bool(true) => Some(hash32(b"true")),
+        Value::Bool(false) => Some(hash32(b"false")),
+        _ => None,
+    }
+}
+
+fn value_to_score(value: &Value) -> Option<f64> {
+    value.as_f64()
+}
+
+fn add_single_field_entry(
+    indexes: &mut CollectionIndexes,
+    field_id: FieldId,
+    index_type: IndexType,
+    doc_id: DocId,
+    value: &Value,
+) -> Result<(), DocError> {
+    if value.is_null() {
+        return Ok(());
+    }
+
+    match index_type {
+        IndexType::Hash => {
+            if let Some(hashed) = value_to_hash(value) {
+                indexes.get_or_create_hash(field_id).add(hashed, doc_id);
+            }
+        }
+        IndexType::Sorted => {
+            if let Some(score) = value_to_score(value) {
+                indexes.get_or_create_sorted(field_id).add(score, doc_id);
+            }
+        }
+        IndexType::Array => {
+            if let Value::Array(items) = value {
+                let array_idx = indexes.get_or_create_array(field_id);
+                for item in items {
+                    if let Value::String(s) = item {
+                        array_idx.add(hash32(s.as_bytes()), doc_id);
+                    }
+                }
+            }
+        }
+        IndexType::Unique => {
+            if let Some(hashed) = value_to_hash(value) {
+                indexes.get_or_create_unique(field_id).add(hashed, doc_id)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_single_field_entry(
+    indexes: &mut CollectionIndexes,
+    field_id: FieldId,
+    index_type: IndexType,
+    doc_id: DocId,
+    value: &Value,
+) {
+    if value.is_null() {
+        return;
+    }
+
+    match index_type {
+        IndexType::Hash => {
+            if let Some(hashed) = value_to_hash(value) {
+                indexes.get_or_create_hash(field_id).remove(hashed, doc_id);
+            }
+        }
+        IndexType::Sorted => {
+            if let Some(score) = value_to_score(value) {
+                indexes.get_or_create_sorted(field_id).remove(score, doc_id);
+            }
+        }
+        IndexType::Array => {
+            if let Value::Array(items) = value {
+                let array_idx = indexes.get_or_create_array(field_id);
+                for item in items {
+                    if let Value::String(s) = item {
+                        array_idx.remove(hash32(s.as_bytes()), doc_id);
+                    }
+                }
+            }
+        }
+        IndexType::Unique => {
+            if let Some(hashed) = value_to_hash(value) {
+                indexes.get_or_create_unique(field_id).remove(hashed);
+            }
+        }
+    }
 }
 
 fn set_path(root: &mut Value, path: &str, value: Value) -> Result<(), DocError> {
@@ -972,5 +1330,276 @@ mod tests {
             )
             .expect_err("non-numeric increment must fail");
         assert!(matches!(err, DocError::InvalidMutation(_)));
+    }
+
+    #[test]
+    fn create_index_backfills_existing_docs() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create should work");
+
+        engine
+            .set("users", "doc:1", &json!({"city": "Accra"}))
+            .expect("set should work");
+        engine
+            .set("users", "doc:2", &json!({"city": "London"}))
+            .expect("set should work");
+        engine
+            .set("users", "doc:3", &json!({"city": "Accra"}))
+            .expect("set should work");
+
+        engine
+            .create_index("users", "city", IndexType::Hash)
+            .expect("create_index should work");
+
+        let collection_id = engine.collection_id("users").unwrap();
+        let state = engine.collections.get(&collection_id).unwrap();
+        let field_id = engine
+            .registry
+            .segment(collection_id)
+            .unwrap()
+            .field_id("city")
+            .unwrap();
+
+        let hash_idx = state
+            .indexes
+            .hash(field_id)
+            .expect("hash index should exist");
+        let accra_hash = hash32(b"Accra");
+        let london_hash = hash32(b"London");
+        let accra_docs = hash_idx.lookup(accra_hash);
+        let london_docs = hash_idx.lookup(london_hash);
+
+        assert_eq!(accra_docs.len(), 2);
+        assert_eq!(london_docs.len(), 1);
+    }
+
+    #[test]
+    fn index_maintained_on_set() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create should work");
+
+        engine
+            .create_index("users", "city", IndexType::Hash)
+            .expect("create_index should work");
+
+        engine
+            .set("users", "doc:1", &json!({"city": "Accra"}))
+            .expect("set should work");
+        engine
+            .set("users", "doc:2", &json!({"city": "London"}))
+            .expect("set should work");
+
+        let collection_id = engine.collection_id("users").unwrap();
+        let state = engine.collections.get(&collection_id).unwrap();
+        let field_id = engine
+            .registry
+            .segment(collection_id)
+            .unwrap()
+            .field_id("city")
+            .unwrap();
+
+        let hash_idx = state
+            .indexes
+            .hash(field_id)
+            .expect("hash index should exist");
+        assert_eq!(hash_idx.lookup(hash32(b"Accra")).len(), 1);
+        assert_eq!(hash_idx.lookup(hash32(b"London")).len(), 1);
+    }
+
+    #[test]
+    fn index_maintained_on_update() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create should work");
+
+        engine
+            .set("users", "doc:1", &json!({"city": "Accra"}))
+            .expect("set should work");
+
+        engine
+            .create_index("users", "city", IndexType::Hash)
+            .expect("create_index should work");
+
+        engine
+            .update(
+                "users",
+                "doc:1",
+                &[DocMutation::Set {
+                    path: "city".to_string(),
+                    value: json!("London"),
+                }],
+            )
+            .expect("update should work");
+
+        let collection_id = engine.collection_id("users").unwrap();
+        let state = engine.collections.get(&collection_id).unwrap();
+        let field_id = engine
+            .registry
+            .segment(collection_id)
+            .unwrap()
+            .field_id("city")
+            .unwrap();
+
+        let hash_idx = state
+            .indexes
+            .hash(field_id)
+            .expect("hash index should exist");
+        assert!(hash_idx.lookup(hash32(b"Accra")).is_empty());
+        assert_eq!(hash_idx.lookup(hash32(b"London")).len(), 1);
+    }
+
+    #[test]
+    fn index_maintained_on_delete() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create should work");
+
+        engine
+            .set("users", "doc:1", &json!({"city": "Accra"}))
+            .expect("set should work");
+
+        engine
+            .create_index("users", "city", IndexType::Hash)
+            .expect("create_index should work");
+
+        let collection_id = engine.collection_id("users").unwrap();
+        let field_id = engine
+            .registry
+            .segment(collection_id)
+            .unwrap()
+            .field_id("city")
+            .unwrap();
+
+        {
+            let state = engine.collections.get(&collection_id).unwrap();
+            let hash_idx = state
+                .indexes
+                .hash(field_id)
+                .expect("hash index should exist");
+            assert_eq!(hash_idx.lookup(hash32(b"Accra")).len(), 1);
+        }
+
+        engine.del("users", "doc:1").expect("del should work");
+
+        let state = engine.collections.get(&collection_id).unwrap();
+        let hash_idx = state
+            .indexes
+            .hash(field_id)
+            .expect("hash index should exist");
+        assert!(hash_idx.lookup(hash32(b"Accra")).is_empty());
+    }
+
+    #[test]
+    fn unique_constraint_violation_on_set() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create should work");
+
+        engine
+            .create_index("users", "email", IndexType::Unique)
+            .expect("create_index should work");
+
+        engine
+            .set("users", "doc:1", &json!({"email": "alice@example.com"}))
+            .expect("first set should work");
+
+        let err = engine
+            .set("users", "doc:2", &json!({"email": "alice@example.com"}))
+            .expect_err("duplicate unique value must fail");
+
+        assert!(matches!(
+            err,
+            DocError::Index(IndexError::UniqueViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn drop_index_clears_data() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create should work");
+
+        engine
+            .create_index("users", "city", IndexType::Hash)
+            .expect("create_index should work");
+
+        engine
+            .set("users", "doc:1", &json!({"city": "Accra"}))
+            .expect("set should work");
+        engine
+            .set("users", "doc:2", &json!({"city": "London"}))
+            .expect("set should work");
+
+        engine
+            .drop_index("users", "city")
+            .expect("drop_index should work");
+
+        let indexes = engine.indexes("users").expect("indexes should work");
+        assert!(indexes.is_empty());
+
+        let collection_id = engine.collection_id("users").unwrap();
+        let field_id = engine
+            .registry
+            .segment(collection_id)
+            .unwrap()
+            .field_id("city")
+            .unwrap();
+        let state = engine.collections.get(&collection_id).unwrap();
+        assert!(state.indexes.hash(field_id).is_none());
+    }
+
+    #[test]
+    fn sorted_index_range_query_works() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("products", CollectionConfig::default())
+            .expect("create should work");
+
+        engine
+            .create_index("products", "price", IndexType::Sorted)
+            .expect("create_index should work");
+
+        engine
+            .set("products", "p1", &json!({"price": 10.0}))
+            .expect("set should work");
+        engine
+            .set("products", "p2", &json!({"price": 25.0}))
+            .expect("set should work");
+        engine
+            .set("products", "p3", &json!({"price": 50.0}))
+            .expect("set should work");
+        engine
+            .set("products", "p4", &json!({"price": 5.0}))
+            .expect("set should work");
+
+        let collection_id = engine.collection_id("products").unwrap();
+        let field_id = engine
+            .registry
+            .segment(collection_id)
+            .unwrap()
+            .field_id("price")
+            .unwrap();
+        let state = engine.collections.get(&collection_id).unwrap();
+        let sorted_idx = state
+            .indexes
+            .sorted(field_id)
+            .expect("sorted index should exist");
+
+        let range_10_30 = sorted_idx.range_query(10.0, 30.0);
+        assert_eq!(range_10_30.len(), 2);
+
+        let range_all = sorted_idx.range_query(0.0, 100.0);
+        assert_eq!(range_all.len(), 4);
+
+        let range_high = sorted_idx.range_query(40.0, 100.0);
+        assert_eq!(range_high.len(), 1);
     }
 }
