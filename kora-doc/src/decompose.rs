@@ -1,4 +1,23 @@
-//! JSON decomposition into packed document fields.
+//! JSON-to-packed-document decomposition pipeline.
+//!
+//! [`Decomposer`] walks a `serde_json::Value` tree depth-first, flattening
+//! nested objects into dot-separated field paths (e.g., `address.city`). Each
+//! leaf field is:
+//!
+//! 1. Assigned a compact [`FieldId`](crate::registry::FieldId) via the
+//!    [`IdRegistry`](crate::registry::IdRegistry), creating the mapping on
+//!    first encounter.
+//! 2. Optionally dictionary-encoded through the collection's
+//!    [`ValueDictionary`](crate::dictionary::ValueDictionary) when the field's
+//!    observed cardinality is low and the value meets the minimum length
+//!    threshold.
+//! 3. Emitted as a [`FieldValue`](crate::packed::FieldValue) into a
+//!    [`PackedDocBuilder`](crate::packed::PackedDocBuilder).
+//!
+//! Arrays and empty objects are stored as opaque JSON byte payloads
+//! (`FieldValue::ArrayBytes`) to preserve exact round-trip fidelity. Field
+//! names containing dots are rejected because dots serve as the path
+//! separator in the flattened schema.
 
 use serde_json::Value;
 use thiserror::Error;

@@ -1,12 +1,44 @@
 //! # kora-doc
 //!
-//! Foundation components for Kora's document layer.
+//! Document layer that turns Kora from a key-value cache engine into a
+//! JSON-native document database. Documents are stored in a compact binary
+//! packed format, queried via a WHERE expression parser, and indexed through
+//! four secondary index types (hash, sorted, array, unique).
 //!
-//! This initial implementation provides:
-//! - Packed document encoding/decoding primitives
-//! - ID registry primitives for collection/field/document IDs
-//! - Dictionary encoding primitives for low-cardinality string values
-//! - Core collection and document CRUD engine primitives
+//! ## Architecture
+//!
+//! A JSON document passes through a pipeline of transformations before it
+//! reaches storage:
+//!
+//! 1. **Decomposition** ([`decompose`]) -- a JSON object is recursively walked,
+//!    each leaf field is assigned a numeric [`FieldId`](registry::FieldId) via
+//!    the [`IdRegistry`](registry::IdRegistry), string values are
+//!    dictionary-encoded when their field cardinality is low, and the result is
+//!    assembled into a [`PackedDoc`](packed::PackedDoc).
+//!
+//! 2. **Packed encoding** ([`packed`]) -- fields are stored in a flat binary
+//!    buffer with an offset table sorted by field ID, enabling O(log F)
+//!    single-field reads via binary search.
+//!
+//! 3. **Recomposition** ([`recompose`]) -- the inverse of decomposition,
+//!    rebuilding a `serde_json::Value` from packed bytes, dictionary lookups,
+//!    and registry path resolution. Supports full reconstruction or
+//!    field-level projection.
+//!
+//! ## Key Modules
+//!
+//! | Module | Purpose |
+//! |---|---|
+//! | [`packed`] | Binary packed document format and builder |
+//! | [`registry`] | Integer-keyed ID mapping for collections, fields, and docs |
+//! | [`dictionary`] | Dictionary encoding for low-cardinality string values |
+//! | [`decompose`] | JSON to packed document conversion |
+//! | [`recompose`] | Packed document to JSON reconstruction |
+//! | [`engine`] | Collection CRUD, index maintenance, and query execution |
+//! | [`expr`] | WHERE clause recursive-descent parser |
+//! | [`index`] | Hash, sorted, array, and unique secondary indexes |
+//! | [`collection`] | Collection metadata and configuration |
+//! | [`key`] | Binary key encoding for storage and index records |
 
 #![warn(clippy::all)]
 #![warn(missing_docs)]

@@ -1,4 +1,14 @@
 //! Collection metadata and configuration.
+//!
+//! Every document belongs to exactly one collection. A [`Collection`] record
+//! stores the collection's name, its compact [`CollectionId`], the creation
+//! timestamp, the chosen [`CompressionProfile`], and a running document count
+//! that is maintained by the engine on each insert or delete.
+//!
+//! [`CollectionConfig`] is the user-facing input when creating a collection;
+//! it currently controls only the compression profile, but is designed to
+//! absorb future per-collection tuning knobs (e.g., index defaults, TTL
+//! policies) without breaking the public API.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

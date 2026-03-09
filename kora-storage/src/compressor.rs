@@ -1,7 +1,13 @@
 //! LZ4 compression for cold-tier storage.
 //!
-//! Provides transparent compression and decompression of values
-//! that have been demoted to the cold storage tier.
+//! Wraps `lz4_flex` to provide transparent compression and decompression of
+//! values that have been demoted to the cold storage tier. The compressed
+//! representation prepends the original size so decompression can allocate
+//! the output buffer in a single pass.
+//!
+//! LZ4 was chosen for its decompression speed — cold-tier reads are latency-
+//! sensitive since they serve cache misses, and LZ4 decompresses at memory-
+//! bandwidth speeds while still achieving meaningful size reduction.
 
 use crate::error::{Result, StorageError};
 

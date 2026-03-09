@@ -1,7 +1,19 @@
-//! HNSW (Hierarchical Navigable Small World) index.
+//! HNSW (Hierarchical Navigable Small World) graph index.
 //!
-//! A graph-based approximate nearest neighbor (ANN) index that provides
-//! logarithmic search time with high recall.
+//! Implements the algorithm from Malkov & Yashunin (2018) for approximate
+//! nearest neighbor search with logarithmic query time and high recall.
+//!
+//! Key design decisions:
+//!
+//! - **Single-owner, no locking.** The index is meant to live inside one Kōra
+//!   shard worker and is accessed through `&mut self` / `&self`. No interior
+//!   mutability or atomics are needed.
+//! - **Lazy deletion.** [`HnswIndex::delete`] marks nodes as deleted without
+//!   removing them from the graph, keeping neighbour connectivity intact and
+//!   avoiding expensive edge repair.
+//! - **Deterministic level generation.** A simple xorshift64 PRNG seeded at
+//!   construction produces reproducible layer assignments, which simplifies
+//!   testing and benchmarking.
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -11,25 +23,15 @@ use crate::distance::DistanceMetric;
 
 /// An HNSW index for approximate nearest neighbor search.
 pub struct HnswIndex {
-    /// Dimensionality of vectors.
     dim: usize,
-    /// Distance metric.
     metric: DistanceMetric,
-    /// Maximum number of connections per node per layer.
     m: usize,
-    /// Maximum connections for layer 0 (typically 2*m).
     m_max0: usize,
-    /// Size of dynamic candidate list during construction.
     ef_construction: usize,
-    /// Inverse of the log of the level multiplier.
     ml: f64,
-    /// All nodes in the index.
     nodes: HashMap<u64, Node>,
-    /// Entry point node ID.
     entry_point: Option<u64>,
-    /// Maximum layer in the graph.
     max_layer: usize,
-    /// RNG seed for level generation.
     rng_state: u64,
 }
 
@@ -37,7 +39,8 @@ struct Node {
     id: u64,
     vector: Vec<f32>,
     layer: usize,
-    neighbors: Vec<Vec<u64>>, // neighbors[level] = list of neighbor IDs
+    /// Per-layer neighbour lists, indexed by layer number.
+    neighbors: Vec<Vec<u64>>,
     deleted: bool,
 }
 
@@ -50,13 +53,12 @@ pub struct SearchResult {
     pub distance: f32,
 }
 
-// Min-heap item (for nearest neighbors)
 #[derive(PartialEq, Eq)]
 struct MinItem(OrderedFloat<f32>, u64);
 
 impl Ord for MinItem {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.0.cmp(&self.0) // reversed for min-heap
+        other.0.cmp(&self.0)
     }
 }
 impl PartialOrd for MinItem {
@@ -65,7 +67,6 @@ impl PartialOrd for MinItem {
     }
 }
 
-// Max-heap item (for farthest neighbors)
 #[derive(PartialEq, Eq)]
 struct MaxItem(OrderedFloat<f32>, u64);
 
@@ -134,7 +135,6 @@ impl HnswIndex {
             vector.len()
         );
 
-        // Remove old version if exists
         if self.nodes.contains_key(&id) {
             self.delete(id);
         }
@@ -168,7 +168,6 @@ impl HnswIndex {
             None => return,
         };
 
-        // Phase 1: Greedily traverse layers above the new node's level
         let mut current_ep = ep;
         let query = &self.nodes[&id].vector.clone();
 
@@ -176,7 +175,6 @@ impl HnswIndex {
             current_ep = self.greedy_closest(query, current_ep, lc);
         }
 
-        // Phase 2: Insert at each layer from min(level, max_layer) down to 0
         let insert_top = level.min(self.max_layer);
         let mut ep_set = vec![current_ep];
 
@@ -185,14 +183,12 @@ impl HnswIndex {
 
             let candidates = self.search_layer(query, &ep_set, self.ef_construction, lc);
 
-            // Select M nearest neighbors
             let selected: Vec<u64> = candidates.iter().take(m_max).map(|&(_, nid)| nid).collect();
 
             if let Some(node) = self.nodes.get_mut(&id) {
                 node.neighbors[lc] = selected.clone();
             }
 
-            // Connect neighbors back to new node (bidirectional)
             for &neighbor_id in &selected {
                 let needs_prune = {
                     let Some(neighbor) = self.nodes.get_mut(&neighbor_id) else {
@@ -207,7 +203,6 @@ impl HnswIndex {
                 };
 
                 if needs_prune {
-                    // Collect data needed for scoring without holding a mutable borrow
                     let nv = self.nodes[&neighbor_id].vector.clone();
                     let neighbor_ids: Vec<u64> = self.nodes[&neighbor_id].neighbors[lc].clone();
                     let mut scored: Vec<(f32, u64)> = neighbor_ids
@@ -229,7 +224,6 @@ impl HnswIndex {
             ep_set = candidates.iter().map(|&(_, nid)| nid).collect();
         }
 
-        // Update entry point if new node has higher level
         if level > self.max_layer {
             self.entry_point = Some(id);
             self.max_layer = level;
@@ -242,7 +236,6 @@ impl HnswIndex {
             node.deleted = true;
         }
 
-        // If this was the entry point, find a new one
         if self.entry_point == Some(id) {
             self.entry_point = self
                 .nodes
@@ -271,17 +264,14 @@ impl HnswIndex {
             _ => return vec![],
         };
 
-        // Phase 1: Greedy descent from top layer
         let mut current_ep = ep;
         for lc in (1..=self.max_layer).rev() {
             current_ep = self.greedy_closest(query, current_ep, lc);
         }
 
-        // Phase 2: Search layer 0 with ef candidates
         let ef = ef.max(k);
         let candidates = self.search_layer(query, &[current_ep], ef, 0);
 
-        // Return top-k, filtering deleted nodes
         candidates
             .into_iter()
             .filter(|&(_, id)| !self.nodes[&id].deleted)
@@ -295,10 +285,7 @@ impl HnswIndex {
         self.nodes.get(&id).is_some_and(|n| !n.deleted)
     }
 
-    // ─── Internal ───────────────────────────────────────────────────
-
     fn random_level(&mut self) -> usize {
-        // Simple xorshift64
         self.rng_state ^= self.rng_state << 13;
         self.rng_state ^= self.rng_state >> 7;
         self.rng_state ^= self.rng_state << 17;
@@ -332,7 +319,6 @@ impl HnswIndex {
         ep
     }
 
-    /// Search a single layer, returning sorted (distance, id) pairs.
     fn search_layer(
         &self,
         query: &[f32],

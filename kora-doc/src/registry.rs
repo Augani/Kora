@@ -1,4 +1,28 @@
-//! ID registry primitives for document collections, fields, and document IDs.
+//! Integer-keyed ID registry for collections, fields, and documents.
+//!
+//! The document layer works exclusively with compact numeric identifiers
+//! internally -- [`CollectionId`] (`u16`), [`FieldId`] (`u16`), and
+//! [`DocId`] (`u32`). The [`IdRegistry`] is the single source of truth for
+//! mapping between human-readable names/paths and these numeric IDs.
+//!
+//! ## Two-Level Structure
+//!
+//! - **Global directory** -- maps collection names to `CollectionId` values
+//!   and owns a [`RegistrySegment`] per collection.
+//! - **Per-collection segment** ([`RegistrySegment`]) -- manages bidirectional
+//!   mappings between dotted field paths and `FieldId`, and between external
+//!   document ID strings and internal `DocId` values.
+//!
+//! All IDs are allocated monotonically and never reused. Lookups are O(1)
+//! hash-map operations; creation is idempotent (returning the existing ID if
+//! the name/path was already registered).
+//!
+//! ## Segment References
+//!
+//! Each collection also carries a [`RegistrySegmentRef`] tuple `(shard, key)`
+//! that records where the segment's persistent representation lives in the
+//! shard-affinity storage layer. This pointer is opaque to the registry
+//! itself and managed by the engine.
 
 use std::collections::HashMap;
 

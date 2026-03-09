@@ -1,35 +1,46 @@
-//! CDC consumer groups with ack tracking and redelivery.
+//! CDC consumer groups with acknowledgement tracking and redelivery.
 //!
-//! Modeled after Redis Streams consumer groups (XGROUP, XREADGROUP, XACK, XPENDING).
-//! Each consumer group maintains independent cursors per consumer, tracks pending
-//! (delivered but unacknowledged) entries, and supports timeout-based redelivery.
+//! A [`ConsumerGroup`] coordinates multiple named consumers reading from the
+//! same [`CdcRing`](crate::ring::CdcRing). Each consumer maintains its own
+//! cursor and a pending-entry list. Events are delivered at-least-once:
+//! delivered entries remain pending until explicitly acknowledged, and entries
+//! that exceed a configurable idle timeout become reclaimable by other
+//! consumers via the [`claim`](ConsumerGroupManager::claim) operation.
+//!
+//! The [`ConsumerGroupManager`] owns all groups for a single ring and
+//! exposes the full lifecycle: group creation, consumer reads, acknowledgement,
+//! pending-entry inspection, ownership transfer, and gap detection.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::ring::{CdcEvent, CdcRing};
 
-/// A pending entry that has been delivered but not yet acknowledged.
+/// An event that has been delivered to a consumer but not yet acknowledged.
+///
+/// Tracks delivery metadata so the system can detect stalled consumers
+/// and redeliver entries that have exceeded the idle timeout.
 #[derive(Debug, Clone)]
 pub struct PendingEntry {
-    /// The sequence number of the event.
+    /// Sequence number of the underlying [`CdcEvent`](crate::ring::CdcEvent).
     pub event_seq: u64,
-    /// Number of times this entry has been delivered.
+    /// How many times this entry has been delivered (initial + redeliveries).
     pub delivery_count: u32,
-    /// When this entry was first delivered.
+    /// Instant of the very first delivery attempt.
     pub first_delivery: Instant,
-    /// When this entry was last delivered.
+    /// Instant of the most recent delivery attempt.
     pub last_delivery: Instant,
 }
 
-/// Per-consumer state within a group.
+/// Mutable state for one consumer within a [`ConsumerGroup`].
 #[derive(Debug)]
 pub struct ConsumerState {
-    /// Last acknowledged sequence number.
+    /// Highest sequence number that has been acknowledged.
     pub last_acked_seq: u64,
-    /// Entries delivered but not yet acknowledged, keyed by sequence.
+    /// Ordered queue of entries delivered but not yet acknowledged.
     pub pending: VecDeque<PendingEntry>,
-    /// Whether this consumer has fallen behind the ring buffer.
+    /// Set to `true` when a gap is detected, indicating the consumer
+    /// missed events and may need to reconcile externally.
     pub needs_resync: bool,
 }
 
@@ -43,21 +54,25 @@ impl ConsumerState {
     }
 }
 
-/// A named consumer group tracking multiple consumers.
+/// A named group of consumers sharing a single CDC stream.
+///
+/// The group maintains a high-watermark (`last_delivered_seq`) so that
+/// each new read delivers only events that no consumer in the group has
+/// seen yet. Individual consumer state is tracked in [`ConsumerState`].
 #[derive(Debug)]
 pub struct ConsumerGroup {
-    /// Group name.
+    /// Human-readable group name.
     pub name: String,
-    /// Per-consumer tracking state.
+    /// Per-consumer tracking state, keyed by consumer name.
     pub consumers: HashMap<String, ConsumerState>,
-    /// The group-level last delivered sequence (high watermark).
+    /// Next sequence to deliver (high watermark for the group).
     pub last_delivered_seq: u64,
-    /// Idle timeout after which pending entries become reclaimable.
+    /// Duration after which an unacknowledged entry becomes reclaimable.
     pub idle_timeout: Duration,
 }
 
 impl ConsumerGroup {
-    /// Create a new consumer group starting at the given sequence.
+    /// Create a consumer group that begins reading at `start_seq`.
     pub fn new(name: String, start_seq: u64, idle_timeout: Duration) -> Self {
         Self {
             name,
@@ -68,50 +83,56 @@ impl ConsumerGroup {
     }
 }
 
-/// Result of a group read operation.
+/// Outcome of a [`ConsumerGroupManager::read_group`] call.
 #[derive(Debug)]
 pub struct GroupReadResult {
-    /// Events delivered to the consumer.
+    /// Events delivered to the consumer in this batch.
     pub events: Vec<CdcEvent>,
-    /// Whether a gap was detected (consumer fell behind ring buffer).
+    /// `true` when the ring evicted events before they could be delivered,
+    /// indicating the consumer has fallen behind.
     pub gap: bool,
 }
 
-/// Summary of a single pending entry for the PENDING command.
+/// Snapshot of a single pending entry, used for inspection.
 #[derive(Debug, Clone)]
 pub struct PendingSummary {
-    /// Sequence number.
+    /// Sequence number of the pending event.
     pub seq: u64,
-    /// Consumer that owns this entry.
+    /// Name of the consumer that currently owns this entry.
     pub consumer: String,
-    /// Milliseconds since first delivery.
+    /// Milliseconds elapsed since the most recent delivery.
     pub idle_ms: u64,
-    /// Number of delivery attempts.
+    /// Total number of delivery attempts.
     pub delivery_count: u32,
 }
 
-/// Error type for consumer group operations.
+/// Errors returned by [`ConsumerGroupManager`] operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ConsumerGroupError {
-    /// The named group already exists.
+    /// Attempted to create a group whose name is already taken.
     #[error("BUSYGROUP consumer group name already exists")]
     GroupExists,
-    /// The named group was not found.
+    /// Referenced a group name that does not exist.
     #[error("NOGROUP no such consumer group '{0}'")]
     NoGroup(String),
-    /// The ring buffer is not available.
+    /// The backing CDC ring buffer is unavailable.
     #[error("ERR CDC ring not available")]
     NoRing,
 }
 
-/// Manages multiple consumer groups for a single CDC ring.
+/// Owns all consumer groups for a single CDC ring.
+///
+/// Provides the full group lifecycle: creation, per-consumer reads,
+/// acknowledgement, pending-entry inspection, ownership transfer (claim),
+/// and gap detection.
 pub struct ConsumerGroupManager {
     groups: HashMap<String, ConsumerGroup>,
     default_idle_timeout: Duration,
 }
 
 impl ConsumerGroupManager {
-    /// Create a new manager with the given default idle timeout.
+    /// Create a manager whose newly created groups use `default_idle_timeout`
+    /// for pending-entry redelivery.
     pub fn new(default_idle_timeout: Duration) -> Self {
         Self {
             groups: HashMap::new(),
@@ -119,7 +140,9 @@ impl ConsumerGroupManager {
         }
     }
 
-    /// Create a new consumer group starting at the given sequence.
+    /// Create a consumer group that begins delivering events at `start_seq`.
+    ///
+    /// Returns [`ConsumerGroupError::GroupExists`] if `name` is already taken.
     pub fn create_group(&mut self, name: &str, start_seq: u64) -> Result<(), ConsumerGroupError> {
         if self.groups.contains_key(name) {
             return Err(ConsumerGroupError::GroupExists);
@@ -131,10 +154,11 @@ impl ConsumerGroupManager {
         Ok(())
     }
 
-    /// Read the next `count` undelivered events for a consumer in a group.
+    /// Deliver up to `count` events to `consumer_name` within `group_name`.
     ///
-    /// New events are read from the ring starting at the group's last delivered
-    /// sequence. Timed-out pending entries from other consumers are also redelivered.
+    /// Before reading fresh events from the ring, timed-out pending entries
+    /// owned by *other* consumers are reclaimed and delivered first. The
+    /// consumer is auto-created if it does not already exist.
     pub fn read_group(
         &mut self,
         ring: &CdcRing,
@@ -213,9 +237,10 @@ impl ConsumerGroupManager {
         })
     }
 
-    /// Acknowledge events, removing them from the consumer's pending list.
+    /// Acknowledge one or more events by sequence number.
     ///
-    /// Returns the number of entries actually acknowledged.
+    /// Acknowledged entries are removed from every consumer's pending list
+    /// within the group. Returns the total number of entries removed.
     pub fn ack(&mut self, group_name: &str, seqs: &[u64]) -> Result<usize, ConsumerGroupError> {
         let group = self
             .groups
@@ -239,7 +264,8 @@ impl ConsumerGroupManager {
         Ok(acked)
     }
 
-    /// List all pending entries across all consumers in a group.
+    /// Return a snapshot of every pending entry across all consumers in the group,
+    /// sorted by sequence number.
     pub fn pending(&self, group_name: &str) -> Result<Vec<PendingSummary>, ConsumerGroupError> {
         let group = self
             .groups
@@ -265,10 +291,10 @@ impl ConsumerGroupManager {
         Ok(result)
     }
 
-    /// Transfer pending entries to another consumer (claim).
+    /// Transfer ownership of pending entries to `target_consumer`.
     ///
-    /// Only entries idle for at least `min_idle` are transferred.
-    /// Returns the sequences that were actually claimed.
+    /// Only entries whose idle time meets or exceeds `min_idle` are
+    /// transferred. Returns the sequence numbers that were claimed.
     pub fn claim(
         &mut self,
         group_name: &str,
@@ -326,17 +352,20 @@ impl ConsumerGroupManager {
         Ok(claimed_seqs)
     }
 
-    /// Check if a group exists.
+    /// Return `true` if a group with the given name exists.
     pub fn has_group(&self, name: &str) -> bool {
         self.groups.contains_key(name)
     }
 
-    /// Get the number of groups.
+    /// Return the number of registered groups.
     pub fn group_count(&self) -> usize {
         self.groups.len()
     }
 
-    /// Check gap detection: returns true if consumer has fallen behind the ring.
+    /// Check whether `consumer_name` in `group_name` has fallen behind the ring.
+    ///
+    /// Returns `true` if the consumer's last acknowledged sequence has been
+    /// evicted from the ring, or if the consumer was already marked for resync.
     pub fn check_gap(
         &mut self,
         ring: &CdcRing,

@@ -1,4 +1,13 @@
 //! Distance metrics for vector similarity search.
+//!
+//! All metrics are normalised so that *lower values mean more similar vectors*.
+//! Cosine distance is `1 - cosine_similarity`, and inner-product distance is
+//! the negated dot product, so a standard min-distance search always selects the
+//! best match regardless of which metric is chosen.
+//!
+//! Implementations are scalar loops today; SIMD intrinsics can be dropped in
+//! behind the same [`DistanceMetric::distance`] interface when profiling
+//! warrants it.
 
 /// Supported distance metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

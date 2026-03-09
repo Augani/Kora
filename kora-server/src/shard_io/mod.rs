@@ -1,6 +1,22 @@
+//! Shard-affinity I/O engine for the Kōra server.
+//!
+//! This module implements a shared-nothing threading architecture where each shard
+//! worker thread runs its own single-threaded tokio runtime and owns both its data
+//! (`ShardStore`) and its connection I/O. Store access is lock-free via
+//! `Rc<RefCell<>>`, and cross-shard communication uses `tokio::sync::mpsc` channels
+//! with `oneshot` response channels.
+//!
+//! Each worker creates its own `SO_REUSEPORT` TCP listener so the kernel distributes
+//! incoming connections across shard threads without a dedicated accept thread.
+//!
+//! ## Submodules
+//!
+//! - [`connection`] — RESP protocol connection handler with pipeline batching.
+//! - [`dispatch`] — Cross-shard fan-out for multi-key and broadcast commands.
+//! - [`stage_metrics`] — Per-stage latency histograms for batch processing.
+
 pub(crate) mod connection;
 pub(crate) mod dispatch;
-pub(crate) mod memcache;
 pub(crate) mod stage_metrics;
 
 use std::cell::RefCell;
@@ -16,13 +32,11 @@ use kora_cdc::ring::CdcRing;
 use kora_core::command::{Command, CommandResponse};
 use kora_core::hash::shard_for_key;
 use kora_core::shard::{command_to_wal_record, ShardStore, WalWriter};
-use kora_core::tenant::{TenantConfig, TenantId, TenantRegistry};
 use kora_core::types::Value;
 use kora_doc::DocEngine;
 use kora_observability::histogram::CommandHistograms;
-use kora_protocol::{MemcacheResponse, MemcacheStoreMode};
 use kora_pubsub::PubSubBroker;
-use kora_scripting::{FunctionRegistry, WasmRuntime};
+
 use kora_storage::manager::StorageConfig;
 use kora_storage::rdb::{self, RdbEntry, RdbValue};
 use parking_lot::Mutex;
@@ -30,27 +44,26 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use self::stage_metrics::{format_stage_metrics_prometheus, BatchStage, BatchStageMetrics};
 
+/// Maximum time to wait for a cross-shard request before returning an error.
 pub(crate) const CROSS_SHARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 type BatchStreamResponse = (u64, Instant, Vec<(usize, CommandResponse)>);
 
-#[allow(dead_code)]
+/// A request sent to a shard worker thread over its unbounded channel.
 pub(crate) enum ShardRequest {
+    /// Execute a single RESP command and return the response.
     Execute {
         command: Command,
         queued_at: Instant,
         response_tx: oneshot::Sender<CommandResponse>,
     },
-    ExecuteMemcache {
-        request: MemcacheRequest,
-        queued_at: Instant,
-        response_tx: oneshot::Sender<MemcacheResponse>,
-    },
+    /// Execute a batch of pipelined commands for a single connection flush.
     ExecuteBatchStream {
         commands: Vec<(usize, Command)>,
         queued_at: Instant,
         flush_id: u64,
         response_tx: mpsc::UnboundedSender<BatchStreamResponse>,
     },
+    /// Produce an RDB snapshot on this shard's data.
     BgSave {
         request: SnapshotRequest,
         queued_at: Instant,
@@ -58,6 +71,7 @@ pub(crate) enum ShardRequest {
     },
 }
 
+/// Parameters for an RDB snapshot operation.
 #[derive(Debug, Clone)]
 pub(crate) struct SnapshotRequest {
     pub data_dir: PathBuf,
@@ -66,48 +80,7 @@ pub(crate) struct SnapshotRequest {
     pub retain_backups: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) enum MemcacheRequest {
-    Get {
-        key: Vec<u8>,
-    },
-    Store {
-        mode: MemcacheStoreMode,
-        key: Vec<u8>,
-        flags: u32,
-        ttl_seconds: Option<u64>,
-        value: Vec<u8>,
-    },
-    Delete {
-        key: Vec<u8>,
-    },
-    Incr {
-        key: Vec<u8>,
-        value: u64,
-    },
-    Decr {
-        key: Vec<u8>,
-        value: u64,
-    },
-    Touch {
-        key: Vec<u8>,
-        ttl_seconds: Option<u64>,
-    },
-}
-
-impl MemcacheRequest {
-    fn key(&self) -> &[u8] {
-        match self {
-            MemcacheRequest::Get { key }
-            | MemcacheRequest::Delete { key }
-            | MemcacheRequest::Incr { key, .. }
-            | MemcacheRequest::Decr { key, .. }
-            | MemcacheRequest::Touch { key, .. }
-            | MemcacheRequest::Store { key, .. } => key,
-        }
-    }
-}
-
+/// Routes commands to the correct shard worker via per-shard unbounded channels.
 #[derive(Clone)]
 pub(crate) struct ShardRouter {
     pub(crate) shard_senders: Arc<[mpsc::UnboundedSender<ShardRequest>]>,
@@ -115,34 +88,17 @@ pub(crate) struct ShardRouter {
 }
 
 impl ShardRouter {
+    /// Returns the shard index that owns the given key.
     pub fn shard_for_key(&self, key: &[u8]) -> u16 {
         shard_for_key(key, self.shard_count)
     }
 
+    /// Returns the total number of shards.
     pub fn shard_count(&self) -> usize {
         self.shard_count
     }
 
-    #[allow(dead_code)]
-    pub async fn dispatch_foreign(&self, shard_id: u16, cmd: Command) -> CommandResponse {
-        let (tx, rx) = oneshot::channel();
-        if self.shard_senders[shard_id as usize]
-            .send(ShardRequest::Execute {
-                command: cmd,
-                queued_at: Instant::now(),
-                response_tx: tx,
-            })
-            .is_err()
-        {
-            return CommandResponse::Error("ERR shard unavailable".into());
-        }
-        match tokio::time::timeout(CROSS_SHARD_TIMEOUT, rx).await {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(_)) => CommandResponse::Error("ERR shard channel closed".into()),
-            Err(_) => CommandResponse::Error("ERR shard request timeout".into()),
-        }
-    }
-
+    /// Sends a command to a foreign shard, returning the response receiver without blocking.
     pub fn try_dispatch_foreign(
         &self,
         shard_id: u16,
@@ -159,6 +115,7 @@ impl ShardRouter {
         Ok(rx)
     }
 
+    /// Sends a batch of commands to a foreign shard for streamed response delivery.
     pub fn try_dispatch_foreign_batch_stream(
         &self,
         shard_id: u16,
@@ -176,6 +133,7 @@ impl ShardRouter {
             .map_err(|_| CommandResponse::Error("ERR shard unavailable".into()))
     }
 
+    /// Broadcasts a command to all shards except `exclude_shard`, returning response receivers.
     pub fn try_dispatch_foreign_broadcast<F>(
         &self,
         exclude_shard: u16,
@@ -200,6 +158,7 @@ impl ShardRouter {
         receivers
     }
 
+    /// Broadcasts a command to all shards and collects every response.
     pub async fn dispatch_broadcast<F>(&self, cmd_factory: F) -> Vec<CommandResponse>
     where
         F: Fn() -> Command,
@@ -225,28 +184,23 @@ impl ShardRouter {
     }
 }
 
+/// State shared across all shard workers via `Arc`.
+///
+/// Contains cross-cutting concerns that cannot be shard-local: pub/sub broker,
+/// CDC rings, observability, and authentication.
 pub(crate) struct AffinitySharedState {
     pub pub_sub: PubSubBroker,
     pub cdc_rings: Vec<Mutex<CdcRing>>,
     pub cdc_groups: Mutex<ConsumerGroupManager>,
     pub doc_engine: Mutex<DocEngine>,
-    pub scripts: Mutex<Option<FunctionRegistry>>,
+
     pub histograms: Arc<CommandHistograms>,
     pub track_latency: AtomicBool,
     pub latency_sums_ns: Arc<[AtomicU64; 32]>,
     pub batch_stage_metrics: Arc<BatchStageMetrics>,
-    pub tenants: TenantRegistry,
     pub auth_password: Option<String>,
-    pub tenant_limits_enabled: bool,
     pub storage_config: Option<StorageConfig>,
-    pub memcached_bind_address: Option<String>,
-    pub started_at: Instant,
-    pub memcache_total_connections: AtomicU64,
-    pub memcache_current_connections: AtomicUsize,
-    pub memcache_cmd_get: AtomicU64,
-    pub memcache_cmd_set: AtomicU64,
-    pub memcache_get_hits: AtomicU64,
-    pub memcache_get_misses: AtomicU64,
+
     pub snapshot_in_progress: AtomicBool,
     pub next_conn_id: AtomicU64,
     pub router: ShardRouter,
@@ -254,6 +208,7 @@ pub(crate) struct AffinitySharedState {
     pub conn_counts: Arc<[AtomicUsize]>,
 }
 
+/// The shard-affinity I/O engine that owns shard worker threads and the shutdown signal.
 pub(crate) struct ShardIoEngine {
     pub shared: Arc<AffinitySharedState>,
     shutdown_tx: watch::Sender<bool>,
@@ -263,18 +218,17 @@ pub(crate) struct ShardIoEngine {
 }
 
 impl ShardIoEngine {
+    /// Creates a new engine, spawning one shard worker thread per shard.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         shard_count: usize,
         wal_writers: Vec<Option<Box<dyn WalWriter>>>,
         cdc_capacity: usize,
-        script_max_fuel: u64,
+
         metrics_port: u16,
         auth_password: Option<String>,
-        tenant_limits_enabled: bool,
         storage_config: Option<StorageConfig>,
         bind_address: String,
-        memcached_bind_address: Option<String>,
         unix_socket: Option<PathBuf>,
     ) -> Self {
         assert_eq!(wal_writers.len(), shard_count);
@@ -306,19 +260,9 @@ impl ShardIoEngine {
             Vec::new()
         };
 
-        let scripts = if script_max_fuel > 0 {
-            let runtime = Arc::new(WasmRuntime::new(script_max_fuel));
-            Mutex::new(Some(FunctionRegistry::new(runtime)))
-        } else {
-            Mutex::new(None)
-        };
-
         let histograms = Arc::new(CommandHistograms::new());
         let latency_sums_ns = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
         let batch_stage_metrics = Arc::new(BatchStageMetrics::new(metrics_port > 0));
-
-        let mut tenant_reg = TenantRegistry::new();
-        tenant_reg.register(TenantId(0), TenantConfig::default());
 
         let pub_sub = PubSubBroker::new(shard_count);
 
@@ -327,23 +271,12 @@ impl ShardIoEngine {
             cdc_rings,
             cdc_groups: Mutex::new(ConsumerGroupManager::default()),
             doc_engine: Mutex::new(DocEngine::new()),
-            scripts,
             histograms,
             track_latency: AtomicBool::new(metrics_port > 0),
             latency_sums_ns,
             batch_stage_metrics,
-            tenants: tenant_reg,
             auth_password,
-            tenant_limits_enabled,
             storage_config,
-            memcached_bind_address,
-            started_at: Instant::now(),
-            memcache_total_connections: AtomicU64::new(0),
-            memcache_current_connections: AtomicUsize::new(0),
-            memcache_cmd_get: AtomicU64::new(0),
-            memcache_cmd_set: AtomicU64::new(0),
-            memcache_get_hits: AtomicU64::new(0),
-            memcache_get_misses: AtomicU64::new(0),
             snapshot_in_progress: AtomicBool::new(false),
             next_conn_id: AtomicU64::new(1),
             router: router.clone(),
@@ -361,7 +294,6 @@ impl ShardIoEngine {
             let conn_counts = conn_counts.clone();
             let shutdown_rx = shutdown_rx.clone();
             let bind_addr = bind_address.clone();
-            let memcached_bind_addr = shared.memcached_bind_address.clone();
             let unix_path = if i == 0 { unix_socket.clone() } else { None };
 
             let handle = thread::Builder::new()
@@ -386,7 +318,6 @@ impl ShardIoEngine {
                             conn_counts,
                             shutdown_rx,
                             &bind_addr,
-                            memcached_bind_addr.as_deref(),
                             unix_path.as_ref(),
                         )
                         .await;
@@ -406,6 +337,7 @@ impl ShardIoEngine {
         }
     }
 
+    /// Runs the engine until the shutdown signal fires, then joins all worker threads.
     pub async fn run(&self, mut shutdown: watch::Receiver<bool>) -> std::io::Result<()> {
         if self.metrics_port > 0 {
             let shared = self.shared.clone();
@@ -512,53 +444,6 @@ fn spawn_connection_handler<
     });
 }
 
-fn spawn_memcache_connection_handler<
-    S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin + 'static,
->(
-    stream: S,
-    shard_id: u16,
-    store: &Rc<RefCell<ShardStore>>,
-    wal_writer: &Rc<RefCell<Option<Box<dyn WalWriter>>>>,
-    router: &ShardRouter,
-    shared: &Arc<AffinitySharedState>,
-) {
-    shared
-        .memcache_total_connections
-        .fetch_add(1, Ordering::Relaxed);
-    shared
-        .memcache_current_connections
-        .fetch_add(1, Ordering::Relaxed);
-
-    let store = store.clone();
-    let wal = wal_writer.clone();
-    let router = router.clone();
-    let shared = shared.clone();
-
-    tokio::task::spawn_local(async move {
-        let result = memcache::handle_connection_affinity(
-            stream,
-            shard_id,
-            store,
-            wal,
-            router,
-            shared.clone(),
-        )
-        .await;
-
-        if let Err(e) = result {
-            if e.kind() != std::io::ErrorKind::UnexpectedEof
-                && e.kind() != std::io::ErrorKind::ConnectionReset
-            {
-                tracing::debug!("Memcached connection error: {}", e);
-            }
-        }
-
-        shared
-            .memcache_current_connections
-            .fetch_sub(1, Ordering::Relaxed);
-    });
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn shard_worker_loop(
     shard_id: u16,
@@ -570,7 +455,6 @@ async fn shard_worker_loop(
     conn_counts: Arc<[AtomicUsize]>,
     mut shutdown: watch::Receiver<bool>,
     bind_address: &str,
-    memcached_bind_address: Option<&str>,
     unix_socket: Option<&PathBuf>,
 ) {
     let listener = match create_reuseport_listener(bind_address) {
@@ -584,25 +468,6 @@ async fn shard_worker_loop(
     if shard_id == 0 {
         tracing::info!("Kōra listening on {} (shard-affinity mode)", bind_address);
     }
-
-    let memcached_listener = if let Some(addr) = memcached_bind_address {
-        match create_reuseport_listener(addr) {
-            Ok(listener) => {
-                if shard_id == 0 {
-                    tracing::info!("Kōra memcached listener on {}", addr);
-                }
-                Some(listener)
-            }
-            Err(e) => {
-                if shard_id == 0 {
-                    tracing::error!("Failed to bind memcached listener {}: {}", addr, e);
-                }
-                None
-            }
-        }
-    } else {
-        None
-    };
 
     let unix_listener: Option<tokio::net::UnixListener> = if let Some(path) = unix_socket {
         if shard_id == 0 {
@@ -633,18 +498,6 @@ async fn shard_worker_loop(
                 let _ = stream.set_nodelay(true);
                 spawn_connection_handler(
                     stream, shard_id, &store, &wal_writer, &router, &shared, &conn_counts,
-                );
-            }
-            result = async {
-                match &memcached_listener {
-                    Some(listener) => listener.accept().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                let Ok((stream, _addr)) = result else { continue };
-                let _ = stream.set_nodelay(true);
-                spawn_memcache_connection_handler(
-                    stream, shard_id, &store, &wal_writer, &router, &shared,
                 );
             }
             result = async {
@@ -698,24 +551,6 @@ fn handle_shard_request(
             let execute_start = Instant::now();
             maybe_sweep_inline(store, ops_since_expire);
             let resp = execute_with_wal_inline(store, wal_writer, command);
-            shared.batch_stage_metrics.record(
-                BatchStage::RemoteExecute,
-                execute_start.elapsed().as_nanos() as u64,
-            );
-            let _ = response_tx.send(resp);
-        }
-        ShardRequest::ExecuteMemcache {
-            request,
-            queued_at,
-            response_tx,
-        } => {
-            shared.batch_stage_metrics.record(
-                BatchStage::RemoteQueue,
-                queued_at.elapsed().as_nanos() as u64,
-            );
-            let execute_start = Instant::now();
-            maybe_sweep_inline(store, ops_since_expire);
-            let resp = memcache::execute_memcache_inline(store, wal_writer, shared, request);
             shared.batch_stage_metrics.record(
                 BatchStage::RemoteExecute,
                 execute_start.elapsed().as_nanos() as u64,
@@ -777,6 +612,7 @@ fn handle_shard_request(
     }
 }
 
+/// Triggers a manual RDB snapshot across all shards.
 pub(crate) fn start_manual_snapshot(shared: &Arc<AffinitySharedState>) -> Result<(), String> {
     let config = shared
         .storage_config
@@ -886,6 +722,7 @@ async fn run_periodic_snapshot_scheduler(
     }
 }
 
+/// Executes a command on the local shard, writing to the WAL first if the command mutates state.
 pub(crate) fn execute_with_wal_inline(
     store: &Rc<RefCell<ShardStore>>,
     wal_writer: &Rc<RefCell<Option<Box<dyn WalWriter>>>>,

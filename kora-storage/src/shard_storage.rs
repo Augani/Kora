@@ -1,8 +1,19 @@
-//! Per-shard storage — each shard owns its own WAL and RDB files.
+//! Per-shard storage isolation.
 //!
-//! This module provides [`ShardStorage`], which gives each shard its own
-//! subdirectory (`shard-{N}/`) with an independent WAL file and RDB snapshot.
-//! WAL appends happen on the shard's own thread with no cross-shard I/O.
+//! In Kōra's shared-nothing architecture each shard worker owns its data and
+//! its I/O. This module provides [`ShardStorage`], which gives every shard an
+//! independent subdirectory (`{base_dir}/shard-{N}/`) containing its own WAL
+//! file and RDB snapshot.
+//!
+//! Because each [`ShardStorage`] instance is owned by exactly one shard
+//! worker thread, WAL appends require only `&mut self` — no locks, no
+//! cross-shard contention. The shard worker can also trigger RDB snapshots
+//! independently; a successful snapshot automatically truncates that shard's
+//! WAL.
+//!
+//! [`ShardStorage`] also implements `kora_core::shard::WalWriter`, so the
+//! core engine can log mutations without knowing about the storage layer's
+//! wire format.
 
 use std::path::{Path, PathBuf};
 

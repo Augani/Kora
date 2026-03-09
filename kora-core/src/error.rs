@@ -1,4 +1,9 @@
 //! Core error types for the Kōra engine.
+//!
+//! `KoraError` covers the error conditions that arise during command execution:
+//! type mismatches, arity violations, non-integer values, and shutdown. All
+//! variants produce RESP-compatible error messages so the protocol layer can
+//! relay them directly to clients.
 
 use thiserror::Error;
 

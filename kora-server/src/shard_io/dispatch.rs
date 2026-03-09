@@ -1,3 +1,15 @@
+//! Cross-shard command dispatch for multi-key and broadcast operations.
+//!
+//! Commands that touch multiple keys (MGET, MSET, DEL, EXISTS, set operations,
+//! stream reads, etc.) or that must run on every shard (DBSIZE, FLUSHDB, KEYS,
+//! SCAN, DUMP) are handled here. The dispatcher fans out sub-requests to the
+//! owning shards via [`ShardRouter`], collects the responses, and merges them
+//! into a single [`CommandResponse`].
+//!
+//! All functions in this module are called from the connection handler on the
+//! shard worker that accepted the client, so local-shard work executes inline
+//! while foreign-shard work is awaited over oneshot channels.
+
 use std::cell::RefCell;
 use std::future::{poll_fn, Future};
 use std::pin::Pin;
@@ -11,6 +23,7 @@ use tokio::sync::oneshot;
 
 use super::{execute_with_wal_inline, ShardRouter, CROSS_SHARD_TIMEOUT};
 
+/// Executes a multi-key or broadcast command, fanning out to remote shards as needed.
 pub(crate) async fn handle_complex_command(
     cmd: Command,
     shard_id: u16,

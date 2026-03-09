@@ -1,40 +1,48 @@
-//! RESP2/RESP3 data types.
+//! RESP wire protocol value types.
+//!
+//! Defines [`RespValue`], the in-memory representation of a single RESP frame.
+//! Both RESP2 and RESP3 type prefixes are represented as enum variants so the
+//! parser and serializer can handle either protocol version through one unified
+//! type. RESP2 clients see only the first five variants; RESP3-aware clients
+//! may additionally encounter Null, Double, Boolean, Map, Set, BigNumber,
+//! VerbatimString, and Push.
 
-/// A RESP protocol value (supports both RESP2 and RESP3).
+/// A single RESP wire protocol value.
+///
+/// Covers all RESP2 and RESP3 type prefixes. Used as the intermediate
+/// representation between raw bytes on the wire and typed Kora commands.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RespValue {
-    // ─── RESP2 types ─────────────────────────────────────────────
-    /// Simple string: +OK\r\n
+    /// RESP2 simple string (`+OK\r\n`).
     SimpleString(Vec<u8>),
-    /// Error: -ERR message\r\n
+    /// RESP2 error (`-ERR message\r\n`).
     Error(Vec<u8>),
-    /// Integer: :42\r\n
+    /// RESP2 integer (`:42\r\n`).
     Integer(i64),
-    /// Bulk string: $N\r\n...data...\r\n (None = $-1\r\n null)
+    /// RESP2 bulk string (`$N\r\n...data...\r\n`). `None` represents the null bulk string (`$-1\r\n`).
     BulkString(Option<Vec<u8>>),
-    /// Array: *N\r\n... (None = *-1\r\n null)
+    /// RESP2 array (`*N\r\n...`). `None` represents the null array (`*-1\r\n`).
     Array(Option<Vec<RespValue>>),
 
-    // ─── RESP3 types ─────────────────────────────────────────────
-    /// Null: _\r\n
+    /// RESP3 null (`_\r\n`).
     Null,
-    /// Double: ,3.14\r\n
+    /// RESP3 double (`,3.14\r\n`).
     Double(f64),
-    /// Boolean: #t\r\n or #f\r\n
+    /// RESP3 boolean (`#t\r\n` or `#f\r\n`).
     Boolean(bool),
-    /// Map: %N\r\n key value key value ...
+    /// RESP3 map (`%N\r\n key value key value ...`).
     Map(Vec<(RespValue, RespValue)>),
-    /// Set: ~N\r\n member member ...
+    /// RESP3 set (`~N\r\n member member ...`).
     Set(Vec<RespValue>),
-    /// Big number: (12345678901234567890\r\n
+    /// RESP3 big number (`(12345678901234567890\r\n`).
     BigNumber(Vec<u8>),
-    /// Verbatim string: =N\r\ntxt:data\r\n
+    /// RESP3 verbatim string (`=N\r\ntxt:data\r\n`).
     VerbatimString {
-        /// 3-byte encoding (e.g., "txt", "mkd").
+        /// 3-byte encoding prefix (e.g., `txt`, `mkd`).
         encoding: [u8; 3],
-        /// The string data.
+        /// The string payload after the encoding prefix.
         data: Vec<u8>,
     },
-    /// Push: >N\r\n elements...
+    /// RESP3 push message (`>N\r\n elements...`).
     Push(Vec<RespValue>),
 }

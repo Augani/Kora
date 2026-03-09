@@ -1,8 +1,13 @@
-//! Sharded Pub/Sub broker.
+//! Sharded Pub/Sub broker implementation.
 //!
-//! Channels are hashed to independent shards using `ahash`, enabling
-//! lock-free parallelism for publishes to different channels. Pattern
-//! subscriptions are replicated to all shards since any publish could match.
+//! [`PubSubBroker`] distributes channels across a power-of-two number of
+//! shards using `ahash`. Publishing takes only a read lock on the target
+//! shard, while subscribe/unsubscribe operations take a write lock. Pattern
+//! subscriptions are replicated to every shard because any publish could
+//! match a glob pattern.
+//!
+//! Dead subscribers (those whose [`MessageSink::send`] returns `false`) are
+//! lazily cleaned up during the next publish to the same shard.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -15,10 +20,14 @@ use crate::message::PubSubMessage;
 
 /// Trait for delivering messages to a subscriber.
 ///
-/// Returns `true` if the message was accepted, `false` if the subscriber
-/// is dead and should be cleaned up.
+/// Implementors represent the write half of a client connection. The broker
+/// calls [`MessageSink::send`] under a read lock, so implementations must
+/// not block for an extended period.
 pub trait MessageSink: Send + Sync {
-    /// Send a message to the subscriber.
+    /// Attempt to deliver `msg` to the subscriber.
+    ///
+    /// Returns `true` if the message was accepted, or `false` if the
+    /// subscriber is dead and should be removed on the next cleanup pass.
     fn send(&self, msg: PubSubMessage) -> bool;
 }
 

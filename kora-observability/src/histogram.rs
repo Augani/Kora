@@ -1,7 +1,12 @@
 //! HDR histogram wrappers for per-command latency distributions.
 //!
-//! Each command type gets its own histogram, protected by a mutex for
-//! concurrent recording from multiple connections.
+//! Wraps the [`hdrhistogram`] crate to provide a fixed-size array of
+//! histograms — one per command type index (0..31). Each histogram is
+//! protected by a [`parking_lot::Mutex`] for concurrent recording from
+//! multiple shard worker threads.
+//!
+//! Default range is 1 microsecond to 60 seconds with 3 significant digits
+//! of precision, covering the full spectrum of cache operation latencies.
 
 use hdrhistogram::Histogram;
 use parking_lot::Mutex;

@@ -1,4 +1,25 @@
-//! Binary key encoding helpers for document and index records.
+//! Binary key encoding and decoding for document and index records.
+//!
+//! Every persisted record in kora-doc is addressed by a compact binary key
+//! whose first byte is a [`KeyTag`] discriminant. The remaining bytes encode
+//! collection IDs, document IDs, field IDs, value hashes, or sequence numbers
+//! in little-endian order.
+//!
+//! ## Key Layouts
+//!
+//! | Tag | Layout | Size | Purpose |
+//! |-----|--------|------|---------|
+//! | `0x01` | `[tag][col:2][doc:4]` | 7 | Hot document |
+//! | `0x02`..`0x05`, `0x20` | `[tag][col:2]` | 3 | Collection metadata / schema / dictionary / registry / CDC head |
+//! | `0x06` | `[tag][col:2][doc:4]` | 7 | Cold-tier document |
+//! | `0x10`, `0x12`, `0x13` | `[tag][col:2][field:2][vhash:4]` | 10 | Hash / array / unique index bucket |
+//! | `0x11` | `[tag][col:2][field:2]` | 5 | Sorted index |
+//! | `0x14` | `[tag][col:2][f1:2][f2:2][vhash:4]` | 11 | Compound index bucket |
+//! | `0x21` | `[tag][col:2][seq:8]` | 11 | CDC event |
+//!
+//! All encode/decode functions are symmetric: encoding produces a fixed-size
+//! byte array, and decoding validates length and tag before extracting fields.
+//! Malformed keys surface as [`KeyDecodeError`].
 
 use thiserror::Error;
 

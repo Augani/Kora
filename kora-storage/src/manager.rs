@@ -1,9 +1,18 @@
 //! Storage manager — coordinates WAL, RDB snapshots, and cold-tier backend.
 //!
-//! The `StorageManager` provides a unified interface for persistence:
-//! - WAL logging of mutations for crash recovery
-//! - RDB snapshot save/load for point-in-time backups
-//! - Cold-tier backend for spilling infrequently-accessed data to disk
+//! [`StorageManager`] is the unified entry point for all persistence
+//! operations. It owns the WAL, the RDB snapshot path, and the cold-tier
+//! [`FileBackend`](crate::backend::FileBackend), providing methods that
+//! handle:
+//!
+//! - **WAL lifecycle** — append, sync, replay, rotate, and truncate.
+//! - **RDB snapshots** — atomic save/load with a concurrent-snapshot guard
+//!   that prevents overlapping writes.
+//! - **Cold backend** — exposes the [`FileBackend`](crate::backend::FileBackend)
+//!   for callers that need direct cold-tier access.
+//!
+//! After a successful RDB snapshot the WAL is automatically truncated,
+//! since all committed state has been captured in the snapshot.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -91,7 +100,6 @@ impl StorageManager {
                 .map_err(|e| StorageError::LockPoisoned(e.to_string()))?;
             wal.append(entry)?;
 
-            // Auto-rotate if WAL exceeds size limit
             if self.config.wal_max_bytes > 0 && wal.bytes_written() >= self.config.wal_max_bytes {
                 tracing::info!(
                     "WAL size {} exceeds limit {}, rotating",
@@ -158,7 +166,6 @@ impl StorageManager {
 
         if result.is_ok() {
             tracing::info!("RDB snapshot saved: {} entries", entries.len());
-            // After a successful snapshot, truncate the WAL
             self.wal_truncate()?;
         }
 

@@ -16,7 +16,7 @@ kora-protocol.workspace = true
 kora-pubsub.workspace = true
 kora-storage.workspace = true
 kora-cdc.workspace = true
-kora-scripting.workspace = true
+
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

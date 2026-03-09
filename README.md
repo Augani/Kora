@@ -1,36 +1,90 @@
-# Kōra — Architecture
+# Kora
 
-> A multi-threaded, embeddable, memory-safe cache engine in Rust.
-> Redis protocol compatible. Built for what comes next.
+**A multi-threaded, embeddable, memory-safe cache engine written in Rust.**
 
-*Kōra (कोर) — Sanskrit for “core, essence.” Also echoes “core” in English and “kɔra” in Twi.*
+<!-- badges -->
+[![Build](https://img.shields.io/github/actions/workflow/status/Augani/Kora/ci.yml?branch=main)](https://github.com/Augani/Kora/actions)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Crates.io](https://img.shields.io/crates/v/kora.svg)](https://crates.io/crates/kora)
 
------
+*Kora (kora) — from Sanskrit (core, essence) and Twi (kora). Also echoes "core" in English.*
 
-## Why this exists
+---
 
-Redis is single-threaded by design. Every scaling strategy — clustering, sharding, multiple instances — exists to work around this. Dragonfly proved in C++ that a multi-threaded, Redis-compatible engine can achieve 25x throughput. Kōra takes that further: multi-threaded, embeddable, memory-safe, with tiered storage and native vector search.
+## What is Kora
 
-**What we keep from Redis:** RESP protocol, command surface, simplicity, speed.
+Kora is a cache engine built on a shared-nothing, shard-affinity threading architecture inspired by Seastar and ScyllaDB. Each worker thread owns both its data and its connections' I/O — no locks on the data path, linear scaling with cores.
 
-**What we fix:** single-thread ceiling, RAM-only constraint, no embedded mode, no native vectors, no change streaming, Lua-only scripting.
+It speaks RESP2 on the wire, so existing Redis clients work out of the box. But Kora goes beyond caching: it includes a JSON document database with secondary indexes and WHERE queries, HNSW vector search, change data capture, and built-in observability. The entire engine compiles as an embeddable library for in-process use with zero network overhead.
 
------
+---
 
-## High-level overview
+## Key Features
+
+- **Multi-threaded shard-affinity I/O** — each worker owns data + connections, scales linearly with cores
+- **JSON document database** — secondary indexes (hash, sorted, array, unique), WHERE clause queries, field projection
+- **HNSW vector search** — cosine, L2, and inner product distance metrics
+- **Change data capture** — per-shard ring buffers with cursor-based subscriptions and gap detection
+- **Sharded pub/sub** — SUBSCRIBE, PSUBSCRIBE, PUBLISH with glob pattern matching
+- **Built-in observability** — Count-Min Sketch hot-key detection, per-command latency histograms, atomic shard stats
+- **WAL + RDB persistence** — CRC-verified write-ahead log, atomic snapshots, LZ4-compressed cold-tier storage
+- **Embeddable library mode** — same multi-threaded engine, no network required
+- **RESP2 wire protocol** — works with redis-cli, Jedis, ioredis, redis-rs, and any Redis client
+
+---
+
+## Quick Start
+
+### Build from source
+
+```bash
+git clone https://github.com/Augani/Kora.git
+cd kora
+cargo build --release
+```
+
+### Start the server
+
+```bash
+./target/release/kora-cli --port 6379 --workers 4
+```
+
+### Connect with redis-cli
+
+```bash
+redis-cli -p 6379
+
+127.0.0.1:6379> SET greeting "hello world"
+OK
+127.0.0.1:6379> GET greeting
+"hello world"
+127.0.0.1:6379> INCR counter
+(integer) 1
+127.0.0.1:6379> HSET user:1 name "Augustus" city "Accra"
+(integer) 2
+127.0.0.1:6379> HGETALL user:1
+1) "name"
+2) "Augustus"
+3) "city"
+4) "Accra"
+```
+
+---
+
+## Architecture Overview
 
 ```
 ┌──────────────────────────────────────────────────────────┐
 │                      Client Layer                        │
-│         RESP3 Protocol  /  Embedded API (direct)         │
+│            RESP2 Protocol  /  Embedded API               │
 └──────────────┬──────────────────────┬────────────────────┘
                │ TCP/Unix socket      │ fn call (in-process)
-               ▼                      ▼
+               v                      v
 ┌──────────────────────────────────────────────────────────┐
 │                    Router / Dispatcher                    │
-│            hash(key) % N → worker thread                 │
+│            hash(key) % N -> worker thread                │
 └──────┬────────┬────────┬────────┬────────┬───────────────┘
-       ▼        ▼        ▼        ▼        ▼
+       v        v        v        v        v
    ┌────────┬────────┬────────┬────────┬────────┐
    │Worker 0│Worker 1│Worker 2│Worker 3│Worker N│
    │        │        │        │        │        │
@@ -44,529 +98,218 @@ Redis is single-threaded by design. Every scaling strategy — clustering, shard
    │ Ring   │ Ring   │ Ring   │ Ring   │ Ring   │
    └───┬────┴───┬────┴───┬────┴───┬────┴───┬────┘
        │        │        │        │        │
-       ▼        ▼        ▼        ▼        ▼
+       v        v        v        v        v
 ┌──────────────────────────────────────────────────────────┐
-│                    Tiered Storage                         │
-│         Hot (RAM) → Warm (mmap NVMe) → Cold (disk)       │
-│                    io_uring backend                       │
+│                    Persistence Layer                      │
+│           WAL + RDB Snapshots + LZ4 Cold Tier            │
 └──────────────────────────────────────────────────────────┘
 ```
 
------
+Each shard worker runs its own `current_thread` Tokio runtime. Local-key commands execute inline with zero channel hops. Foreign-key commands take a single async hop via `tokio::sync::mpsc` + `oneshot`. Data structures use `Rc<RefCell<>>` instead of `Arc<Mutex<>>` — no lock contention.
 
-## Crate structure
+---
+
+## Performance
+
+Benchmarked on AWS m5.xlarge (4 vCPU, 16GB RAM) with memtier_benchmark, 200 clients, 256-byte values.
+
+### Throughput (ops/sec)
+
+| Workload        | Redis 8    | Dragonfly 1.37 | Kora       | vs Redis     | vs Dragonfly    |
+|-----------------|------------|----------------|------------|--------------|-----------------|
+| SET-only        | 138,239    | 236,885        | 229,535    | **+66.0%**   | -3.1%           |
+| GET-only        | 144,240    | 241,305        | 239,230    | **+65.9%**   | -0.9%           |
+| Mixed 1:1       | 139,014    | 232,507        | 233,377    | **+67.9%**   | **+0.4%**       |
+| Pipeline x16    | 510,705    | 389,286        | 769,374    | **+50.7%**   | **+97.7%**      |
+
+### p50 Latency (ms)
+
+| Workload        | Redis 8 | Dragonfly | Kora      |
+|-----------------|---------|-----------|-----------|
+| SET-only        | 1.415   | 0.847     | **0.831** |
+| GET-only        | 1.359   | 0.839     | **0.839** |
+| Mixed 1:1       | 1.415   | 0.871     | **0.847** |
+| Pipeline x16    | 6.303   | 8.191     | **4.063** |
+
+### p99 Latency (ms)
+
+| Workload        | Redis 8 | Dragonfly | Kora      |
+|-----------------|---------|-----------|-----------|
+| SET-only        | 2.111   | 1.175     | 1.223     |
+| GET-only        | 1.943   | 1.143     | 1.327     |
+| Mixed 1:1       | 1.999   | 1.175     | 1.631     |
+| Pipeline x16    | 9.087   | 10.815    | **7.519** |
+
+---
+
+## Crate Structure
 
 ```
 kora/
-├── Cargo.toml                  # workspace root
-├── kora-core/                  # data structures, shard engine, memory management
-├── kora-protocol/              # RESP2/RESP3 parser and serializer
-├── kora-server/                # TCP/Unix listener, shard-affinity I/O, command dispatch
-├── kora-embedded/              # library mode — direct API, no network
-├── kora-storage/               # tiered storage, NVMe spill, io_uring async I/O
-├── kora-vector/                # HNSW index, similarity search, quantization
-├── kora-cdc/                   # change data capture, stream subscriptions
-├── kora-pubsub/                # publish/subscribe messaging with pattern support
-├── kora-scripting/             # WASM runtime (wasmtime), function registry
-├── kora-observability/         # per-key stats, hot-key detection, memory attribution
-└── kora-cli/                   # CLI binary, config parsing, server entrypoint
+├── kora-core/           Core data structures, shard engine, memory management
+├── kora-protocol/       RESP2 streaming parser and response serializer
+├── kora-server/         TCP/Unix server, shard-affinity I/O engine
+├── kora-embedded/       Library mode — direct API, no network
+├── kora-storage/        WAL, RDB snapshots, LZ4-compressed cold-tier backend
+├── kora-doc/            JSON document database, secondary indexes, WHERE queries
+├── kora-vector/         HNSW approximate nearest neighbor index
+├── kora-cdc/            Change data capture with per-shard ring buffers
+├── kora-pubsub/         Publish/subscribe messaging with pattern support
+├── kora-observability/  Hot-key detection, per-command stats, latency histograms
+└── kora-cli/            CLI binary with TOML config support
 ```
 
-**Dependency flow (strict — no cycles):**
+`kora-core` has zero internal workspace dependencies. The dependency graph is strictly acyclic.
 
-```
-cli → server → core
-              → protocol
-              → storage
-              → vector
-              → cdc
-              → pubsub
-              → scripting
-              → observability
+---
 
-embedded → core
-         → storage
-         → vector
-         → cdc
-         → observability
-```
+## Embedded Mode
 
-`kora-core` depends on nothing else in the workspace. Everything flows downward.
-
------
-
-## Threading model: shard-affinity I/O
-
-The key architectural decision. Borrowed from Seastar/ScyllaDB/Dragonfly, then taken further.
-
-**Each shard worker thread owns both its data AND its connections’ I/O.** No locks on the data path. No channel hops for local-key commands.
-
-```
-Accept thread (1 std::thread, own tokio runtime)
-  └── Assigns connections to least-loaded shard
-
-Shard-IO 0 (1 std::thread, current_thread tokio runtime + LocalSet)
-  ├── Owns: ShardStore, WalWriter (via Rc<RefCell<>>, no Mutex needed)
-  ├── Owns: connections assigned to this shard (spawn_local per connection)
-  ├── Local-key commands: store.execute(cmd) inline, zero channel hops
-  └── Foreign-key commands: tokio::sync::mpsc → target shard, oneshot response
-
-Shard-IO 1..N-1: same structure
-```
-
-**How a command executes:**
-
-1. Accept thread receives TCP connection, assigns it to the least-loaded shard worker.
-1. Shard worker reads RESP command from its owned connections via `spawn_local`.
-1. Single-key commands where key hashes to this shard: execute inline with zero overhead.
-1. Single-key commands for a foreign shard: 1 async hop via `tokio::sync::mpsc` + `oneshot`.
-1. Multi-key commands (MGET, MSET, DEL, EXISTS): split local/foreign, execute local inline, fan out foreign via `join_all`.
-1. Response written back on the same shard worker — no context switch.
-
-**Why shard-affinity over separate I/O and data threads:**
-
-- **Zero-hop local execution.** With N shards, ~1/N commands are local — executed inline with no channels, no context switches, no async overhead.
-- **1 async hop for foreign keys** — down from 2 crossbeam hops in the previous architecture. Native tokio channels eliminate spin+yield.
-- **`Rc<RefCell<>>` instead of `Arc<Mutex<>>`** — single-threaded runtime means no Send/Sync bounds, no lock contention.
-- **Each shard manages only 1/N connections** — reduces cooperative scheduling jitter that caused p99 tail latency.
-- Scales linearly with cores. Dragonfly demonstrated this empirically.
-
-**Benchmark results vs Redis (64 clients, 200K keys, mixed GET/SET/INCR/PUBLISH):**
-
-| Metric | Redis | Kōra | Delta |
-|--------|-------|------|-------|
-| Throughput | 256,864 ops/s | 358,000 ops/s | **+39.4%** |
-| p50 latency | 0.591ms | 0.418ms | **-29%** |
-| p99 latency | 0.883ms | 0.555ms | **-37%** |
-
------
-
-## Memory architecture
-
-### Per-thread slab allocator
-
-Each worker thread gets its own slab allocator. No global `malloc` contention.
+Use Kora as a library, not a server. The same multi-threaded engine runs in-process with sub-microsecond dispatch latency.
 
 ```rust
-struct ShardAllocator {
-    // Size classes: 64, 128, 256, 512, 1024, 2048, 4096 bytes
-    slabs: [SlabPool; 7],
-    // Large allocations fall through to system allocator
-    large_threshold: usize, // 4096
-}
+use kora_embedded::{Config, Database};
+
+let db = Database::open(Config::default());
+
+db.set("user:1", b"Augustus");
+let val = db.get("user:1"); // Some(b"Augustus")
+
+db.hset("profile:1", "name", b"Augustus");
+db.hset("profile:1", "city", b"Accra");
+let name = db.hget("profile:1", "name"); // Some(b"Augustus")
+
+db.lpush("queue", &[b"task-1", b"task-2"]);
+let tasks = db.lrange("queue", 0, -1);
 ```
 
-**Small string optimization:** Keys under 64 bytes are stored inline in the hash table entry, avoiding a pointer chase. This covers the vast majority of real-world Redis keys.
-
-### Value representation
+Hybrid mode — embed the database and expose a TCP listener for external tools:
 
 ```rust
-enum Value {
-    // Inline small strings (≤ 23 bytes stored in-place, no heap alloc)
-    InlineStr([u8; 23], u8),  // data + length
-
-    // Heap string with refcount for zero-copy reads
-    HeapStr(Arc<[u8]>),
-
-    // Integer (stored as i64, not serialized string)
-    Int(i64),
-
-    // Collections — each thread-local, no sync needed
-    List(VecDeque<Value>),
-    Set(HashSet<Value>),
-    SortedSet(SkipList<f64, Value>),
-    Hash(HashMap<Value, Value>),
-
-    // New types
-    Vector(Box<[f32]>),    // dense embedding
-    Stream(StreamLog),      // append-only log entries
-}
+let db = Database::open(config);
+db.start_listener("127.0.0.1:6379")?; // non-blocking
+db.set("key", b"works from both paths");
 ```
 
-### Key metadata
+---
+
+## Document Database
+
+Kora includes a JSON-native document database with secondary indexes and a WHERE expression query engine.
+
+### Via redis-cli
+
+```bash
+# Create a collection
+127.0.0.1:6379> DOC.CREATE users
+
+# Insert documents
+127.0.0.1:6379> DOC.SET users user:1 '{"name":"Augustus","age":30,"city":"Accra"}'
+127.0.0.1:6379> DOC.SET users user:2 '{"name":"Kwame","age":25,"city":"Kumasi"}'
+
+# Create a secondary index
+127.0.0.1:6379> DOC.CREATEINDEX users city hash
+
+# Query with WHERE clause
+127.0.0.1:6379> DOC.FIND users WHERE city = "Accra"
+127.0.0.1:6379> DOC.FIND users WHERE age > 20 AND city = "Accra" LIMIT 10
+
+# Count matching documents
+127.0.0.1:6379> DOC.COUNT users WHERE age >= 25
+
+# Field projection
+127.0.0.1:6379> DOC.GET users user:1 FIELDS name city
+```
+
+### Via embedded API
 
 ```rust
-struct KeyEntry {
-    key: CompactKey,          // inline if ≤ 64 bytes, heap otherwise
-    value: Value,
-    ttl: Option<Instant>,     // expiry
-    lfu_counter: u8,          // access frequency for eviction / tiering
-    last_access: u32,         // seconds since shard epoch (compact timestamp)
-    flags: u8,                // encoding hints, dirty bit, tier marker
-}
+use serde_json::json;
+
+db.doc_create_collection("users", Default::default())?;
+db.doc_set("users", "user:1", &json!({"name": "Augustus", "age": 30, "city": "Accra"}))?;
+db.doc_create_index("users", "city", "hash")?;
+let results = db.doc_find("users", "city = \"Accra\"", None, Some(10), 0)?;
 ```
 
-The `lfu_counter` uses Redis’s probabilistic LFU algorithm (logarithmic counter with decay) — 1 byte tracks access frequency well enough for eviction and tier migration decisions.
+Supported index types: `hash`, `sorted`, `array`, `unique`.
 
------
+---
 
-## Tiered storage (kora-storage)
+## Configuration
 
-Three tiers. Data migrates automatically based on access frequency.
+### CLI arguments
 
-```
-┌─────────────────────────┐
-│      Hot Tier (RAM)      │  All keys start here.
-│   Thread-local hashmap   │  Full speed, no I/O.
-└──────────┬──────────────┘
-           │ lfu_counter drops below warm_threshold
-           ▼
-┌─────────────────────────┐
-│   Warm Tier (mmap NVMe)  │  Values evicted from RAM.
-│   Key stays in RAM index │  Read = page fault or io_uring prefetch.
-│   Value on NVMe via mmap │  Transparent to command execution.
-└──────────┬──────────────┘
-           │ lfu_counter drops below cold_threshold
-           ▼
-┌─────────────────────────┐
-│  Cold Tier (compressed)  │  LZ4-compressed on disk.
-│  Key in bloom filter     │  Read requires decompress + promote.
-│  Full eviction candidate │  Background compaction.
-└─────────────────────────┘
+```bash
+kora-cli \
+  --bind 0.0.0.0 \
+  --port 6379 \
+  --workers 8 \
+  --log-level info \
+  --data-dir /var/lib/kora \
+  --snapshot-interval-secs 300 \
+  --snapshot-retain 24 \
+  --cdc-capacity 65536 \
+  --metrics-port 9090 \
+  --unix-socket /tmp/kora.sock
 ```
 
-**Migration is async.** A background fiber per worker scans key entries periodically and issues io_uring write commands for keys that should demote. Promotion on read is synchronous (the read blocks until the value is loaded) but uses io_uring’s `IORING_OP_READ` to avoid blocking the kernel thread.
+### TOML config file
 
-```rust
-trait StorageBackend: Send + 'static {
-    async fn read(&self, key_hash: u64) -> io::Result<Option<Vec<u8>>>;
-    async fn write(&self, key_hash: u64, value: &[u8]) -> io::Result<()>;
-    async fn delete(&self, key_hash: u64) -> io::Result<()>;
-    async fn sync(&self) -> io::Result<()>;
-}
+```toml
+bind = "0.0.0.0"
+port = 6379
+workers = 8
+log_level = "info"
+cdc_capacity = 65536
+metrics_port = 9090
+unix_socket = "/tmp/kora.sock"
 
-struct IoUringBackend {
-    ring: io_uring::IoUring,
-    data_dir: PathBuf,
-    // Shard-local file — one file per worker thread, no contention
-}
+[storage]
+data_dir = "/var/lib/kora"
+wal_sync = "every_second"   # every_write | every_second | os_managed
+wal_enabled = true
+rdb_enabled = true
+snapshot_interval_secs = 300
+snapshot_retain = 24
+wal_max_bytes = 67108864
 ```
 
-**Why this matters:** A Redis instance with 100GB of data currently needs 100GB of RAM. With tiered storage, you might keep 20GB hot in RAM and 80GB on a $0.08/GB NVMe drive instead of $5/GB RAM. 10x cost reduction for workloads with skewed access patterns (which is most of them).
+CLI arguments override config file values. If no config file is specified, Kora looks for `kora.toml` in the working directory.
 
------
+---
 
-## Embedded mode (kora-embedded)
+## Building from Source
 
-The SQLite play. Use Kōra as a library, not a server.
+```bash
+# Build the workspace
+cargo build --release
 
-```rust
-use kora_embedded::{Database, Config};
+# Run all tests
+cargo test --workspace
 
-let db = Database::open(Config::default())?;
+# Run clippy lints
+cargo clippy --workspace --all-targets
 
-// Direct calls — no serialization, no network, no RESP parsing
-db.set("user:1", b"Augustus")?;
-let val = db.get("user:1")?;
+# Format code
+cargo fmt --all
 
-// Typed API
-db.hset("profile:1", "name", "Augustus")?;
-db.hset("profile:1", "city", "Accra")?;
-let name: Option<String> = db.hget("profile:1", "name")?;
-
-// Vector operations
-db.vector_set("emb:1", &[0.1, 0.2, 0.3, 0.8])?;
-let neighbors = db.vector_search("emb:*", &query_vec, 10)?;
-
-// Still multi-threaded internally — spawns N worker threads
-// Keys are sharded across workers, same as server mode
-// Caller thread sends commands via channels, receives via oneshot
+# Run benchmarks
+cargo bench -p kora-core
+cargo bench -p kora-protocol
+cargo bench -p kora-vector
 ```
 
-**Architecture difference from server mode:** The `kora-server` and `kora-protocol` crates are simply not linked. The `kora-embedded` crate provides a `Database` struct that wraps the same `ShardEngine` the server uses, but routes commands through direct channel sends instead of TCP connections.
+Requires Rust 1.75+ (edition 2021).
 
-**Hybrid mode:** You can also start the embedded database AND bind a TCP listener, so your application uses direct calls while external tools (redis-cli, monitoring) connect over the network.
+---
 
-```rust
-let db = Database::open(config)?;
-db.start_listener("127.0.0.1:6379")?; // optional, non-blocking
-db.set("key", b"works from both paths")?;
-```
+## Contributing
 
------
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on submitting issues and pull requests.
 
-## Vector index (kora-vector)
+---
 
-HNSW (Hierarchical Navigable Small World) graph, sharded per worker like everything else.
+## License
 
-```rust
-struct HnswIndex {
-    layers: Vec<HnswLayer>,
-    dim: usize,
-    metric: DistanceMetric, // Cosine, L2, InnerProduct
-    ef_construction: usize, // build quality parameter
-    m: usize,               // max connections per node
-    // Quantization for memory efficiency
-    quantizer: Option<ProductQuantizer>,
-}
-
-// Commands (Redis-compatible extension)
-// VSIM.SET key dim [METRIC cosine|l2|ip]
-// VSIM.ADD key id vector_f32...
-// VSIM.SEARCH key vector_f32... K [EF search_ef]
-// VSIM.DEL key id
-```
-
-**Why per-shard indexes work:** Vector search is embarrassingly parallel. Each shard searches its local HNSW graph, returns top-K candidates, and the dispatcher merges results. This is how distributed vector databases (Milvus, Qdrant) already work — we get it for free from the shared-nothing architecture.
-
-**Quantization:** Product quantization (PQ) reduces memory per vector from 4 bytes × dim to roughly 1 byte × dim with minimal recall loss. For a 768-dim embedding, that’s 3KB → 768 bytes per vector. At 10M vectors, that’s 30GB → 7.5GB.
-
------
-
-## Pub/Sub messaging (kora-pubsub)
-
-Redis-compatible publish/subscribe with pattern matching.
-
-```
-# Subscribe to channels
-SUBSCRIBE chat news alerts
-
-# Pattern subscribe (glob matching)
-PSUBSCRIBE user.* event.*
-
-# Publish a message (returns number of receivers)
-PUBLISH chat "hello world"
-
-# Unsubscribe
-UNSUBSCRIBE chat
-PUNSUBSCRIBE user.*
-```
-
-**Architecture:** `PubSubBroker` is shared across all shard workers via `Arc`. Subscriber connections receive messages inline via push mode — the shard worker writes messages directly to the subscriber's TCP stream. Pattern matching uses glob syntax (`*` and `?`).
-
-**Performance vs Redis (8 channels, 8 publishers, 3 subs/channel):**
-
-| Metric | Redis | Kōra | Delta |
-|--------|-------|------|-------|
-| Publish rate | 60,964/s | 66,046/s | **+8.3%** |
-| Delivery rate | 182,893/s | 198,138/s | **+8.3%** |
-| Delivery p99 | 0.237ms | 0.201ms | **-15%** |
-| Fan-out | 3.00x | 3.00x | Perfect (zero message loss) |
-
------
-
-## CDC — Change Data Capture (kora-cdc)
-
-Per-shard ring buffer capturing every mutation.
-
-```rust
-struct CdcRing {
-    buffer: Box<[CdcEvent]>,  // fixed-size ring
-    capacity: usize,
-    write_head: u64,          // monotonic sequence number
-}
-
-struct CdcEvent {
-    seq: u64,
-    timestamp: u64,
-    op: CdcOp,
-    key: CompactKey,
-    value: Option<Value>,     // None for DEL
-}
-
-enum CdcOp { Set, Del, Expire, HSet, LPush, SAdd, /* ... */ }
-```
-
-**Subscription model:**
-
-```
-# Subscribe to all mutations on keys matching "user:*"
-SUBSCRIBE.CDC user:*
-
-# Subscribe with cursor (resume from sequence number)
-SUBSCRIBE.CDC user:* CURSOR 184729
-
-# Consumer groups (like Redis Streams but for any key mutation)
-SUBSCRIBE.CDC user:* GROUP analytics CONSUMER worker-1
-```
-
-**Delivery guarantees:** At-least-once. Each consumer group tracks its acknowledged sequence number. Unacknowledged events are redelivered after a timeout. The ring buffer has finite capacity — if a consumer falls too far behind, it gets a gap notification and must re-sync.
-
-**Use cases this unlocks:**
-
-- Cache invalidation buses (subscribe to changes, propagate to edge caches)
-- Event sourcing (treat Kōra as the event log)
-- Real-time analytics pipelines (stream mutations to a processor)
-- Replication (replicas subscribe to the CDC stream)
-
------
-
-## WASM scripting (kora-scripting)
-
-Replace Lua with WASM. Write server-side functions in any language that compiles to WASM.
-
-```rust
-struct WasmRuntime {
-    engine: wasmtime::Engine,
-    // Pre-compiled modules cached by SHA256
-    module_cache: HashMap<[u8; 32], wasmtime::Module>,
-    // Fuel limit per execution (prevents infinite loops)
-    max_fuel: u64,
-    // Memory limit per instance
-    max_memory: usize,
-}
-```
-
-**Host functions exposed to WASM:**
-
-```rust
-// The WASM module can call back into the shard engine
-fn kora_get(key: &str) -> Option<Vec<u8>>;
-fn kora_set(key: &str, value: &[u8]) -> Result<()>;
-fn kora_del(key: &str) -> Result<bool>;
-fn kora_hget(key: &str, field: &str) -> Option<Vec<u8>>;
-// ... full command surface
-```
-
-**Usage:**
-
-```
-# Register a WASM function
-FUNCTION.LOAD rate_limiter ./rate_limiter.wasm
-
-# Call it
-FUNCTION.CALL rate_limiter user:42 limit=100 window=60
-
-# Lua compatibility layer — existing EVAL scripts work
-EVAL "return redis.call('GET', KEYS[1])" 1 mykey
-```
-
-**Why WASM over Lua:**
-
-- Fuel metering: hard cap on execution cost, no runaway scripts blocking the server.
-- Memory sandboxing: each instance gets a fixed memory region, can’t corrupt server state.
-- Language agnostic: write in Rust, Go, TypeScript, Python, AssemblyScript — anything targeting WASM.
-- Precompilation: WASM modules are AOT-compiled and cached, faster invocation than Lua parsing.
-
------
-
-## Multi-tenancy (kora-core)
-
-First-class tenant isolation in the engine, not a naming convention.
-
-```rust
-struct TenantConfig {
-    id: TenantId,
-    max_memory: usize,           // hard memory quota
-    max_keys: Option<u64>,       // optional key count limit
-    ops_per_second: Option<u32>, // rate limit (token bucket)
-    blocked_commands: Vec<String>,// e.g., block KEYS, FLUSHALL
-}
-
-struct ShardEngine {
-    tenants: HashMap<TenantId, TenantState>,
-    default_tenant: TenantId,
-    // ...
-}
-```
-
-**How it works:** Each connection authenticates with a tenant ID (via AUTH or a connection parameter). All key operations are scoped to the tenant. Memory accounting is per-tenant — when tenant A hits its quota, its writes are rejected while tenant B continues normally.
-
-**Isolation guarantees:**
-
-- Memory: per-tenant accounting, hard limits enforced at write time.
-- CPU: per-tenant rate limiting via token bucket. A `KEYS *` from one tenant doesn’t block others because it only scans that tenant’s keyspace.
-- Eviction: per-tenant LFU. One tenant’s cold data doesn’t evict another’s hot data.
-
------
-
-## Observability (kora-observability)
-
-Always-on, near-zero overhead.
-
-```rust
-struct ShardStats {
-    // Per-command counters
-    cmd_counts: [AtomicU64; NUM_COMMANDS],
-    cmd_durations_ns: [AtomicU64; NUM_COMMANDS],
-
-    // Hot key tracking (Count-Min Sketch, ~4KB memory)
-    hot_key_sketch: CountMinSketch,
-
-    // Memory attribution
-    memory_by_prefix: PrefixTrie<AtomicUsize>, // "user:*" → 2.3GB
-
-    // Per-tier stats
-    tier_sizes: [AtomicUsize; 3], // hot, warm, cold
-
-    // Latency histograms (HDR histogram, P50/P99/P999)
-    latency_hist: HdrHistogram,
-}
-```
-
-**Exposed via commands:**
-
-```
-# Top-10 hottest keys in the last 60 seconds
-STATS.HOTKEYS 10
-
-# Memory breakdown by key prefix pattern
-STATS.MEMORY user:* session:* cache:*
-
-# Command latency percentiles
-STATS.LATENCY GET P50 P99 P999
-
-# Per-tenant resource usage
-STATS.TENANT tenant:42
-```
-
-Also exposed as a Prometheus `/metrics` endpoint for standard monitoring stack integration.
-
------
-
-## Build phases
-
-### Phase 0–4 — Core engine, storage, advanced features, production hardening ✅
-
-- Shared-nothing threading with shard routing, per-thread slab allocator
-- All Redis data types: String, List, Set, SortedSet, Hash, Stream
-- RESP2 protocol, TCP/Unix server, embedded mode
-- WAL + RDB persistence, tiered storage (hot/warm/cold), io_uring backend
-- HNSW vector index, CDC streams, WASM scripting, multi-tenancy, observability
-- 400+ tests, deterministic simulation framework
-
-### Phase 5–7 — Deep integration, Redis compatibility, full sweep ✅
-
-- Per-shard vector indexes with fan-out search, product quantization
-- WASM host functions, CDC consumer groups, Prometheus metrics
-- Per-shard storage, LFU eviction, per-tenant isolation
-- Warm tier (mmap NVMe), automatic tier migration, Stream data type
-
-### Phase 8 — Pub/Sub ✅
-
-- SUBSCRIBE, PSUBSCRIBE, PUBLISH with pattern matching
-- Thread-safe PubSubBroker with push-mode delivery
-
-### Phase 9 — Shard-Affinity I/O ✅
-
-- Each shard owns both data AND connection I/O
-- Zero-hop local execution, 1 async hop for foreign keys
-- **+39% throughput, -37% p99 latency vs Redis**
-
------
-
-## Key technical risks and mitigations
-
-|Risk                                         |Mitigation                                                                      |
-|---------------------------------------------|--------------------------------------------------------------------------------|
-|Cross-shard latency for multi-key ops        |Batch messages, amortize channel overhead. Measure early.                       |
-|io_uring portability (not available on macOS)|Abstract behind `StorageBackend` trait. Use kqueue/epoll fallback.              |
-|HNSW memory consumption at scale             |Product quantization, optional disk-backed index for cold vectors.              |
-|RESP protocol edge cases                     |Fuzz test with AFL/cargo-fuzz against Redis’s own test suite output.            |
-|Embedded mode API ergonomics                 |Ship a `kora` crate with builder pattern config. Iterate on API with real users.|
-|WASM cold start latency                      |AOT compile modules at registration, cache compiled artifacts.                  |
-
------
-
-## Name candidates
-
-|Name     |Origin            |Reasoning                                   |
-|---------|------------------|--------------------------------------------|
-|**Kōra** |Sanskrit कोर (core)|Essence. Also echoes “core” and Twi “kɔra.” |
-|**Sika** |Twi (gold)        |Valuable, foundational.                     |
-|**Ember**|English           |Persistent heat. Cache that doesn’t go cold.|
-|**Bolt** |English           |Speed. Direct.                              |
-
------
-
-*All phases (0–9) delivered. 550+ tests passing. Benchmarked and proven faster than Redis.*
+MIT

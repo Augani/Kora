@@ -1,4 +1,14 @@
-//! ShardEngine — coordinates worker threads and routes commands.
+//! Shard engine — coordinates worker threads and routes commands.
+//!
+//! `ShardEngine` spawns N OS threads, each running a tight event loop over a
+//! crossbeam channel. Incoming commands are routed by key hash to the owning
+//! shard worker. Multi-key commands (MGET, MSET, DEL, EXISTS, etc.) are fanned
+//! out to all relevant shards and their responses merged. Keyless commands
+//! (PING, DBSIZE, FLUSHDB, KEYS, SCAN) are either broadcast or delegated to
+//! shard 0.
+//!
+//! Each worker loop periodically samples expired keys (lazy + sweep) and,
+//! when a WAL writer is attached, appends mutation records before execution.
 
 use std::sync::Arc;
 use std::thread;
@@ -115,19 +125,14 @@ impl ShardEngine {
         let (tx, rx) = response_channel();
 
         if let Some(key) = cmd.key() {
-            // Single-key command: route to owning shard
             let shard_id = shard_for_key(key, self.shard_count) as usize;
             let _ = self.workers[shard_id].tx.send(ShardMessage::Single {
                 command: cmd,
                 response_tx: tx,
             });
         } else if cmd.is_multi_key() {
-            // Multi-key commands: for simplicity, broadcast to shard 0
-            // A proper implementation would fan out and merge, but this works
-            // correctly for single-shard setups and as a starting point.
             self.dispatch_multi_key(cmd, tx);
         } else {
-            // Keyless commands (PING, ECHO, INFO, DBSIZE, FLUSHDB, KEYS, SCAN)
             self.dispatch_keyless(cmd, tx);
         }
 
@@ -223,7 +228,6 @@ impl ShardEngine {
         match cmd {
             Command::MGet { keys } => {
                 let mut results = vec![CommandResponse::Nil; keys.len()];
-                // Group keys by shard and collect responses
                 let mut shard_requests: Vec<Vec<(usize, Vec<u8>)>> = vec![vec![]; self.shard_count];
                 for (i, key) in keys.iter().enumerate() {
                     let shard_id = shard_for_key(key, self.shard_count) as usize;
@@ -255,7 +259,6 @@ impl ShardEngine {
                 let _ = tx.send(CommandResponse::Array(results));
             }
             Command::MSet { entries } => {
-                // Group entries by shard
                 let mut shard_entries: Vec<Vec<(Vec<u8>, Vec<u8>)>> =
                     vec![vec![]; self.shard_count];
                 for (key, value) in entries {
@@ -491,7 +494,6 @@ impl ShardEngine {
         match cmd {
             Command::VecQuery { .. } => self.dispatch_vec_query(cmd, tx),
             Command::DbSize => {
-                // Sum up db sizes from all shards
                 let mut total = 0i64;
                 let mut receivers = Vec::new();
                 for worker in &self.workers {
@@ -525,7 +527,6 @@ impl ShardEngine {
                 let _ = tx.send(CommandResponse::Ok);
             }
             Command::Dump => {
-                // Broadcast to all shards, collect and merge results
                 let mut all_entries = Vec::new();
                 let mut receivers = Vec::new();
                 for worker in &self.workers {
@@ -696,7 +697,6 @@ impl ShardEngine {
                 let _ = tx.send(CommandResponse::Nil);
             }
             _ => {
-                // PING, ECHO, INFO — send to shard 0
                 let _ = self.workers[0].tx.send(ShardMessage::Single {
                     command: cmd,
                     response_tx: tx,
@@ -708,14 +708,11 @@ impl ShardEngine {
 
 impl Drop for ShardEngine {
     fn drop(&mut self) {
-        // Drop all senders to signal workers to stop
         for worker in &mut self.workers {
-            // Dropping the sender implicitly when we clear it
             let (dummy, _) = crossbeam_channel::unbounded();
             let old_tx = std::mem::replace(&mut worker.tx, dummy);
             drop(old_tx);
         }
-        // Join all worker threads
         for worker in &mut self.workers {
             if let Some(handle) = worker.thread.take() {
                 let _ = handle.join();

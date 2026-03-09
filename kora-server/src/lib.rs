@@ -20,24 +20,19 @@ use kora_storage::shard_storage::ShardStorage;
 pub struct ServerConfig {
     /// Address to bind to (e.g., "127.0.0.1:6379").
     pub bind_address: String,
-    /// Optional dedicated memcached listener address (e.g., "127.0.0.1:11211").
-    pub memcached_bind_address: Option<String>,
     /// Number of shard worker threads.
     pub worker_count: usize,
     /// Optional storage configuration for persistence.
     pub storage: Option<StorageConfig>,
     /// CDC ring buffer capacity per shard (0 = disabled).
     pub cdc_capacity: usize,
-    /// WASM scripting fuel budget (0 = disabled).
-    pub script_max_fuel: u64,
+
     /// Port for Prometheus metrics HTTP endpoint (0 = disabled).
     pub metrics_port: u16,
     /// Optional Unix socket path.
     pub unix_socket: Option<std::path::PathBuf>,
     /// Optional password for AUTH command validation.
     pub password: Option<String>,
-    /// Enable tenant resource-limit checks on command dispatch.
-    pub tenant_limits_enabled: bool,
 }
 
 /// Returns the optimal shard worker count for the current machine.
@@ -58,15 +53,13 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_address: "127.0.0.1:6379".into(),
-            memcached_bind_address: None,
             worker_count: optimal_worker_count().max(1),
             storage: None,
             cdc_capacity: 0,
-            script_max_fuel: 0,
+
             metrics_port: 0,
             unix_socket: None,
             password: None,
-            tenant_limits_enabled: false,
         }
     }
 }
@@ -117,13 +110,10 @@ impl KoraServer {
             config.worker_count,
             wal_writers,
             config.cdc_capacity,
-            config.script_max_fuel,
             config.metrics_port,
             config.password.clone(),
-            config.tenant_limits_enabled,
             config.storage,
             bind_address,
-            config.memcached_bind_address.clone(),
             unix_socket,
         );
 

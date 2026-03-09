@@ -1,4 +1,9 @@
-//! Storage error types.
+//! Storage error types for the `kora-storage` crate.
+//!
+//! All fallible operations in this crate return [`Result<T>`], which uses
+//! [`StorageError`] as the error type. Variants cover I/O failures,
+//! data-integrity violations (CRC mismatches, corrupt entries), and
+//! internal lock poisoning.
 
 use thiserror::Error;
 

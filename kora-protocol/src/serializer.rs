@@ -1,13 +1,24 @@
 //! RESP2/RESP3 response serializer.
+//!
+//! Converts [`CommandResponse`] values into RESP wire bytes, appending directly
+//! into a caller-supplied [`BytesMut`] buffer to minimize allocation.
+//!
+//! Two entry points are provided:
+//! - [`serialize_response`] always emits RESP2.
+//! - [`serialize_response_versioned`] accepts a `resp3` flag; when set, it
+//!   uses native RESP3 type prefixes for Map (`%`), Set (`~`), Double (`,`),
+//!   and Boolean (`#`). When cleared, those types are automatically downgraded
+//!   to RESP2-compatible representations (flat arrays, bulk strings, integers).
 
 use bytes::BytesMut;
 use kora_core::command::CommandResponse;
 use std::fmt::Write;
 
-/// Serialize a CommandResponse into RESP wire format.
+/// Serialize a [`CommandResponse`] into RESP wire format.
 ///
-/// When `resp3` is true, uses native RESP3 types for Map, Set, Double, Boolean.
-/// When `resp3` is false, these types are downgraded to RESP2 equivalents.
+/// When `resp3` is true, uses native RESP3 type prefixes for Map, Set, Double,
+/// and Boolean. When `resp3` is false, these are downgraded to RESP2
+/// equivalents (flat arrays, bulk strings, integers).
 pub fn serialize_response_versioned(resp: &CommandResponse, buf: &mut BytesMut, resp3: bool) {
     match resp {
         CommandResponse::Ok => buf.extend_from_slice(b"+OK\r\n"),
@@ -55,7 +66,6 @@ pub fn serialize_response_versioned(resp: &CommandResponse, buf: &mut BytesMut, 
                     serialize_response_versioned(v, buf, resp3);
                 }
             } else {
-                // Downgrade to flat array for RESP2
                 let _ = write!(buf, "*{}\r\n", pairs.len() * 2);
                 for (k, v) in pairs {
                     serialize_response_versioned(k, buf, false);
@@ -70,7 +80,6 @@ pub fn serialize_response_versioned(resp: &CommandResponse, buf: &mut BytesMut, 
                     serialize_response_versioned(item, buf, resp3);
                 }
             } else {
-                // Downgrade to array for RESP2
                 let _ = write!(buf, "*{}\r\n", items.len());
                 for item in items {
                     serialize_response_versioned(item, buf, false);
@@ -89,7 +98,6 @@ pub fn serialize_response_versioned(resp: &CommandResponse, buf: &mut BytesMut, 
                     let _ = write!(buf, ",{}\r\n", val);
                 }
             } else {
-                // Downgrade to bulk string for RESP2
                 let s = val.to_string();
                 let _ = write!(buf, "${}\r\n", s.len());
                 buf.extend_from_slice(s.as_bytes());
@@ -104,14 +112,13 @@ pub fn serialize_response_versioned(resp: &CommandResponse, buf: &mut BytesMut, 
                     buf.extend_from_slice(b"#f\r\n");
                 }
             } else {
-                // Downgrade to integer for RESP2
                 let _ = write!(buf, ":{}\r\n", if *b { 1 } else { 0 });
             }
         }
     }
 }
 
-/// Serialize a CommandResponse into RESP2 wire format (default).
+/// Serialize a [`CommandResponse`] into RESP2 wire format.
 pub fn serialize_response(resp: &CommandResponse, buf: &mut BytesMut) {
     serialize_response_versioned(resp, buf, false);
 }

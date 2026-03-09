@@ -1,8 +1,8 @@
 //! RDB-style point-in-time snapshots.
 //!
 //! Saves and loads the complete database state to/from a compact binary file.
-//! This is Kōra's own format (not Redis-compatible), optimized for fast
-//! serialization of our internal types.
+//! This is Kōra's own binary format, optimized for fast serialization of
+//! the engine's internal types.
 //!
 //! ## File format
 //!
@@ -27,7 +27,6 @@ use crate::error::{Result, StorageError};
 const MAGIC: &[u8; 8] = b"KORA_RDB";
 const VERSION: u32 = 1;
 
-// Value type discriminants
 const TYPE_INLINE_STR: u8 = 0;
 const TYPE_HEAP_STR: u8 = 1;
 const TYPE_INT: u8 = 2;
@@ -67,7 +66,6 @@ pub enum RdbValue {
 /// Write a complete RDB snapshot to the given path.
 pub fn save(path: impl AsRef<Path>, entries: &[RdbEntry]) -> Result<()> {
     let path = path.as_ref();
-    // Write to a temp file first, then atomically rename
     let tmp_path = path.with_extension("rdb.tmp");
 
     if let Some(parent) = path.parent() {
@@ -78,7 +76,6 @@ pub fn save(path: impl AsRef<Path>, entries: &[RdbEntry]) -> Result<()> {
     let mut writer = BufWriter::new(file);
     let mut hasher = crc32fast::Hasher::new();
 
-    // Header
     write_and_hash(&mut writer, &mut hasher, MAGIC)?;
     write_and_hash(&mut writer, &mut hasher, &VERSION.to_le_bytes())?;
     write_and_hash(
@@ -87,18 +84,15 @@ pub fn save(path: impl AsRef<Path>, entries: &[RdbEntry]) -> Result<()> {
         &(entries.len() as u64).to_le_bytes(),
     )?;
 
-    // Entries
     for entry in entries {
         encode_rdb_entry(&mut writer, &mut hasher, entry)?;
     }
 
-    // Checksum (CRC of everything written so far)
     let crc = hasher.finalize();
     writer.write_all(&crc.to_le_bytes())?;
     writer.flush()?;
     writer.get_ref().sync_all()?;
 
-    // Atomic rename
     fs::rename(&tmp_path, path)?;
 
     Ok(())
@@ -116,7 +110,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<Vec<RdbEntry>> {
         return Err(StorageError::InvalidRdb("file too small".into()));
     }
 
-    // Verify checksum first
+    // Verify CRC-32C before parsing to reject corrupted files early.
     let payload = &data[..data.len() - 4];
     let stored_crc = u32::from_le_bytes(
         data[data.len() - 4..]
@@ -133,13 +127,11 @@ pub fn load(path: impl AsRef<Path>) -> Result<Vec<RdbEntry>> {
 
     let mut cursor = 0usize;
 
-    // Magic
     if &data[cursor..cursor + 8] != MAGIC {
         return Err(StorageError::InvalidRdb("bad magic bytes".into()));
     }
     cursor += 8;
 
-    // Version
     let version = u32::from_le_bytes(
         data[cursor..cursor + 4]
             .try_into()
@@ -153,7 +145,6 @@ pub fn load(path: impl AsRef<Path>) -> Result<Vec<RdbEntry>> {
     }
     cursor += 4;
 
-    // Entry count
     let num_entries = u64::from_le_bytes(
         data[cursor..cursor + 8]
             .try_into()
@@ -170,18 +161,14 @@ pub fn load(path: impl AsRef<Path>) -> Result<Vec<RdbEntry>> {
     Ok(entries)
 }
 
-// ─── Encoding ───────────────────────────────────────────────────────────────
-
 fn encode_rdb_entry(
     w: &mut BufWriter<File>,
     h: &mut crc32fast::Hasher,
     entry: &RdbEntry,
 ) -> Result<()> {
-    // Key
     write_and_hash(w, h, &(entry.key.len() as u32).to_le_bytes())?;
     write_and_hash(w, h, &entry.key)?;
 
-    // TTL
     match entry.ttl_ms {
         Some(ms) => {
             write_and_hash(w, h, &[1])?;
@@ -192,7 +179,6 @@ fn encode_rdb_entry(
         }
     }
 
-    // Value
     match &entry.value {
         RdbValue::String(data) => {
             write_and_hash(w, h, &[TYPE_INLINE_STR])?;
@@ -235,11 +221,9 @@ fn encode_rdb_entry(
 }
 
 fn decode_rdb_entry(data: &[u8], cursor: &mut usize) -> Result<RdbEntry> {
-    // Key
     let key_len = read_u32(data, cursor)? as usize;
     let key = read_exact(data, cursor, key_len)?;
 
-    // TTL
     let ttl_flag = read_u8(data, cursor)?;
     let ttl_ms = if ttl_flag == 1 {
         Some(read_u64(data, cursor)?)
@@ -247,7 +231,6 @@ fn decode_rdb_entry(data: &[u8], cursor: &mut usize) -> Result<RdbEntry> {
         None
     };
 
-    // Value
     let value_type = read_u8(data, cursor)?;
     let value = match value_type {
         TYPE_INLINE_STR | TYPE_HEAP_STR => {
@@ -299,8 +282,6 @@ fn decode_rdb_entry(data: &[u8], cursor: &mut usize) -> Result<RdbEntry> {
 
     Ok(RdbEntry { key, value, ttl_ms })
 }
-
-// ─── I/O Helpers ────────────────────────────────────────────────────────────
 
 fn write_and_hash(w: &mut BufWriter<File>, h: &mut crc32fast::Hasher, data: &[u8]) -> Result<()> {
     w.write_all(data)?;

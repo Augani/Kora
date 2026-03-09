@@ -1,9 +1,47 @@
 //! # kora-embedded
 //!
-//! Embeddable library mode for Kōra.
+//! Embeddable library mode for the Kōra cache engine.
 //!
-//! Provides a `Database` struct that wraps the same `ShardEngine` the server
-//! uses, but routes commands through direct channel sends instead of TCP.
+//! This crate provides [`Database`], a high-level API for using Kōra as an
+//! in-process library rather than a standalone network server. It wraps the
+//! same multi-threaded [`ShardEngine`](kora_core::shard::ShardEngine) that
+//! powers `kora-server`, but eliminates all network overhead: commands are
+//! serialised into the engine's internal `Command` enum and dispatched through
+//! per-shard channels directly from the calling thread.
+//!
+//! ## How it works
+//!
+//! Each [`Database`] instance owns a [`ShardEngine`](kora_core::shard::ShardEngine)
+//! with a configurable number of shard worker threads. Keys are hashed to a
+//! shard, and the corresponding command is sent over an `mpsc` channel to that
+//! shard's worker. The calling thread blocks on a `oneshot` channel until the
+//! worker replies, giving synchronous semantics with lock-free, shared-nothing
+//! execution on the data path.
+//!
+//! ## Embedded vs. server mode
+//!
+//! | Aspect | `kora-embedded` | `kora-server` |
+//! |--------|----------------|---------------|
+//! | Transport | Direct function calls | TCP / Unix socket (RESP2) |
+//! | Latency | Sub-microsecond dispatch | Network round-trip |
+//! | Deployment | Linked into your binary | Separate process |
+//! | Protocol | Rust types (`Command` / `CommandResponse`) | Wire-compatible RESP2 |
+//!
+//! ## Hybrid mode
+//!
+//! With the `server` Cargo feature enabled, [`Database::start_listener`] spawns
+//! a TCP server alongside the embedded instance, allowing external clients to
+//! connect while the host process retains direct API access.
+//!
+//! ## Quick start
+//!
+//! ```rust
+//! use kora_embedded::{Config, Database};
+//!
+//! let db = Database::open(Config::default());
+//! db.set("greeting", b"hello world");
+//! assert_eq!(db.get("greeting"), Some(b"hello world".to_vec()));
+//! ```
 
 #![warn(clippy::all)]
 
@@ -22,22 +60,28 @@ use serde_json::Value;
 #[cfg(feature = "server")]
 use tokio::task::JoinHandle;
 
-/// Document collection configuration alias for embedded API consumers.
+/// Configuration for creating or updating a document collection.
 pub type DocCollectionConfig = CollectionConfig;
-/// Document collection info alias for embedded API consumers.
+/// Metadata snapshot for a document collection (document count, field count, etc.).
 pub type DocCollectionInfo = CollectionInfo;
-/// Document write result alias for embedded API consumers.
+/// Outcome of a [`Database::doc_set`] call, indicating whether the document was created or replaced.
 pub type DocSetResult = SetResult;
-/// Document update mutation alias for embedded API consumers.
+/// A single field-level mutation applied by [`Database::doc_update`].
 pub type DocUpdateMutation = DocMutation;
-/// Dictionary stats alias for embedded API consumers.
+/// Statistics about a collection's internal dictionary (term counts, memory usage).
 pub type DocDictionaryInfo = DictionaryInfo;
-/// Storage stats alias for embedded API consumers.
+/// Statistics about a collection's packed storage layer (byte counts, compaction state).
 pub type DocStorageInfo = StorageInfo;
 
-/// Configuration for the embedded database.
+/// Configuration for opening an embedded [`Database`].
+///
+/// The default configuration sets `shard_count` to the number of available
+/// hardware threads, which is a good starting point for most workloads.
 pub struct Config {
-    /// Number of shard worker threads.
+    /// Number of shard worker threads to spawn.
+    ///
+    /// Each shard owns an independent key-space partition and runs on its own
+    /// OS thread, so this value controls both parallelism and memory partitioning.
     pub shard_count: usize,
 }
 
@@ -53,8 +97,27 @@ impl Default for Config {
 
 /// An embedded Kōra database instance.
 ///
-/// Uses the same multi-threaded shard engine as the server, but accessed
-/// via direct function calls instead of TCP.
+/// `Database` is the primary entry point for the embedded API. It owns a
+/// multi-threaded [`ShardEngine`](kora_core::shard::ShardEngine) and a
+/// [`DocEngine`](kora_doc::DocEngine), exposing typed methods for key-value,
+/// list, hash, set, vector, and document operations.
+///
+/// All methods are safe to call from multiple threads simultaneously.
+/// Key-value operations route through per-shard channels and block the caller
+/// until the owning shard worker completes the command. Document operations
+/// are coordinated by a `RwLock` over the in-memory document engine.
+///
+/// # Examples
+///
+/// ```rust
+/// use kora_embedded::{Config, Database};
+/// use std::sync::Arc;
+///
+/// let db = Arc::new(Database::open(Config { shard_count: 4 }));
+/// db.set("counter", b"0");
+/// db.incr("counter").unwrap();
+/// assert_eq!(db.get("counter"), Some(b"1".to_vec()));
+/// ```
 pub struct Database {
     engine: Arc<ShardEngine>,
     doc_engine: Arc<RwLock<DocEngine>>,
@@ -62,23 +125,31 @@ pub struct Database {
 
 impl Database {
     /// Open a new database with the given configuration.
+    ///
+    /// This spawns `config.shard_count` background worker threads that remain
+    /// alive for the lifetime of the returned `Database`.
     pub fn open(config: Config) -> Self {
         let engine = Arc::new(ShardEngine::new(config.shard_count));
         let doc_engine = Arc::new(RwLock::new(DocEngine::new()));
         Self { engine, doc_engine }
     }
 
-    /// Get a reference to the underlying engine.
+    /// Return a reference to the underlying [`ShardEngine`](kora_core::shard::ShardEngine).
     pub fn engine(&self) -> &ShardEngine {
         &self.engine
     }
 
-    /// Get a shared reference to the engine (for hybrid mode).
+    /// Return a shared handle to the underlying [`ShardEngine`](kora_core::shard::ShardEngine).
+    ///
+    /// Useful when integrating with components that need their own `Arc` clone,
+    /// such as hybrid server mode or custom command dispatch layers.
     pub fn shared_engine(&self) -> Arc<ShardEngine> {
         self.engine.clone()
     }
 
-    /// Get a shared handle to the embedded document engine.
+    /// Return a shared handle to the embedded [`DocEngine`](kora_doc::DocEngine).
+    ///
+    /// Callers are responsible for acquiring the inner `RwLock` appropriately.
     #[must_use]
     pub fn shared_doc_engine(&self) -> Arc<RwLock<DocEngine>> {
         self.doc_engine.clone()
@@ -102,18 +173,18 @@ impl Database {
         self.doc_engine.write().drop_collection(collection)
     }
 
-    /// Get collection metadata when present.
+    /// Return collection metadata, or `None` if the collection does not exist.
     #[must_use]
     pub fn doc_collection_info(&self, collection: &str) -> Option<DocCollectionInfo> {
         self.doc_engine.read().collection_info(collection)
     }
 
-    /// Get dictionary statistics for one collection.
+    /// Return dictionary statistics for a collection.
     pub fn doc_dictionary_info(&self, collection: &str) -> Result<DocDictionaryInfo, DocError> {
         self.doc_engine.read().dictionary_info(collection)
     }
 
-    /// Get packed storage statistics for one collection.
+    /// Return packed storage statistics for a collection.
     pub fn doc_storage_info(&self, collection: &str) -> Result<DocStorageInfo, DocError> {
         self.doc_engine.read().storage_info(collection)
     }
@@ -141,7 +212,10 @@ impl Database {
             .collect()
     }
 
-    /// Read one JSON document. Optional field projection accepts dotted paths.
+    /// Read one JSON document, optionally projecting a subset of fields.
+    ///
+    /// `projection` accepts dot-separated paths (e.g. `"address.city"`) to return
+    /// only the requested fields. Pass `None` to return the full document.
     pub fn doc_get(
         &self,
         collection: &str,
@@ -151,7 +225,10 @@ impl Database {
         self.doc_engine.read().get(collection, doc_id, projection)
     }
 
-    /// Read multiple JSON documents from one collection.
+    /// Read multiple JSON documents from a collection in one call.
+    ///
+    /// Missing documents appear as `None` in the returned vector, preserving
+    /// positional correspondence with `doc_ids`.
     pub fn doc_mget(
         &self,
         collection: &str,
@@ -179,12 +256,12 @@ impl Database {
             .update(collection, doc_id, mutations)
     }
 
-    /// Delete one document.
+    /// Delete a document. Returns `Ok(true)` if the document existed.
     pub fn doc_del(&self, collection: &str, doc_id: &str) -> Result<bool, DocError> {
         self.doc_engine.write().del(collection, doc_id)
     }
 
-    /// Check if one document exists.
+    /// Check whether a document exists in a collection.
     pub fn doc_exists(&self, collection: &str, doc_id: &str) -> Result<bool, DocError> {
         self.doc_engine.read().exists(collection, doc_id)
     }
@@ -207,7 +284,10 @@ impl Database {
         self.doc_engine.write().drop_index(collection, field)
     }
 
-    /// List all indexes for a collection as `(field_path, index_type_name)` pairs.
+    /// List all secondary indexes for a collection.
+    ///
+    /// Returns `(field_path, index_type_name)` pairs where `index_type_name`
+    /// is one of `"hash"`, `"sorted"`, `"array"`, or `"unique"`.
     pub fn doc_indexes(&self, collection: &str) -> Result<Vec<(String, String)>, DocError> {
         let indexes = self.doc_engine.read().indexes(collection)?;
         Ok(indexes
@@ -245,7 +325,7 @@ impl Database {
 
     // ─── String operations ───────────────────────────────────────
 
-    /// Get the value of a key.
+    /// Return the value stored at `key`, or `None` if the key does not exist.
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         match self.engine.dispatch_blocking(Command::Get {
             key: key.as_bytes().to_vec(),
@@ -255,7 +335,7 @@ impl Database {
         }
     }
 
-    /// Set a key-value pair.
+    /// Store a key-value pair, overwriting any existing value.
     pub fn set(&self, key: &str, value: &[u8]) {
         self.engine.dispatch_blocking(Command::Set {
             key: key.as_bytes().to_vec(),
@@ -267,7 +347,7 @@ impl Database {
         });
     }
 
-    /// Set a key-value pair with an expiry duration.
+    /// Store a key-value pair that expires after `ttl`.
     pub fn set_ex(&self, key: &str, value: &[u8], ttl: Duration) {
         self.engine.dispatch_blocking(Command::Set {
             key: key.as_bytes().to_vec(),
@@ -279,7 +359,7 @@ impl Database {
         });
     }
 
-    /// Delete a key, returning true if it existed.
+    /// Delete a key. Returns `true` if the key existed.
     pub fn del(&self, key: &str) -> bool {
         matches!(
             self.engine.dispatch_blocking(Command::Del {
@@ -289,7 +369,7 @@ impl Database {
         )
     }
 
-    /// Check if a key exists.
+    /// Check whether `key` exists in the store.
     pub fn exists(&self, key: &str) -> bool {
         matches!(
             self.engine.dispatch_blocking(Command::Exists {
@@ -299,7 +379,7 @@ impl Database {
         )
     }
 
-    /// Increment a key's integer value by 1.
+    /// Atomically increment a key's integer value by 1, returning the new value.
     pub fn incr(&self, key: &str) -> Result<i64, String> {
         match self.engine.dispatch_blocking(Command::Incr {
             key: key.as_bytes().to_vec(),
@@ -310,7 +390,7 @@ impl Database {
         }
     }
 
-    /// Get the old value and set a new one.
+    /// Atomically set `key` to `value` and return the previous value, if any.
     pub fn getset(&self, key: &str, value: &[u8]) -> Option<Vec<u8>> {
         match self.engine.dispatch_blocking(Command::GetSet {
             key: key.as_bytes().to_vec(),
@@ -321,7 +401,7 @@ impl Database {
         }
     }
 
-    /// Append a value to a key, returning the new length.
+    /// Append `value` to the string stored at `key`, returning the new byte length.
     pub fn append(&self, key: &str, value: &[u8]) -> i64 {
         match self.engine.dispatch_blocking(Command::Append {
             key: key.as_bytes().to_vec(),
@@ -342,7 +422,7 @@ impl Database {
         }
     }
 
-    /// Decrement a key's integer value by 1.
+    /// Atomically decrement a key's integer value by 1, returning the new value.
     pub fn decr(&self, key: &str) -> Result<i64, String> {
         match self.engine.dispatch_blocking(Command::Decr {
             key: key.as_bytes().to_vec(),
@@ -353,7 +433,7 @@ impl Database {
         }
     }
 
-    /// Increment a key's integer value by a given amount.
+    /// Atomically increment a key's integer value by `delta`, returning the new value.
     pub fn incrby(&self, key: &str, delta: i64) -> Result<i64, String> {
         match self.engine.dispatch_blocking(Command::IncrBy {
             key: key.as_bytes().to_vec(),
@@ -365,7 +445,7 @@ impl Database {
         }
     }
 
-    /// Decrement a key's integer value by a given amount.
+    /// Atomically decrement a key's integer value by `delta`, returning the new value.
     pub fn decrby(&self, key: &str, delta: i64) -> Result<i64, String> {
         match self.engine.dispatch_blocking(Command::DecrBy {
             key: key.as_bytes().to_vec(),
@@ -377,7 +457,9 @@ impl Database {
         }
     }
 
-    /// Get the values of multiple keys.
+    /// Return the values of multiple keys in a single call.
+    ///
+    /// Missing keys appear as `None`, preserving positional correspondence with `keys`.
     pub fn mget(&self, keys: &[&str]) -> Vec<Option<Vec<u8>>> {
         let cmd_keys: Vec<Vec<u8>> = keys.iter().map(|k| k.as_bytes().to_vec()).collect();
         match self
@@ -395,7 +477,7 @@ impl Database {
         }
     }
 
-    /// Set multiple key-value pairs.
+    /// Store multiple key-value pairs in a single call.
     pub fn mset(&self, entries: &[(&str, &[u8])]) {
         let cmd_entries: Vec<(Vec<u8>, Vec<u8>)> = entries
             .iter()
@@ -406,7 +488,9 @@ impl Database {
         });
     }
 
-    /// Set a key only if it does not already exist. Returns true if set.
+    /// Store a key-value pair only if the key does not already exist.
+    ///
+    /// Returns `true` if the key was set, `false` if it already existed.
     pub fn setnx(&self, key: &str, value: &[u8]) -> bool {
         matches!(
             self.engine.dispatch_blocking(Command::SetNx {
@@ -417,7 +501,7 @@ impl Database {
         )
     }
 
-    /// Set a TTL on a key in seconds. Returns true if the key exists.
+    /// Set a time-to-live on `key`. Returns `true` if the key exists.
     pub fn expire(&self, key: &str, seconds: u64) -> bool {
         matches!(
             self.engine.dispatch_blocking(Command::Expire {
@@ -428,7 +512,9 @@ impl Database {
         )
     }
 
-    /// Remove the TTL on a key. Returns true if the key exists and had a TTL.
+    /// Remove the time-to-live on `key`, making it persistent.
+    ///
+    /// Returns `true` if the key existed and had a TTL.
     pub fn persist(&self, key: &str) -> bool {
         matches!(
             self.engine.dispatch_blocking(Command::Persist {
@@ -438,7 +524,9 @@ impl Database {
         )
     }
 
-    /// Get the TTL of a key in seconds. Returns None if no TTL or key doesn't exist.
+    /// Return the remaining time-to-live (in seconds) for `key`.
+    ///
+    /// Returns `None` if the key does not exist or has no TTL set.
     pub fn ttl(&self, key: &str) -> Option<i64> {
         match self.engine.dispatch_blocking(Command::Ttl {
             key: key.as_bytes().to_vec(),
@@ -448,7 +536,7 @@ impl Database {
         }
     }
 
-    /// Get the type of a key as a string.
+    /// Return the data type of the value stored at `key` (e.g. `"string"`, `"list"`, `"none"`).
     pub fn key_type(&self, key: &str) -> String {
         match self.engine.dispatch_blocking(Command::Type {
             key: key.as_bytes().to_vec(),
@@ -476,7 +564,7 @@ impl Database {
 
     // ─── List operations ─────────────────────────────────────────
 
-    /// Push values to the left of a list, returning the new length.
+    /// Prepend one or more values to a list, returning the new length.
     pub fn lpush(&self, key: &str, values: &[&[u8]]) -> i64 {
         match self.engine.dispatch_blocking(Command::LPush {
             key: key.as_bytes().to_vec(),
@@ -487,7 +575,7 @@ impl Database {
         }
     }
 
-    /// Push values to the right of a list, returning the new length.
+    /// Append one or more values to a list, returning the new length.
     pub fn rpush(&self, key: &str, values: &[&[u8]]) -> i64 {
         match self.engine.dispatch_blocking(Command::RPush {
             key: key.as_bytes().to_vec(),
@@ -498,7 +586,9 @@ impl Database {
         }
     }
 
-    /// Get a range of elements from a list.
+    /// Return a contiguous range of elements from a list.
+    ///
+    /// Negative indices count from the end (`-1` is the last element).
     pub fn lrange(&self, key: &str, start: i64, stop: i64) -> Vec<Vec<u8>> {
         match self.engine.dispatch_blocking(Command::LRange {
             key: key.as_bytes().to_vec(),
@@ -516,7 +606,7 @@ impl Database {
         }
     }
 
-    /// Pop from the left of a list.
+    /// Remove and return the first element of a list.
     pub fn lpop(&self, key: &str) -> Option<Vec<u8>> {
         match self.engine.dispatch_blocking(Command::LPop {
             key: key.as_bytes().to_vec(),
@@ -526,7 +616,7 @@ impl Database {
         }
     }
 
-    /// Pop from the right of a list.
+    /// Remove and return the last element of a list.
     pub fn rpop(&self, key: &str) -> Option<Vec<u8>> {
         match self.engine.dispatch_blocking(Command::RPop {
             key: key.as_bytes().to_vec(),
@@ -536,7 +626,7 @@ impl Database {
         }
     }
 
-    /// Get the length of a list.
+    /// Return the number of elements in a list.
     pub fn llen(&self, key: &str) -> i64 {
         match self.engine.dispatch_blocking(Command::LLen {
             key: key.as_bytes().to_vec(),
@@ -546,7 +636,7 @@ impl Database {
         }
     }
 
-    /// Get an element from a list by index.
+    /// Return the element at `index` in a list, or `None` if out of range.
     pub fn lindex(&self, key: &str, index: i64) -> Option<Vec<u8>> {
         match self.engine.dispatch_blocking(Command::LIndex {
             key: key.as_bytes().to_vec(),
@@ -559,7 +649,7 @@ impl Database {
 
     // ─── Hash operations ─────────────────────────────────────────
 
-    /// Set a hash field.
+    /// Set a field in a hash, creating the hash if it does not exist.
     pub fn hset(&self, key: &str, field: &str, value: &[u8]) {
         self.engine.dispatch_blocking(Command::HSet {
             key: key.as_bytes().to_vec(),
@@ -567,7 +657,7 @@ impl Database {
         });
     }
 
-    /// Get a hash field value.
+    /// Return the value of a hash field, or `None` if the field or hash does not exist.
     pub fn hget(&self, key: &str, field: &str) -> Option<Vec<u8>> {
         match self.engine.dispatch_blocking(Command::HGet {
             key: key.as_bytes().to_vec(),
@@ -578,7 +668,7 @@ impl Database {
         }
     }
 
-    /// Delete hash fields, returning the number removed.
+    /// Remove one or more fields from a hash, returning the number of fields removed.
     pub fn hdel(&self, key: &str, fields: &[&str]) -> i64 {
         match self.engine.dispatch_blocking(Command::HDel {
             key: key.as_bytes().to_vec(),
@@ -589,7 +679,7 @@ impl Database {
         }
     }
 
-    /// Get all field-value pairs from a hash.
+    /// Return all field-value pairs from a hash.
     pub fn hgetall(&self, key: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
         match self.engine.dispatch_blocking(Command::HGetAll {
             key: key.as_bytes().to_vec(),
@@ -610,7 +700,7 @@ impl Database {
         }
     }
 
-    /// Get the number of fields in a hash.
+    /// Return the number of fields in a hash.
     pub fn hlen(&self, key: &str) -> i64 {
         match self.engine.dispatch_blocking(Command::HLen {
             key: key.as_bytes().to_vec(),
@@ -620,7 +710,7 @@ impl Database {
         }
     }
 
-    /// Check if a hash field exists.
+    /// Check whether a field exists in a hash.
     pub fn hexists(&self, key: &str, field: &str) -> bool {
         matches!(
             self.engine.dispatch_blocking(Command::HExists {
@@ -631,7 +721,7 @@ impl Database {
         )
     }
 
-    /// Increment a hash field by a given amount.
+    /// Atomically increment a hash field's integer value by `delta`, returning the new value.
     pub fn hincrby(&self, key: &str, field: &str, delta: i64) -> Result<i64, String> {
         match self.engine.dispatch_blocking(Command::HIncrBy {
             key: key.as_bytes().to_vec(),
@@ -646,7 +736,7 @@ impl Database {
 
     // ─── Set operations ──────────────────────────────────────────
 
-    /// Add members to a set, returning the number added.
+    /// Add one or more members to a set, returning the number of new members added.
     pub fn sadd(&self, key: &str, members: &[&[u8]]) -> i64 {
         match self.engine.dispatch_blocking(Command::SAdd {
             key: key.as_bytes().to_vec(),
@@ -657,7 +747,7 @@ impl Database {
         }
     }
 
-    /// Get all members of a set.
+    /// Return all members of a set.
     pub fn smembers(&self, key: &str) -> Vec<Vec<u8>> {
         match self.engine.dispatch_blocking(Command::SMembers {
             key: key.as_bytes().to_vec(),
@@ -673,7 +763,7 @@ impl Database {
         }
     }
 
-    /// Remove members from a set, returning the number removed.
+    /// Remove one or more members from a set, returning the number of members removed.
     pub fn srem(&self, key: &str, members: &[&[u8]]) -> i64 {
         match self.engine.dispatch_blocking(Command::SRem {
             key: key.as_bytes().to_vec(),
@@ -684,7 +774,7 @@ impl Database {
         }
     }
 
-    /// Check if a member exists in a set.
+    /// Check whether `member` belongs to the set stored at `key`.
     pub fn sismember(&self, key: &str, member: &[u8]) -> bool {
         matches!(
             self.engine.dispatch_blocking(Command::SIsMember {
@@ -695,7 +785,7 @@ impl Database {
         )
     }
 
-    /// Get the number of members in a set.
+    /// Return the number of members in a set.
     pub fn scard(&self, key: &str) -> i64 {
         match self.engine.dispatch_blocking(Command::SCard {
             key: key.as_bytes().to_vec(),
@@ -707,7 +797,7 @@ impl Database {
 
     // ─── Server operations ───────────────────────────────────────
 
-    /// Get the total number of keys.
+    /// Return the total number of keys across all shards.
     pub fn db_size(&self) -> i64 {
         match self.engine.dispatch_blocking(Command::DbSize) {
             CommandResponse::Integer(n) => n,
@@ -715,7 +805,7 @@ impl Database {
         }
     }
 
-    /// Remove all keys.
+    /// Remove all keys from every shard.
     pub fn flush_db(&self) {
         self.engine.dispatch_blocking(Command::FlushDb);
     }
@@ -789,15 +879,16 @@ impl Database {
 
     // ─── Hybrid mode ────────────────────────────────────────────
 
-    /// Start a TCP listener on the given address.
+    /// Start a TCP listener on `addr` for hybrid embedded + network mode.
     ///
-    /// Returns a `JoinHandle` for the background server task. The server runs
-    /// until the returned shutdown sender is signaled or the handle is dropped.
+    /// Returns a `JoinHandle` for the background server task and a
+    /// `watch::Sender` that shuts the server down when `true` is sent.
     ///
-    /// Note: the server creates its own shard stores — data is not shared with
-    /// the embedded `Database` instance.
+    /// **Note:** the server creates its own shard stores -- data is not shared
+    /// with the embedded `Database` key-value store. This is intended for
+    /// scenarios where external clients need independent access.
     ///
-    /// Requires the `server` feature.
+    /// Requires the `server` Cargo feature.
     #[cfg(feature = "server")]
     pub fn start_listener(
         &self,

@@ -1,8 +1,11 @@
-//! Configuration file parsing for Kōra.
+//! TOML configuration file parsing for the Kōra CLI.
 //!
-//! Supports TOML configuration files with CLI argument overrides.
+//! [`FileConfig`] is the top-level struct deserialized from a TOML file
+//! (typically `kora.toml`). Every field is optional so the file can contain
+//! only the values that differ from the built-in defaults. CLI arguments
+//! in `main.rs` take precedence over any file-level value.
 //!
-//! ## Example config file (kora.toml)
+//! # Example
 //!
 //! ```toml
 //! bind = "0.0.0.0"
@@ -31,10 +34,6 @@ pub struct FileConfig {
     pub port: Option<u16>,
     /// Number of worker threads.
     pub workers: Option<usize>,
-    /// Address for the optional memcached listener.
-    pub memcached_bind: Option<String>,
-    /// Port for the optional memcached listener.
-    pub memcached_port: Option<u16>,
     /// Number of Tokio runtime worker threads.
     pub runtime_workers: Option<usize>,
     /// Log level.
@@ -43,14 +42,11 @@ pub struct FileConfig {
     pub storage: StorageFileConfig,
     /// CDC ring buffer capacity per shard (0 = disabled).
     pub cdc_capacity: Option<usize>,
-    /// WASM scripting fuel budget (0 = disabled).
-    pub script_max_fuel: Option<u64>,
+
     /// Port for Prometheus metrics HTTP endpoint (0 = disabled).
     pub metrics_port: Option<u16>,
     /// Optional Unix socket path.
     pub unix_socket: Option<String>,
-    /// Enable tenant resource-limit checks on command dispatch.
-    pub tenant_limits_enabled: Option<bool>,
 }
 
 /// Storage section of the config file.
@@ -96,8 +92,6 @@ mod tests {
 bind = "0.0.0.0"
 port = 7379
 workers = 8
-memcached_bind = "0.0.0.0"
-memcached_port = 11211
 log_level = "debug"
 
 [storage]
@@ -113,8 +107,6 @@ wal_max_bytes = 134217728
         assert_eq!(config.bind, Some("0.0.0.0".into()));
         assert_eq!(config.port, Some(7379));
         assert_eq!(config.workers, Some(8));
-        assert_eq!(config.memcached_bind, Some("0.0.0.0".into()));
-        assert_eq!(config.memcached_port, Some(11211));
         assert_eq!(config.log_level, Some("debug".into()));
         assert_eq!(config.storage.data_dir, Some("/var/lib/kora".into()));
         assert_eq!(config.storage.wal_sync, Some("every_write".into()));
@@ -130,7 +122,6 @@ wal_max_bytes = 134217728
         assert_eq!(config.port, Some(8080));
         assert_eq!(config.bind, None);
         assert_eq!(config.workers, None);
-        assert_eq!(config.memcached_port, None);
     }
 
     #[test]

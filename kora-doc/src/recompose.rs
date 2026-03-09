@@ -1,4 +1,24 @@
-//! Packed document reconstruction into JSON.
+//! Packed document to JSON reconstruction pipeline.
+//!
+//! [`Recomposer`] is the inverse of
+//! [`Decomposer`](crate::decompose::Decomposer). Given a [`PackedDoc`], the
+//! [`IdRegistry`], and the collection's [`ValueDictionary`], it rebuilds a
+//! `serde_json::Value` by:
+//!
+//! 1. Iterating over packed fields in field-ID order.
+//! 2. Resolving each numeric `FieldId` back to its dot-separated path string
+//!    via the registry.
+//! 3. Decoding the [`FieldValue`](crate::packed::FieldValue) into a JSON
+//!    primitive, looking up `DictRef` values through the dictionary.
+//! 4. Inserting each value into a nested `serde_json::Map` tree by splitting
+//!    the dotted path and creating intermediate objects as needed.
+//!
+//! ## Projection
+//!
+//! [`Recomposer::project`] reconstructs only a caller-specified subset of
+//! fields, leveraging [`PackedDoc::read_field`]'s O(log F) binary search to
+//! skip unneeded data. This is the fast path for queries that select a small
+//! number of fields from large documents.
 
 use std::str;
 

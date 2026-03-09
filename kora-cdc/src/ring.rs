@@ -1,46 +1,58 @@
 //! Per-shard CDC ring buffer.
 //!
-//! Captures every mutation in a fixed-size circular buffer. Old events are
-//! overwritten when the buffer wraps. Consumers track their position via
-//! a sequence number.
+//! Each Kōra shard owns a [`CdcRing`] that records every mutation as a
+//! [`CdcEvent`] with a monotonically increasing sequence number. The ring has
+//! a fixed capacity: once full, the oldest events are silently overwritten.
+//! Consumers detect lost events through the gap flag returned by [`CdcRing::read`].
 
-/// The type of mutation captured.
+/// Discriminant for the kind of mutation recorded in a [`CdcEvent`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CdcOp {
-    /// Key was set/updated.
+    /// A string key was created or overwritten.
     Set,
-    /// Key was deleted.
+    /// A key was explicitly deleted.
     Del,
-    /// Key was expired.
+    /// A key was removed by TTL expiration.
     Expire,
-    /// Hash field was set.
+    /// A field was set inside a hash.
     HSet,
-    /// Value pushed to list.
+    /// A value was pushed to the head of a list.
     LPush,
-    /// Value pushed to list (right).
+    /// A value was pushed to the tail of a list.
     RPush,
-    /// Member added to set.
+    /// A member was added to a set.
     SAdd,
-    /// Database was flushed.
+    /// The entire database was flushed.
     FlushDb,
 }
 
-/// A single CDC event.
+/// A single captured mutation event.
+///
+/// Every write operation in a shard produces one `CdcEvent`. Events are
+/// immutable once written to the ring and are identified by their unique,
+/// monotonically increasing [`seq`](CdcEvent::seq).
 #[derive(Debug, Clone)]
 pub struct CdcEvent {
-    /// Monotonically increasing sequence number.
+    /// Unique, monotonically increasing sequence number assigned at write time.
     pub seq: u64,
-    /// Timestamp (milliseconds since shard epoch).
+    /// Wall-clock timestamp in milliseconds provided by the caller.
     pub timestamp_ms: u64,
-    /// The operation type.
+    /// The kind of mutation that occurred.
     pub op: CdcOp,
-    /// The affected key (empty for FlushDb).
+    /// The affected key. Empty for [`CdcOp::FlushDb`].
     pub key: Vec<u8>,
-    /// The new value, if applicable.
+    /// The new value, when the operation carries one (e.g. `Set`, `HSet`).
     pub value: Option<Vec<u8>>,
 }
 
-/// A fixed-size ring buffer for CDC events.
+/// Fixed-capacity circular buffer for CDC events.
+///
+/// Events are appended with [`push`](CdcRing::push) and assigned a
+/// monotonically increasing sequence number. When the buffer is full the
+/// oldest slot is silently overwritten. Consumers read batches via
+/// [`read`](CdcRing::read) and are informed through
+/// [`CdcReadResult::gap`] when events they have not yet consumed were
+/// evicted.
 pub struct CdcRing {
     buffer: Vec<Option<CdcEvent>>,
     capacity: usize,
@@ -49,7 +61,11 @@ pub struct CdcRing {
 }
 
 impl CdcRing {
-    /// Create a new ring buffer with the given capacity.
+    /// Create a new ring buffer that can hold up to `capacity` events.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is zero.
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "CDC ring capacity must be > 0");
         let mut buffer = Vec::with_capacity(capacity);
@@ -64,7 +80,10 @@ impl CdcRing {
         }
     }
 
-    /// Push an event into the ring buffer.
+    /// Append a mutation event to the ring, assigning it the next sequence number.
+    ///
+    /// If the buffer is full the oldest event is overwritten and
+    /// [`start_seq`](CdcRing::start_seq) advances accordingly.
     pub fn push(&mut self, op: CdcOp, key: Vec<u8>, value: Option<Vec<u8>>, timestamp_ms: u64) {
         let seq = self.write_seq;
         let idx = (seq as usize) % self.capacity;
@@ -79,37 +98,36 @@ impl CdcRing {
 
         self.write_seq += 1;
 
-        // Update start_seq if we've wrapped
         if self.write_seq > self.capacity as u64 {
             self.start_seq = self.write_seq - self.capacity as u64;
         }
     }
 
-    /// Get the current write sequence number (next seq to be written).
+    /// Return the sequence number that will be assigned to the next pushed event.
     pub fn write_seq(&self) -> u64 {
         self.write_seq
     }
 
-    /// Get the earliest available sequence number.
+    /// Return the earliest sequence number still available in the buffer.
     pub fn start_seq(&self) -> u64 {
         self.start_seq
     }
 
-    /// Get the number of events currently in the buffer.
+    /// Return the number of events currently retained in the buffer.
     pub fn len(&self) -> usize {
         (self.write_seq - self.start_seq) as usize
     }
 
-    /// Check if the buffer is empty.
+    /// Return `true` if no events have been pushed yet.
     pub fn is_empty(&self) -> bool {
         self.write_seq == 0
     }
 
-    /// Read events starting from the given sequence number.
+    /// Read up to `limit` events starting at `from_seq`.
     ///
-    /// Returns up to `limit` events and the next sequence to read from.
-    /// If `from_seq` is behind the buffer (events were overwritten), starts
-    /// from `start_seq` and returns a gap indicator.
+    /// If `from_seq` has already been evicted the read begins at the
+    /// earliest available sequence and [`CdcReadResult::gap`] is set to
+    /// `true`, signalling that the consumer missed events.
     pub fn read(&self, from_seq: u64, limit: usize) -> CdcReadResult {
         if from_seq >= self.write_seq {
             return CdcReadResult {
@@ -145,7 +163,9 @@ impl CdcRing {
         }
     }
 
-    /// Get a single event by sequence number, if available.
+    /// Look up a single event by its sequence number.
+    ///
+    /// Returns `None` if `seq` has been evicted or has not been written yet.
     pub fn get(&self, seq: u64) -> Option<&CdcEvent> {
         if seq < self.start_seq || seq >= self.write_seq {
             return None;
@@ -155,14 +175,15 @@ impl CdcRing {
     }
 }
 
-/// Result of reading from the CDC ring buffer.
+/// Outcome of a [`CdcRing::read`] call.
 #[derive(Debug)]
 pub struct CdcReadResult {
-    /// The events read.
+    /// The batch of events returned by this read.
     pub events: Vec<CdcEvent>,
-    /// The next sequence number to read from.
+    /// The sequence number the caller should pass to the next read.
     pub next_seq: u64,
-    /// True if events were lost (consumer fell behind).
+    /// `true` when the requested `from_seq` had already been evicted,
+    /// meaning the consumer missed one or more events.
     pub gap: bool,
 }
 

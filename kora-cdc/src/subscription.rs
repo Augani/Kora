@@ -1,21 +1,29 @@
-//! CDC subscription management.
+//! Lightweight CDC subscriptions with cursor tracking.
 //!
-//! Manages consumer subscriptions with pattern matching and cursor tracking.
+//! A [`Subscription`] provides a stateful read cursor over a
+//! [`CdcRing`](crate::ring::CdcRing). Each call to
+//! [`Subscription::poll`] returns the next batch of events and advances
+//! the cursor, optionally filtering keys through a glob pattern.
+//!
+//! Multiple subscriptions can be managed together through a
+//! [`SubscriptionManager`], which assigns monotonic IDs and exposes
+//! subscribe / unsubscribe lifecycle operations.
 
 use crate::ring::{CdcEvent, CdcReadResult, CdcRing};
 
-/// A CDC subscription that tracks a consumer's position.
+/// A cursor-based CDC subscription.
+///
+/// Holds a read position into a [`CdcRing`](crate::ring::CdcRing) and an
+/// optional glob pattern used to filter events by key. Call [`poll`](Subscription::poll)
+/// to consume the next batch of matching events.
 pub struct Subscription {
-    /// Unique subscription ID.
     id: u64,
-    /// Glob pattern to filter keys (None = all keys).
     pattern: Option<String>,
-    /// Current read cursor (sequence number).
     cursor: u64,
 }
 
 impl Subscription {
-    /// Create a new subscription.
+    /// Create a subscription starting from sequence 0.
     pub fn new(id: u64, pattern: Option<String>) -> Self {
         Self {
             id,
@@ -24,7 +32,7 @@ impl Subscription {
         }
     }
 
-    /// Create a subscription starting from a specific sequence.
+    /// Create a subscription starting from the given sequence number.
     pub fn with_cursor(id: u64, pattern: Option<String>, cursor: u64) -> Self {
         Self {
             id,
@@ -33,28 +41,29 @@ impl Subscription {
         }
     }
 
-    /// Get the subscription ID.
+    /// Return the unique subscription ID.
     pub fn id(&self) -> u64 {
         self.id
     }
 
-    /// Get the current cursor position.
+    /// Return the current read-cursor position (next sequence to consume).
     pub fn cursor(&self) -> u64 {
         self.cursor
     }
 
-    /// Get the pattern, if any.
+    /// Return the glob pattern, if one was set.
     pub fn pattern(&self) -> Option<&str> {
         self.pattern.as_deref()
     }
 
-    /// Poll for new events from the ring buffer.
+    /// Read up to `limit` new events from `ring`, advancing the cursor.
     ///
-    /// Returns matching events and updates the internal cursor.
+    /// When a pattern is set, only events whose key matches the glob are
+    /// included in the returned batch. The cursor still advances past
+    /// non-matching events so they are not re-examined on the next poll.
     pub fn poll(&mut self, ring: &CdcRing, limit: usize) -> CdcReadResult {
         let result = ring.read(self.cursor, limit);
 
-        // Filter by pattern if set
         let filtered_events: Vec<CdcEvent> = if let Some(ref pattern) = self.pattern {
             result
                 .events
@@ -74,20 +83,23 @@ impl Subscription {
         }
     }
 
-    /// Reset the cursor to a specific position.
+    /// Reposition the read cursor to an arbitrary sequence number.
     pub fn seek(&mut self, seq: u64) {
         self.cursor = seq;
     }
 }
 
-/// Manager for multiple CDC subscriptions.
+/// Registry for multiple CDC subscriptions.
+///
+/// Assigns monotonically increasing IDs and provides lookup, creation, and
+/// removal of [`Subscription`] instances.
 pub struct SubscriptionManager {
     subscriptions: Vec<Subscription>,
     next_id: u64,
 }
 
 impl SubscriptionManager {
-    /// Create a new subscription manager.
+    /// Create an empty subscription manager.
     pub fn new() -> Self {
         Self {
             subscriptions: Vec::new(),
@@ -95,7 +107,7 @@ impl SubscriptionManager {
         }
     }
 
-    /// Add a new subscription, returning its ID.
+    /// Create a subscription starting at sequence 0 and return its ID.
     pub fn subscribe(&mut self, pattern: Option<String>) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -103,7 +115,7 @@ impl SubscriptionManager {
         id
     }
 
-    /// Add a subscription with a specific starting cursor.
+    /// Create a subscription beginning at `cursor` and return its ID.
     pub fn subscribe_at(&mut self, pattern: Option<String>, cursor: u64) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -112,24 +124,24 @@ impl SubscriptionManager {
         id
     }
 
-    /// Remove a subscription by ID.
+    /// Remove a subscription by ID. Returns `true` if it existed.
     pub fn unsubscribe(&mut self, id: u64) -> bool {
         let before = self.subscriptions.len();
         self.subscriptions.retain(|s| s.id != id);
         self.subscriptions.len() < before
     }
 
-    /// Get a mutable reference to a subscription by ID.
+    /// Look up a subscription by ID, returning a mutable reference.
     pub fn get_mut(&mut self, id: u64) -> Option<&mut Subscription> {
         self.subscriptions.iter_mut().find(|s| s.id == id)
     }
 
-    /// Get the number of active subscriptions.
+    /// Return the number of active subscriptions.
     pub fn len(&self) -> usize {
         self.subscriptions.len()
     }
 
-    /// Check if there are no subscriptions.
+    /// Return `true` if there are no active subscriptions.
     pub fn is_empty(&self) -> bool {
         self.subscriptions.is_empty()
     }
@@ -141,9 +153,10 @@ impl Default for SubscriptionManager {
     }
 }
 
-/// Simple glob pattern matching for CDC key filters.
+/// Match a glob `pattern` against a UTF-8 `key`.
 ///
-/// Supports `*` (any sequence) and `?` (any single byte).
+/// Supports `*` (zero or more characters) and `?` (exactly one character).
+/// Returns `false` for non-UTF-8 keys.
 fn glob_match(pattern: &str, key: &[u8]) -> bool {
     let key_str = match std::str::from_utf8(key) {
         Ok(s) => s,

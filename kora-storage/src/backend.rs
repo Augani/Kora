@@ -1,7 +1,22 @@
-//! Storage backend trait and implementations.
+//! Cold-tier storage backend trait and implementations.
 //!
-//! Defines the interface for persistent key-value storage that backs the
-//! cold tier. Values are addressed by their key hash for efficient lookup.
+//! This module defines [`StorageBackend`], the trait that all cold-tier
+//! persistence implementations must satisfy, and provides [`FileBackend`] as
+//! the default implementation.
+//!
+//! ## Design
+//!
+//! The cold tier stores infrequently accessed data that has been evicted from
+//! hot RAM. Values are addressed by a `u64` key hash (not by the original key
+//! bytes) so the backend remains decoupled from Kōra's key encoding.
+//!
+//! [`FileBackend`] uses a single append-only data file with LZ4 compression
+//! and an in-memory index that maps each key hash to its file offset and
+//! record length. Overwrites and deletes are lazy — stale records accumulate
+//! until an explicit [`compact`](FileBackend::compact) pass rewrites the file.
+//!
+//! The index can be persisted to a sidecar `.idx` file for fast recovery
+//! without scanning the data file.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -45,7 +60,7 @@ pub struct FileBackend {
 
 struct FileBackendInner {
     file: File,
-    index: HashMap<u64, (u64, u32)>, // key_hash → (offset, length)
+    index: HashMap<u64, (u64, u32)>,
     write_offset: u64,
     deleted: usize,
 }
@@ -68,7 +83,6 @@ impl FileBackend {
 
         let write_offset = file.metadata()?.len();
 
-        // Load index if it exists
         let index = if index_path.exists() {
             load_index(&index_path)?
         } else {
@@ -132,12 +146,10 @@ impl FileBackend {
             .collect();
 
         for (key_hash, offset, length) in entries {
-            // Read old data
             inner.file.seek(SeekFrom::Start(offset))?;
             let mut buf = vec![0u8; length as usize];
             inner.file.read_exact(&mut buf)?;
 
-            // Write to new file
             tmp_file.write_all(&buf)?;
             new_index.insert(key_hash, (new_offset, length));
             new_offset += length as u64;
@@ -174,12 +186,10 @@ impl StorageBackend for FileBackend {
 
         inner.file.seek(SeekFrom::Start(offset))?;
 
-        // Read length prefix
         let mut len_buf = [0u8; 4];
         inner.file.read_exact(&mut len_buf)?;
         let compressed_len = u32::from_le_bytes(len_buf) as usize;
 
-        // Read compressed data
         let mut compressed = vec![0u8; compressed_len];
         inner.file.read_exact(&mut compressed)?;
 
@@ -194,7 +204,6 @@ impl StorageBackend for FileBackend {
             .lock()
             .map_err(|e| StorageError::LockPoisoned(e.to_string()))?;
 
-        // If key already exists, mark old space as wasted
         if inner.index.contains_key(&key_hash) {
             inner.deleted += 1;
         }
@@ -235,8 +244,6 @@ impl StorageBackend for FileBackend {
         Ok(())
     }
 }
-
-// ─── Index persistence ─────────────────────────────────────────────────────
 
 fn save_index(path: &Path, index: &HashMap<u64, (u64, u32)>) -> Result<()> {
     let tmp_path = path.with_extension("idx.tmp");

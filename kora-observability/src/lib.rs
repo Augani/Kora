@@ -1,14 +1,20 @@
 //! # kora-observability
 //!
-//! Observability subsystem for Kōra.
+//! Observability subsystem for the Kōra cache engine.
 //!
-//! Provides always-on, near-zero overhead statistics including per-command
-//! counters, hot key detection via Count-Min Sketch, and memory attribution.
+//! Provides always-on, near-zero overhead instrumentation for production
+//! monitoring: per-command counters, HDR latency histograms, hot key
+//! detection via Count-Min Sketch, memory attribution by key prefix, and
+//! Prometheus-compatible metrics exposition.
+//!
+//! All primitives are designed for concurrent access from shard worker
+//! threads using atomic counters, lock-free reads, and fine-grained
+//! mutexes where necessary.
 //!
 //! ## Modules
 //!
 //! - [`histogram`] — HDR histograms for per-command latency distributions
-//! - [`prometheus`] — Prometheus exposition format output
+//! - [`prometheus`] — Prometheus text exposition format renderer
 //! - [`sketch`] — Count-Min Sketch for probabilistic frequency estimation
 //! - [`stats`] — Per-shard statistics, command timers, and snapshot merging
 //! - [`trie`] — Prefix trie for memory attribution by key prefix

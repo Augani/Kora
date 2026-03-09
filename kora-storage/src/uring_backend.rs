@@ -42,23 +42,15 @@ const DEFAULT_QUEUE_DEPTH: u32 = 32;
 /// and the `io_uring` instance) since io_uring submission and completion
 /// must be coordinated.
 pub struct IoUringBackend {
-    /// Path to the data file on disk.
     data_path: PathBuf,
-    /// Protected mutable state.
     inner: Mutex<IoUringInner>,
 }
 
 struct IoUringInner {
-    /// The raw file descriptor for the data file, kept open for the
-    /// lifetime of the backend.
     fd: std::fs::File,
-    /// In-memory index: key_hash → (file_offset, total_record_length).
     index: HashMap<u64, (u64, u32)>,
-    /// Current append offset in the data file.
     write_offset: u64,
-    /// Number of logically deleted entries (for future compaction).
     deleted: usize,
-    /// The io_uring instance used for submitting I/O operations.
     ring: IoUring,
 }
 
@@ -248,7 +240,6 @@ impl StorageBackend for IoUringBackend {
 
         let raw_fd = inner.fd.as_raw_fd();
 
-        // Read the 4-byte length prefix.
         let mut len_buf = [0u8; 4];
         let n = uring_read(&mut inner.ring, raw_fd, &mut len_buf, offset)?;
         if n < 4 {
@@ -259,7 +250,6 @@ impl StorageBackend for IoUringBackend {
         }
         let compressed_len = u32::from_le_bytes(len_buf) as usize;
 
-        // Read compressed payload.
         let mut compressed = vec![0u8; compressed_len];
         let n = uring_read(&mut inner.ring, raw_fd, &mut compressed, offset + 4)?;
         if n < compressed_len {
@@ -288,7 +278,6 @@ impl StorageBackend for IoUringBackend {
         let offset = inner.write_offset;
         let raw_fd = inner.fd.as_raw_fd();
 
-        // Build the record: [len: u32][compressed_data...]
         let len_bytes = (compressed.len() as u32).to_le_bytes();
         let mut record = Vec::with_capacity(4 + compressed.len());
         record.extend_from_slice(&len_bytes);
@@ -332,8 +321,6 @@ impl StorageBackend for IoUringBackend {
         uring_fsync(&mut inner.ring, raw_fd)
     }
 }
-
-// ─── Index persistence (mirrors FileBackend format) ─────────────────────────
 
 fn save_index(path: &Path, index: &HashMap<u64, (u64, u32)>) -> Result<()> {
     use std::io::Write;

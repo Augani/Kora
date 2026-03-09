@@ -1,16 +1,32 @@
 //! Async storage I/O abstraction with platform-specific backends.
 //!
-//! Defines [`AsyncStorageIo`] for submitting non-blocking reads and writes,
-//! with a [`SyncFallbackBackend`] for all platforms and a stub
-//! [`IoUringBackend`] for Linux.
+//! This module defines [`AsyncStorageIo`], a trait for submitting non-blocking
+//! read and write operations against a data file. Callers receive an
+//! [`IoToken`] on submission and later poll for [`IoCompletion`] results,
+//! decoupling I/O initiation from completion.
+//!
+//! ## Backends
+//!
+//! - [`SyncFallbackBackend`] — Available on all platforms. Performs I/O inline
+//!   and buffers results for the next `poll_completions` call. This is the
+//!   production default on non-Linux systems and serves as the baseline
+//!   correctness reference.
+//!
+//! - [`IoUringBackend`] (Linux only) — Currently delegates to
+//!   `SyncFallbackBackend`; intended to be backed by the kernel `io_uring`
+//!   interface for true asynchronous I/O. The separate
+//!   [`uring_backend`](crate::uring_backend) module (behind the `io-uring`
+//!   feature flag) implements the full io_uring `StorageBackend` path.
+//!
+//! Use [`create_async_backend`] to get the platform-appropriate implementation.
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// An opaque token identifying a submitted I/O operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IoToken(pub u64);
 
 /// The result of a completed I/O operation.
@@ -149,9 +165,9 @@ impl SyncFallbackBackend {
 
 /// io_uring-based async storage backend (Linux only).
 ///
-/// TODO: Replace inner `SyncFallbackBackend` delegation with actual `io-uring`
-/// crate calls for true async I/O on Linux. Currently delegates to sync I/O
-/// as a stub implementation.
+/// Currently delegates to [`SyncFallbackBackend`] as a stub. The full
+/// io_uring path is implemented in [`crate::uring_backend::IoUringBackend`]
+/// behind the `io-uring` feature flag.
 #[cfg(target_os = "linux")]
 pub struct IoUringBackend {
     inner: SyncFallbackBackend,

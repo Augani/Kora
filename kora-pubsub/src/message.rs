@@ -1,4 +1,9 @@
-//! Pub/Sub message types.
+//! Pub/Sub message types delivered to subscribers.
+//!
+//! [`PubSubMessage`] is the envelope passed through a [`super::MessageSink`].
+//! It distinguishes exact-channel messages from pattern-matched messages so
+//! that callers can include the originating pattern when forwarding to
+//! clients.
 
 use std::sync::Arc;
 

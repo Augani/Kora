@@ -1,4 +1,14 @@
-//! Translate parsed RESP arrays into typed kora_core::Command values.
+//! Command translation from RESP frames to typed Kora commands.
+//!
+//! The single public entry point, [`parse_command`], accepts a [`RespValue`]
+//! (expected to be an array of bulk strings representing a client request) and
+//! returns a fully validated [`Command`] variant from `kora-core`.
+//!
+//! High-frequency commands (GET, SET, PING, PUBLISH, and the pub/sub family)
+//! are matched first via fast-path byte comparisons that avoid normalizing the
+//! command name or cloning arguments. All remaining commands fall through to a
+//! case-insensitive match table. Arity checking is enforced for every command
+//! before construction.
 
 use kora_core::command::{
     BitFieldEncoding, BitFieldOffset, BitFieldOperation, BitFieldOverflow, BitOperation, Command,
@@ -78,7 +88,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
         return Ok(Command::PUnsubscribe { patterns });
     }
 
-    // Fast path for common non-pubsub commands.
     if is_command_name(&parts[0], b"GET") {
         if parts.len() != 2 {
             return Err(ProtocolError::WrongArity("GET".into()));
@@ -128,7 +137,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
     let args = &parts[1..];
 
     match cmd_name.as_slice() {
-        // Document commands
         b"DOC.CREATE" => parse_doc_create(args),
         b"DOC.DROP" => {
             check_arity("DOC.DROP", args, 1)?;
@@ -197,7 +205,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
         b"DOC.FIND" => parse_doc_find(args),
         b"DOC.COUNT" => parse_doc_count(args),
 
-        // String commands
         b"GET" => {
             check_arity("GET", args, 1)?;
             Ok(Command::Get {
@@ -336,7 +343,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             Ok(Command::MSetNx { entries })
         }
 
-        // Key commands
         b"DEL" => {
             check_min_arity("DEL", args, 1)?;
             let keys = args.iter().map(extract_bytes).collect::<Result<_, _>>()?;
@@ -463,7 +469,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             Ok(Command::Touch { keys })
         }
 
-        // List commands
         b"LPUSH" => {
             check_min_arity("LPUSH", args, 2)?;
             Ok(Command::LPush {
@@ -598,7 +603,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             })
         }
 
-        // Hash commands
         b"HSET" => {
             if args.len() < 3 || (args.len() - 1) % 2 != 0 {
                 return Err(ProtocolError::WrongArity("HSET".into()));
@@ -706,7 +710,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
         b"HRANDFIELD" => parse_hrandfield(args),
         b"HSCAN" => parse_hscan(args),
 
-        // Set commands
         b"SADD" => {
             check_min_arity("SADD", args, 2)?;
             Ok(Command::SAdd {
@@ -829,7 +832,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
         }
         b"SSCAN" => parse_sscan(args),
 
-        // Sorted set commands
         b"ZADD" => {
             check_min_arity("ZADD", args, 3)?;
             let key = extract_bytes(&args[0])?;
@@ -1057,7 +1059,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
         b"ZRANDMEMBER" => parse_zrandmember(args),
         b"ZSCAN" => parse_zscan(args),
 
-        // Server commands
         b"PING" => Ok(Command::Ping {
             message: args.first().and_then(|a| extract_bytes(a).ok()),
         }),
@@ -1110,7 +1111,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             }
         }
 
-        // Server / admin commands
         b"BGSAVE" => {
             check_arity("BGSAVE", args, 0)?;
             Ok(Command::BgSave)
@@ -1137,20 +1137,14 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             if args.is_empty() {
                 return Err(ProtocolError::WrongArity("AUTH".into()));
             }
-            if args.len() == 1 {
-                Ok(Command::Auth {
-                    tenant: None,
-                    password: extract_bytes(&args[0])?,
-                })
+            let password = if args.len() == 1 {
+                extract_bytes(&args[0])?
             } else {
-                Ok(Command::Auth {
-                    tenant: Some(extract_bytes(&args[0])?),
-                    password: extract_bytes(&args[1])?,
-                })
-            }
+                extract_bytes(&args[1])?
+            };
+            Ok(Command::Auth { password })
         }
 
-        // CDC commands
         b"CDCPOLL" => {
             check_arity("CDCPOLL", args, 2)?;
             Ok(Command::CdcPoll {
@@ -1173,7 +1167,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             Ok(Command::CdcPending { key, group })
         }
 
-        // Vector commands
         b"VECSET" => {
             check_min_arity("VECSET", args, 3)?;
             let key = extract_bytes(&args[0])?;
@@ -1206,39 +1199,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             })
         }
 
-        // Scripting commands
-        b"SCRIPTLOAD" => {
-            check_arity("SCRIPTLOAD", args, 2)?;
-            Ok(Command::ScriptLoad {
-                name: extract_bytes(&args[0])?,
-                wasm_bytes: extract_bytes(&args[1])?,
-            })
-        }
-        b"SCRIPTCALL" => {
-            check_min_arity("SCRIPTCALL", args, 1)?;
-            let name = extract_bytes(&args[0])?;
-            let byte_args: Vec<Vec<u8>> = args[1..]
-                .iter()
-                .map(extract_bytes)
-                .collect::<Result<_, _>>()?;
-            let int_args: Vec<i64> = byte_args
-                .iter()
-                .filter_map(|b| std::str::from_utf8(b).ok().and_then(|s| s.parse().ok()))
-                .collect();
-            Ok(Command::ScriptCall {
-                name,
-                args: int_args,
-                byte_args,
-            })
-        }
-        b"SCRIPTDEL" => {
-            check_arity("SCRIPTDEL", args, 1)?;
-            Ok(Command::ScriptDel {
-                name: extract_bytes(&args[0])?,
-            })
-        }
-
-        // Stats commands
         b"STATS.HOTKEYS" => {
             check_arity("STATS.HOTKEYS", args, 1)?;
             Ok(Command::StatsHotkeys {
@@ -1260,7 +1220,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             Ok(Command::StatsMemory { prefixes })
         }
 
-        // Object commands
         b"OBJECT" => {
             check_min_arity("OBJECT", args, 1)?;
             let subcmd = extract_string(&args[0])?.to_ascii_uppercase();
@@ -1297,7 +1256,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             }
         }
 
-        // Stream commands
         b"XADD" => parse_xadd(args),
         b"XLEN" => {
             check_arity("XLEN", args, 1)?;
@@ -1321,7 +1279,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             Ok(Command::XTrim { key, maxlen })
         }
 
-        // Pub/Sub commands
         b"SUBSCRIBE" => {
             check_min_arity("SUBSCRIBE", args, 1)?;
             let channels = args
@@ -1360,7 +1317,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             })
         }
 
-        // HyperLogLog commands
         b"PFADD" => {
             check_min_arity("PFADD", args, 1)?;
             Ok(Command::PfAdd {
@@ -1389,7 +1345,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             })
         }
 
-        // Bitmap commands
         b"SETBIT" => {
             check_arity("SETBIT", args, 3)?;
             let value = parse_u64(&args[2])?;
@@ -1416,7 +1371,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
         b"BITPOS" => parse_bitpos(args),
         b"BITFIELD" => parse_bitfield(args),
 
-        // Geo commands
         b"GEOADD" => parse_geoadd(args),
         b"GEODIST" => parse_geodist(args),
         b"GEOHASH" => {
@@ -1441,7 +1395,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
         }
         b"GEOSEARCH" => parse_geosearch(args),
 
-        // Transaction commands
         b"MULTI" => {
             check_arity("MULTI", args, 0)?;
             Ok(Command::Multi)
@@ -1464,7 +1417,6 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             Ok(Command::Unwatch)
         }
 
-        // Server commands (Phase 5)
         b"CONFIG" => {
             if args.is_empty() {
                 return Err(ProtocolError::WrongArity("CONFIG".into()));
@@ -1539,14 +1491,12 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             })
         }
 
-        // Blocking operations
         b"BLPOP" => parse_blpop(args),
         b"BRPOP" => parse_brpop(args),
         b"BLMOVE" => parse_blmove(args),
         b"BZPOPMIN" => parse_bzpopmin(args),
         b"BZPOPMAX" => parse_bzpopmax(args),
 
-        // Stream consumer group commands
         b"XGROUP" => parse_xgroup(args),
         b"XREADGROUP" => parse_xreadgroup(args),
         b"XACK" => parse_xack(args),
@@ -3508,8 +3458,7 @@ mod tests {
     fn test_parse_auth_password_only() {
         let cmd = parse_command(make_cmd(&[b"AUTH", b"secret"])).unwrap();
         match cmd {
-            Command::Auth { tenant, password } => {
-                assert!(tenant.is_none());
+            Command::Auth { password } => {
                 assert_eq!(password, b"secret");
             }
             other => panic!("Expected Auth, got {:?}", other),
@@ -3517,11 +3466,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_auth_with_tenant() {
-        let cmd = parse_command(make_cmd(&[b"AUTH", b"tenant1", b"secret"])).unwrap();
+    fn test_parse_auth_with_username() {
+        let cmd = parse_command(make_cmd(&[b"AUTH", b"default", b"secret"])).unwrap();
         match cmd {
-            Command::Auth { tenant, password } => {
-                assert_eq!(tenant.unwrap(), b"tenant1");
+            Command::Auth { password } => {
                 assert_eq!(password, b"secret");
             }
             other => panic!("Expected Auth, got {:?}", other),
@@ -3798,41 +3746,6 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(matches!(err, ProtocolError::WrongArity(_)));
-    }
-
-    #[test]
-    fn test_parse_scriptload() {
-        let cmd = parse_command(make_cmd(&[b"SCRIPTLOAD", b"myfn", b"wasmdata"])).unwrap();
-        match cmd {
-            Command::ScriptLoad { name, wasm_bytes } => {
-                assert_eq!(name, b"myfn");
-                assert_eq!(wasm_bytes, b"wasmdata");
-            }
-            other => panic!("Expected ScriptLoad, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_parse_scriptcall() {
-        let cmd = parse_command(make_cmd(&[b"SCRIPTCALL", b"myfn", b"42", b"7"])).unwrap();
-        match cmd {
-            Command::ScriptCall {
-                name,
-                args,
-                byte_args,
-            } => {
-                assert_eq!(name, b"myfn");
-                assert_eq!(args, vec![42, 7]);
-                assert_eq!(byte_args, vec![b"42".to_vec(), b"7".to_vec()]);
-            }
-            other => panic!("Expected ScriptCall, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_parse_scriptdel() {
-        let cmd = parse_command(make_cmd(&[b"SCRIPTDEL", b"myfn"])).unwrap();
-        assert!(matches!(cmd, Command::ScriptDel { name } if name == b"myfn"));
     }
 
     #[test]

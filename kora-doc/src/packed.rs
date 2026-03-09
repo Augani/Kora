@@ -1,4 +1,39 @@
-//! Packed document encoding primitives.
+//! Compact binary packed document format.
+//!
+//! A [`PackedDoc`] is a flat byte buffer that stores an arbitrary number of
+//! typed fields in a layout optimised for single-field random access without
+//! deserialising the entire document.
+//!
+//! ## Binary Layout
+//!
+//! ```text
+//! [version:2][field_count:2][updated_at:4]  ← 8-byte header
+//! [field_id:2, data_offset:2] × N           ← offset table (4 bytes per field)
+//! [type_tag:1] × N                          ← type table (1 byte per field)
+//! [field data bytes...]                      ← data region
+//! ```
+//!
+//! - **Header (8 bytes):** format version (`u16`), field count (`u16`),
+//!   and last-update timestamp as Unix seconds (`u32`).
+//! - **Offset table:** one `(FieldId, u16)` pair per field, sorted by
+//!   `FieldId` in ascending order. `data_offset` is relative to the start
+//!   of the data region.
+//! - **Type table:** one tag byte per field indicating its [`FieldValue`]
+//!   variant.
+//! - **Data region:** variable-length payloads concatenated in field-ID order.
+//!
+//! ## Field Access
+//!
+//! [`PackedDoc::read_field`] performs a binary search over the offset table
+//! to locate a field by its `FieldId` in O(log F) time, then decodes the
+//! payload using the corresponding type tag. This avoids scanning the entire
+//! document for point reads and projections.
+//!
+//! ## Building
+//!
+//! [`PackedDocBuilder`] collects field entries in any order, sorts them by
+//! field ID at build time, validates for duplicates and size limits, and
+//! emits a validated [`PackedDoc`].
 
 use thiserror::Error;
 

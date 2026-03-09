@@ -88,7 +88,6 @@ pub enum WalEntry {
     FlushDb,
 }
 
-// Wire type discriminants
 const WAL_SET: u8 = 1;
 const WAL_DEL: u8 = 2;
 const WAL_EXPIRE: u8 = 3;
@@ -177,7 +176,6 @@ impl WriteAheadLog {
                 break;
             }
 
-            // Need at least 4 bytes for len
             if file_len - pos < 4 {
                 tracing::warn!("WAL truncated at position {}: incomplete length", pos);
                 break;
@@ -189,7 +187,6 @@ impl WriteAheadLog {
             }
             let len = u32::from_le_bytes(len_buf) as usize;
 
-            // Sanity check: entry shouldn't be larger than 512MB
             if len > 512 * 1024 * 1024 {
                 tracing::warn!(
                     "WAL corrupt at position {}: entry length {} too large",
@@ -199,7 +196,6 @@ impl WriteAheadLog {
                 break;
             }
 
-            // Need len bytes for payload + 4 bytes for CRC
             if file_len - file.stream_position()? < (len as u64 + 4) {
                 tracing::warn!("WAL truncated at position {}: incomplete entry", pos);
                 break;
@@ -271,8 +267,6 @@ impl WriteAheadLog {
         Ok(())
     }
 }
-
-// ─── Encoding ───────────────────────────────────────────────────────────────
 
 fn encode_entry(entry: &WalEntry) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -419,8 +413,6 @@ fn decode_entry(data: &[u8]) -> Result<WalEntry> {
         ))),
     }
 }
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn write_bytes(buf: &mut Vec<u8>, data: &[u8]) {
     let len = data.len() as u32;

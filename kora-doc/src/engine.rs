@@ -1,4 +1,42 @@
-//! In-memory document engine for collection and CRUD operations.
+//! In-memory document engine providing collection CRUD, secondary indexes,
+//! and WHERE-clause query execution.
+//!
+//! [`DocEngine`] is the top-level entry point. It owns an [`IdRegistry`],
+//! a map of per-collection state (metadata, dictionary, packed documents,
+//! and indexes), and orchestrates the full document lifecycle:
+//!
+//! ## Write Path
+//!
+//! 1. The caller supplies a JSON `Value` to [`DocEngine::set`].
+//! 2. The engine resolves (or allocates) a `DocId` via the registry.
+//! 3. Unique-constraint indexes are checked **before** mutation.
+//! 4. If the document already exists, old index entries are removed.
+//! 5. The JSON is decomposed into a [`PackedDoc`] through the
+//!    [`Decomposer`](crate::decompose::Decomposer) pipeline.
+//! 6. New index entries are inserted for every configured field.
+//!
+//! ## Read Path
+//!
+//! - [`DocEngine::get`] retrieves and recomposes a single document, with
+//!   optional field-level projection.
+//! - [`DocEngine::find`] parses a WHERE expression via
+//!   [`parse_where`](crate::expr::parse_where), walks the AST to collect
+//!   candidate `DocId` sets (using indexes when available, falling back to a
+//!   full collection scan), applies pagination, and recomposes results.
+//!
+//! ## Index Maintenance
+//!
+//! [`DocEngine::create_index`] registers a secondary index and backfills
+//! every existing document. Four index types are supported: `Hash`, `Sorted`,
+//! `Array`, and `Unique`. Index entries are maintained automatically on
+//! `set`, `update`, and `del`.
+//!
+//! ## Mutation
+//!
+//! [`DocEngine::update`] applies a sequence of [`DocMutation`] operations
+//! (Set, Del, Incr, Push, Pull) to an existing document's JSON
+//! representation, then round-trips through `set` so indexes and packed
+//! storage stay consistent.
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -154,7 +192,6 @@ pub enum DocError {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 struct CollectionState {
     collection: Collection,
     dictionary: ValueDictionary,

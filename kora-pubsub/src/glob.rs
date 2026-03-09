@@ -1,10 +1,16 @@
-//! Glob pattern matching for Pub/Sub channel patterns.
+//! Byte-level glob pattern matching for Pub/Sub channel patterns.
 //!
-//! Supports `*` (any sequence of characters) and `?` (any single character).
+//! Implements a linear-time matching algorithm that supports two wildcards:
+//!
+//! - `*` — matches any sequence of zero or more bytes.
+//! - `?` — matches exactly one byte.
+//!
+//! The matcher operates directly on `&[u8]` slices to avoid UTF-8 overhead.
 
-/// Match a glob pattern against a channel name.
+/// Match a glob `pattern` against a byte-slice `text`.
 ///
-/// Supports `*` (match any sequence) and `?` (match any single byte).
+/// Returns `true` when the entire `text` is consumed by the pattern.
+/// Runs in *O(n * m)* worst-case time with no heap allocation.
 pub fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
     let mut pi = 0;
     let mut ti = 0;

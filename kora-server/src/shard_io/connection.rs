@@ -1,3 +1,23 @@
+//! RESP connection handler for shard-affinity I/O.
+//!
+//! Each accepted TCP or Unix socket connection is driven by
+//! [`handle_connection_affinity`], which runs as a `spawn_local` task on the
+//! shard worker that accepted it. The handler implements:
+//!
+//! - **Pipeline batching** — multiple commands parsed from a single read are
+//!   routed, executed, and serialized as a batch before flushing the write buffer.
+//! - **Hot-command fast path** — GET, SET, and INCR bypass full `Command` parsing
+//!   via [`HotCommandRef`] for lower per-op overhead.
+//! - **Cross-shard fan-out** — commands whose key hashes to a different shard are
+//!   queued into per-shard batches, dispatched in one shot, and resolved before
+//!   the write buffer is flushed.
+//! - **Pub/Sub mode** — once a connection subscribes it enters a push loop that
+//!   multiplexes data reads with message delivery.
+//! - **MULTI/EXEC** — transaction commands are queued locally and executed
+//!   atomically at EXEC time.
+//! - **Blocking commands** — BLPOP, BRPOP, etc. poll with back-off until the
+//!   timeout expires or data appears.
+
 use std::cell::RefCell;
 use std::mem;
 use std::rc::Rc;
@@ -14,7 +34,6 @@ use kora_core::command::{
     supported_command_count, Command, CommandResponse, DocUpdateMutation,
 };
 use kora_core::shard::{ShardStore, WalRecord, WalWriter};
-use kora_core::tenant::TenantId;
 use kora_doc::{CollectionConfig, CompressionProfile, DocEngine, DocMutation, IndexType};
 use kora_protocol::{parse_command, serialize_response_versioned, HotCommandRef, RespParser};
 use kora_pubsub::{MessageSink, PubSubMessage};
@@ -40,7 +59,6 @@ impl MessageSink for TokioSink {
 
 struct ConnState {
     resp3: bool,
-    tenant_id: TenantId,
     conn_id: u64,
     shard_id: u16,
     pubsub_tx: Option<Arc<TokioSink>>,
@@ -142,6 +160,11 @@ async fn resolve_response_slots_in_place(
     }
 }
 
+/// Drives a single RESP client connection on the owning shard worker.
+///
+/// Reads are parsed incrementally; each batch of commands from a single read is
+/// dispatched, cross-shard responses are awaited, and the write buffer is flushed
+/// once per batch. The handler exits when the stream closes or the client sends QUIT.
 pub(crate) async fn handle_connection_affinity<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     mut stream: S,
     shard_id: u16,
@@ -156,7 +179,6 @@ pub(crate) async fn handle_connection_affinity<S: AsyncReadExt + AsyncWriteExt +
     let mut read_buf = vec![0u8; 8192];
     let mut conn = ConnState {
         resp3: false,
-        tenant_id: TenantId(0),
         conn_id,
         shard_id,
         pubsub_tx: None,
@@ -1001,22 +1023,6 @@ async fn flush_pending_responses(
     durations
 }
 
-fn authorize_hot_dispatch(
-    is_mutation: bool,
-    shared: &AffinitySharedState,
-    conn: &ConnState,
-) -> Result<(), CommandResponse> {
-    let key_count_delta = if is_mutation { 1 } else { 0 };
-    if let Err(e) = shared
-        .tenants
-        .check_limits(conn.tenant_id, key_count_delta, 0)
-    {
-        return Err(CommandResponse::Error(format!("ERR {}", e)));
-    }
-    shared.tenants.record_operation(conn.tenant_id);
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn process_simple_command(
     cmd: Command,
@@ -1034,13 +1040,6 @@ fn process_simple_command(
     if let Some(resp) = try_handle_local_affinity(&cmd, shared, conn) {
         push_ready_response(responses, resp);
         return;
-    }
-
-    if shared.tenant_limits_enabled {
-        if let Err(resp) = authorize_dispatch(&cmd, shared, conn) {
-            push_ready_response(responses, resp);
-            return;
-        }
     }
 
     if let Some(key) = cmd.key() {
@@ -1071,7 +1070,7 @@ fn process_hot_command(
     wal_writer: &Rc<RefCell<Option<Box<dyn WalWriter>>>>,
     router: &ShardRouter,
     shared: &Arc<AffinitySharedState>,
-    conn: &ConnState,
+    _conn: &ConnState,
     responses: &mut Vec<Option<CommandResponse>>,
     pending_foreign_batches: &mut [PendingForeignBatch],
     stage_durations: &mut BatchLoopDurations,
@@ -1083,12 +1082,6 @@ fn process_hot_command(
             push_ready_response(responses, CommandResponse::Integer(count as i64));
         }
         HotCommandRef::Get { key } => {
-            if shared.tenant_limits_enabled {
-                if let Err(resp) = authorize_hot_dispatch(false, shared, conn) {
-                    push_ready_response(responses, resp);
-                    return;
-                }
-            }
             let route_start = maybe_now(track_stages);
             let target = router.shard_for_key(key);
             maybe_elapsed(route_start, &mut stage_durations.route_ns);
@@ -1107,12 +1100,6 @@ fn process_hot_command(
             }
         }
         HotCommandRef::Set { key, value } => {
-            if shared.tenant_limits_enabled {
-                if let Err(resp) = authorize_hot_dispatch(true, shared, conn) {
-                    push_ready_response(responses, resp);
-                    return;
-                }
-            }
             let route_start = maybe_now(track_stages);
             let target = router.shard_for_key(key);
             maybe_elapsed(route_start, &mut stage_durations.route_ns);
@@ -1141,12 +1128,6 @@ fn process_hot_command(
             }
         }
         HotCommandRef::Incr { key } => {
-            if shared.tenant_limits_enabled {
-                if let Err(resp) = authorize_hot_dispatch(true, shared, conn) {
-                    push_ready_response(responses, resp);
-                    return;
-                }
-            }
             let route_start = maybe_now(track_stages);
             let target = router.shard_for_key(key);
             maybe_elapsed(route_start, &mut stage_durations.route_ns);
@@ -1198,18 +1179,11 @@ fn try_handle_local_affinity(
             ))
         }
         Command::Hello { version } => Some(handle_hello(version, conn)),
-        Command::Auth { tenant, password } => {
+        Command::Auth { ref password } => {
             if let Some(ref expected) = shared.auth_password {
                 let provided = String::from_utf8_lossy(password);
                 if provided.as_ref() != expected.as_str() {
                     return Some(CommandResponse::Error("ERR invalid password".into()));
-                }
-            }
-            if let Some(ref tenant_bytes) = tenant {
-                if let Ok(s) = std::str::from_utf8(tenant_bytes) {
-                    if let Ok(id) = s.parse::<u32>() {
-                        conn.tenant_id = TenantId(id);
-                    }
                 }
             }
             Some(CommandResponse::Ok)
@@ -1343,15 +1317,7 @@ fn try_handle_local_affinity(
             Some(handle_cdc_ack(&shared.cdc_groups, group, seqs))
         }
         Command::CdcPending { group, .. } => Some(handle_cdc_pending(&shared.cdc_groups, group)),
-        Command::ScriptLoad { name, wasm_bytes } => {
-            Some(handle_script_load(&shared.scripts, name, wasm_bytes))
-        }
-        Command::ScriptCall {
-            name,
-            args,
-            byte_args,
-        } => Some(handle_script_call(&shared.scripts, name, args, byte_args)),
-        Command::ScriptDel { name } => Some(handle_script_del(&shared.scripts, name)),
+
         Command::StatsLatency {
             command,
             percentiles,
@@ -1361,22 +1327,6 @@ fn try_handle_local_affinity(
         }
         _ => None,
     }
-}
-
-fn authorize_dispatch(
-    cmd: &Command,
-    shared: &AffinitySharedState,
-    conn: &ConnState,
-) -> Result<(), CommandResponse> {
-    let key_count_delta = if cmd.is_mutation() { 1 } else { 0 };
-    if let Err(e) = shared
-        .tenants
-        .check_limits(conn.tenant_id, key_count_delta, 0)
-    {
-        return Err(CommandResponse::Error(format!("ERR {}", e)));
-    }
-    shared.tenants.record_operation(conn.tenant_id);
-    Ok(())
 }
 
 fn handle_hello(version: &Option<u8>, conn: &mut ConnState) -> CommandResponse {
@@ -2149,67 +2099,6 @@ fn handle_cdc_pending(groups: &Mutex<ConsumerGroupManager>, group: &str) -> Comm
             CommandResponse::Array(items)
         }
         Err(e) => CommandResponse::Error(e.to_string()),
-    }
-}
-
-fn handle_script_load(
-    scripts: &Mutex<Option<kora_scripting::FunctionRegistry>>,
-    name: &[u8],
-    wasm_bytes: &[u8],
-) -> CommandResponse {
-    let mut scripts = scripts.lock();
-    let registry = match scripts.as_mut() {
-        Some(r) => r,
-        None => return CommandResponse::Error("ERR scripting not enabled".into()),
-    };
-    let name_str = String::from_utf8_lossy(name);
-    match registry.register(&name_str, wasm_bytes) {
-        Ok(()) => CommandResponse::Ok,
-        Err(e) => CommandResponse::Error(format!("ERR {}", e)),
-    }
-}
-
-fn handle_script_call(
-    scripts: &Mutex<Option<kora_scripting::FunctionRegistry>>,
-    name: &[u8],
-    args: &[i64],
-    byte_args: &[Vec<u8>],
-) -> CommandResponse {
-    let scripts = scripts.lock();
-    let registry = match scripts.as_ref() {
-        Some(r) => r,
-        None => return CommandResponse::Error("ERR scripting not enabled".into()),
-    };
-    let name_str = String::from_utf8_lossy(name);
-    let result = if !byte_args.is_empty() && registry.has_engine() {
-        registry.call_with_byte_args(&name_str, byte_args)
-    } else {
-        registry.call(&name_str, args)
-    };
-    match result {
-        Ok(results) => {
-            let items: Vec<CommandResponse> =
-                results.into_iter().map(CommandResponse::Integer).collect();
-            CommandResponse::Array(items)
-        }
-        Err(e) => CommandResponse::Error(format!("ERR {}", e)),
-    }
-}
-
-fn handle_script_del(
-    scripts: &Mutex<Option<kora_scripting::FunctionRegistry>>,
-    name: &[u8],
-) -> CommandResponse {
-    let mut scripts = scripts.lock();
-    let registry = match scripts.as_mut() {
-        Some(r) => r,
-        None => return CommandResponse::Error("ERR scripting not enabled".into()),
-    };
-    let name_str = String::from_utf8_lossy(name);
-    if registry.remove(&name_str) {
-        CommandResponse::Integer(1)
-    } else {
-        CommandResponse::Integer(0)
     }
 }
 

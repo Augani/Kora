@@ -1,7 +1,13 @@
 //! Per-shard and aggregate statistics.
 //!
-//! Tracks command counts, latencies, and memory usage with near-zero overhead
-//! using atomic counters and HDR histograms.
+//! Tracks command counts, latencies, memory usage, byte throughput, and hot
+//! key frequencies with near-zero overhead using atomic counters, HDR
+//! histograms, and a Count-Min Sketch.
+//!
+//! [`ShardStats`] is the per-shard collector, designed for concurrent access
+//! from connection handlers. [`StatsSnapshot`] captures a point-in-time copy
+//! that can be merged across shards for server-wide aggregates.
+//! [`CommandTimer`] provides RAII-based latency recording that fires on drop.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -13,24 +19,19 @@ use crate::sketch::CountMinSketch;
 const NUM_COMMANDS: usize = 32;
 
 /// Per-shard statistics collector.
+///
+/// Aggregates command counts, durations, byte throughput, key counts,
+/// memory usage, and hot key frequencies. All counters use relaxed
+/// atomics for minimal overhead on the data path.
 pub struct ShardStats {
-    /// Total commands processed.
     total_commands: AtomicU64,
-    /// Per-command type counters.
     cmd_counts: [AtomicU64; NUM_COMMANDS],
-    /// Per-command total duration in nanoseconds.
     cmd_durations_ns: [AtomicU64; NUM_COMMANDS],
-    /// Hot key detector.
     hot_key_sketch: parking_lot::Mutex<CountMinSketch>,
-    /// Total keys in this shard.
     key_count: AtomicU64,
-    /// Approximate memory used (bytes).
     memory_used: AtomicU64,
-    /// Total bytes read (responses).
     bytes_out: AtomicU64,
-    /// Total bytes written (requests).
     bytes_in: AtomicU64,
-    /// Per-command latency histograms.
     histograms: CommandHistograms,
 }
 
@@ -128,12 +129,12 @@ impl ShardStats {
         self.memory_used.load(Ordering::Relaxed)
     }
 
-    /// Get bytes in/out.
+    /// Get total bytes received from clients.
     pub fn bytes_in(&self) -> u64 {
         self.bytes_in.load(Ordering::Relaxed)
     }
 
-    /// Get bytes out.
+    /// Get total bytes sent to clients.
     pub fn bytes_out(&self) -> u64 {
         self.bytes_out.load(Ordering::Relaxed)
     }
@@ -175,7 +176,10 @@ impl Default for ShardStats {
     }
 }
 
-/// A point-in-time snapshot of shard statistics.
+/// A point-in-time, copyable snapshot of shard statistics.
+///
+/// Produced by [`ShardStats::snapshot`] and designed for cheap merging
+/// across shards via [`StatsSnapshot::merge`].
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
     /// Total commands processed.
@@ -223,7 +227,10 @@ impl StatsSnapshot {
     }
 }
 
-/// A timer that records command duration on drop.
+/// RAII guard that records command duration on drop.
+///
+/// Captures the start time at construction. When the guard goes out of
+/// scope, it measures elapsed time and calls [`ShardStats::record_command`].
 pub struct CommandTimer<'a> {
     stats: &'a ShardStats,
     cmd_type: usize,

@@ -1,4 +1,30 @@
-//! Index data structures and configuration for document collections.
+//! Secondary index data structures for document collections.
+//!
+//! Four index types cover the query patterns a document engine needs:
+//!
+//! | Type | Struct | Backing store | Use case |
+//! |------|--------|---------------|----------|
+//! | `Hash` | [`HashIndex`] | `HashMap<u32, Vec<DocId>>` | Equality lookups (`field = value`) |
+//! | `Sorted` | [`SortedIndex`] | `BTreeMap<OrderedF64, Vec<DocId>>` | Numeric range queries (`field >= N`) |
+//! | `Array` | (reuses [`HashIndex`]) | `HashMap<u32, Vec<DocId>>` | Array membership (`field CONTAINS value`) |
+//! | `Unique` | [`UniqueIndex`] | `HashMap<u32, Vec<DocId>>` | Unique-constraint enforcement |
+//!
+//! All hash-based indexes key on 32-bit FNV-1a hashes of the field value's
+//! canonical byte representation. Buckets store `DocId` lists in sorted order
+//! so that set intersection and union can be performed with merge-join
+//! ([`intersect_sorted`], [`union_sorted`]).
+//!
+//! [`CollectionIndexes`] groups all index instances for a single collection
+//! behind a unified accessor API, creating index structures lazily on first
+//! access. [`IndexConfig`] records which fields have indexes and of what type,
+//! driving the engine's index-maintenance loop on writes.
+//!
+//! ## Unique Index Semantics
+//!
+//! [`UniqueIndex`] is structurally identical to [`HashIndex`] but carries
+//! different semantics: the engine must verify exact-value uniqueness against
+//! the candidate list before inserting, because 32-bit hash collisions are
+//! expected.
 
 use std::collections::{BTreeMap, HashMap};
 

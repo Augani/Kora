@@ -1,4 +1,18 @@
 //! The core `Value` enum representing all data types in Kōra.
+//!
+//! `Value` is the polymorphic container for everything stored in a shard:
+//! strings (inline ≤ 23 bytes or heap-allocated), native `i64` integers,
+//! doubly-ended queues (lists), hash maps, unordered sets, sorted sets,
+//! append-only stream logs, dense float vectors, and tier references for
+//! warm/cold storage.
+//!
+//! Design decisions:
+//! - Small strings are stored inline to avoid heap allocation on the
+//!   overwhelmingly common case of short keys and values.
+//! - Integers are stored natively so arithmetic commands avoid
+//!   parse→compute→serialize round-trips.
+//! - Heap strings use `Arc<[u8]>` so bulk-string responses can share the
+//!   backing allocation with the store (zero-copy reads).
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -55,7 +69,7 @@ pub struct StreamEntry {
     pub fields: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
-/// An append-only log of stream entries (Redis Streams equivalent).
+/// An append-only log of stream entries with sequenced IDs.
 #[derive(Clone, Debug)]
 pub struct StreamLog {
     /// The entries in the stream, ordered by ID.
@@ -113,13 +127,13 @@ pub enum Value {
     /// Integer stored as native i64 (not a serialized string).
     Int(i64),
 
-    /// Doubly-ended queue (Redis List).
+    /// Doubly-ended queue — supports push/pop from both ends.
     List(VecDeque<Value>),
 
-    /// Unordered set of unique values (Redis Set).
+    /// Unordered set of unique values.
     Set(HashSet<Value>),
 
-    /// Hash map of field-value pairs (Redis Hash).
+    /// Hash map of field-value pairs.
     Hash(HashMap<CompactKey, Value>),
 
     /// Dense float vector for similarity search.
@@ -128,7 +142,7 @@ pub enum Value {
     /// Sorted set with dual index: member→score and score→members for O(log N) operations.
     SortedSet(BTreeMap<Vec<u8>, f64>),
 
-    /// Append-only stream log (Redis Streams equivalent).
+    /// Append-only stream log with sequenced entries and consumer groups.
     Stream(Box<StreamLog>),
 
     /// Reference to a value stored in the warm (mmap) tier.
@@ -317,7 +331,7 @@ impl Value {
         }
     }
 
-    /// Returns the type name as used by the Redis TYPE command.
+    /// Returns the type name as used by the TYPE command.
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::InlineStr { .. } | Value::HeapStr(_) | Value::Int(_) => "string",

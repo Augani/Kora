@@ -1,19 +1,18 @@
 //! # kora-vector
 //!
-//! HNSW (Hierarchical Navigable Small World) vector index for Kōra.
+//! Vector similarity search for the Kōra cache engine.
 //!
-//! Provides per-shard vector indexing with support for cosine, L2, and inner
-//! product distance metrics.
+//! This crate provides an in-process, approximate nearest neighbor (ANN) index
+//! based on the HNSW algorithm. Components are designed to live inside a single
+//! shard with no cross-thread synchronisation requirements.
 //!
 //! ## Modules
 //!
-//! - [`distance`] — Distance metric implementations
-//! - [`hnsw`] — HNSW graph index
-//! - [`quantizer`] — Product quantizer for vector compression
+//! - [`distance`] — Distance metric implementations (Cosine, L2, Inner Product)
+//! - [`hnsw`] — HNSW graph index with configurable connectivity and search width
 
 #![warn(clippy::all)]
 #![warn(missing_docs)]
 
 pub mod distance;
 pub mod hnsw;
-pub mod quantizer;

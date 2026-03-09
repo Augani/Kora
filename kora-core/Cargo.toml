@@ -10,7 +10,6 @@ description = "Core data structures, shard engine, and memory management for Kō
 ahash.workspace = true
 bytes.workspace = true
 crossbeam-channel.workspace = true
-parking_lot.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 kora-observability = { workspace = true, optional = true }

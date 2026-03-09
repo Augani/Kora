@@ -8,7 +8,6 @@ members = [
     "kora-storage",
     "kora-vector",
     "kora-cdc",
-    "kora-scripting",
     "kora-observability",
     "kora-pubsub",
     "kora-doc",
@@ -20,6 +19,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.75"
+repository = "https://github.com/Augani/Kora"
+homepage = "https://github.com/Augani/Kora"
+keywords = ["cache", "database", "resp", "embedded", "multi-threaded"]
+categories = ["database-implementations", "caching"]
 
 [workspace.dependencies]
 # Async runtime
@@ -57,9 +60,6 @@ crc32fast = "1"
 memmap2 = "0.9"
 io-uring = "0.7"
 
-# WASM
-wasmtime = "27"
-
 # Observability
 hdrhistogram = "7"
 
@@ -84,7 +84,7 @@ kora-embedded = { path = "kora-embedded" }
 kora-storage = { path = "kora-storage" }
 kora-vector = { path = "kora-vector" }
 kora-cdc = { path = "kora-cdc" }
-kora-scripting = { path = "kora-scripting" }
+
 kora-observability = { path = "kora-observability" }
 kora-pubsub = { path = "kora-pubsub" }
 kora-doc = { path = "kora-doc" }

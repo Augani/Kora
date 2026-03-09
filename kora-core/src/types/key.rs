@@ -1,10 +1,20 @@
 //! Compact key representation and key-entry metadata.
+//!
+//! `CompactKey` avoids heap allocation for the common case of short keys
+//! (≤ 64 bytes) by storing them inline. For larger keys it falls back to an
+//! `Arc<[u8]>` for shared ownership. The `Borrow<[u8]>` implementation allows
+//! lookups in `HashMap`/`AHashMap` using plain `&[u8]` without allocating.
+//!
+//! `KeyEntry` bundles a key with all per-key metadata: value, TTL, LFU
+//! counter, storage tier, per-key PRNG state, and client flags.
+//! The LFU counter uses a probabilistic logarithmic increment
+//! (P(increment) = 1 / (counter * 10 + 1)) with a per-key xorshift PRNG to
+//! avoid branch-prediction bottlenecks on the hot path.
 
 use std::borrow::Borrow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::tenant::TenantId;
 use crate::types::Value;
 
 /// Tier marker: key is in hot (RAM) tier.
@@ -102,7 +112,7 @@ pub struct KeyEntry {
     pub value: Value,
     /// Optional expiry time.
     pub ttl: Option<Instant>,
-    /// Probabilistic LFU counter (logarithmic, Redis-compatible).
+    /// Probabilistic LFU counter (logarithmic, 0–255).
     pub lfu_counter: u8,
     /// Seconds since shard epoch (compact timestamp for last access).
     pub last_access: u32,
@@ -112,8 +122,6 @@ pub struct KeyEntry {
     pub client_flags: u32,
     /// Per-key xorshift PRNG state for LFU probabilistic increment.
     pub lfu_seed: u32,
-    /// The tenant that owns this key.
-    pub tenant_id: TenantId,
 }
 
 impl KeyEntry {
@@ -131,25 +139,6 @@ impl KeyEntry {
             flags: 0,
             client_flags: 0,
             lfu_seed: seed,
-            tenant_id: TenantId(0),
-        }
-    }
-
-    /// Create a new KeyEntry with a specific tenant owner.
-    pub fn new_with_tenant(key: CompactKey, value: Value, tenant_id: TenantId) -> Self {
-        let seed = key.as_bytes().iter().fold(0x1234_5678u32, |acc, &b| {
-            acc.wrapping_mul(31).wrapping_add(b as u32)
-        });
-        Self {
-            key,
-            value,
-            ttl: None,
-            lfu_counter: 5,
-            last_access: 0,
-            flags: 0,
-            client_flags: 0,
-            lfu_seed: seed,
-            tenant_id,
         }
     }
 
@@ -174,7 +163,7 @@ impl KeyEntry {
         self.ttl = None;
     }
 
-    /// Update the LFU counter on access using Redis's probabilistic increment.
+    /// Update the LFU counter on access using a probabilistic logarithmic increment.
     ///
     /// P(increment) = 1 / (counter * LFU\_LOG\_FACTOR + 1), where LFU\_LOG\_FACTOR = 10.
     pub fn touch_lfu(&mut self) {
@@ -193,7 +182,7 @@ impl KeyEntry {
 
     /// Decay the LFU counter based on elapsed time since last access.
     ///
-    /// Decrements the counter by `elapsed_minutes` (like Redis lfu-decay-time=1).
+    /// Decrements the counter by `elapsed_minutes` (decay-time = 1 minute).
     pub fn decay_lfu(&mut self, elapsed_minutes: u32) {
         self.lfu_counter = self.lfu_counter.saturating_sub(elapsed_minutes as u8);
     }

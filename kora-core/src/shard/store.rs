@@ -1,4 +1,16 @@
-//! Per-shard key-value store with full Redis command execution.
+//! Per-shard key-value store with full command execution.
+//!
+//! `ShardStore` is the workhorse of the Kōra engine. Each shard worker thread
+//! owns exactly one instance, so every operation runs single-threaded with no
+//! locking. The store handles:
+//!
+//! - String, list, hash, set, sorted set, stream, HyperLogLog, bitmap, and
+//!   geo commands.
+//! - Lazy TTL expiration on access plus periodic bounded-sample sweeps.
+//! - LFU-based eviction when a memory limit is configured.
+//! - Optional per-command statistics recording (behind the `observability`
+//!   feature gate).
+//! - Optional HNSW vector index operations (behind the `vector` feature gate).
 
 use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -10,8 +22,6 @@ use crate::command::{
     supported_command_count, BitFieldEncoding, BitFieldOffset, BitFieldOperation, BitFieldOverflow,
     BitOperation, Command, CommandResponse, GeoUnit,
 };
-use crate::shard::allocator::ShardAllocator;
-use crate::tenant::TenantId;
 use crate::types::{
     CompactKey, KeyEntry, PendingEntry, StreamConsumerGroup, StreamEntry, StreamId, StreamLog,
     Value,
@@ -36,9 +46,6 @@ pub struct ShardStore {
     memory_used: usize,
     eviction_counter: u64,
     expire_scan_cursor: usize,
-    allocator: ShardAllocator,
-    tenant_memory: AHashMap<TenantId, usize>,
-    current_tenant: TenantId,
     #[cfg(feature = "observability")]
     stats: ShardStats,
     #[cfg(feature = "observability")]
@@ -58,9 +65,6 @@ impl ShardStore {
             memory_used: 0,
             eviction_counter: 0,
             expire_scan_cursor: 0,
-            allocator: ShardAllocator::new(),
-            tenant_memory: AHashMap::new(),
-            current_tenant: TenantId(0),
             #[cfg(feature = "observability")]
             stats: ShardStats::new(),
             #[cfg(feature = "observability")]
@@ -88,16 +92,6 @@ impl ShardStore {
         self.shard_id
     }
 
-    /// Get a reference to the per-shard slab allocator.
-    pub fn allocator(&self) -> &ShardAllocator {
-        &self.allocator
-    }
-
-    /// Get a mutable reference to the per-shard slab allocator.
-    pub fn allocator_mut(&mut self) -> &mut ShardAllocator {
-        &mut self.allocator
-    }
-
     /// Get the number of keys in this shard.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -116,21 +110,6 @@ impl ShardStore {
     /// Get the maximum memory limit for this shard.
     pub fn max_memory(&self) -> usize {
         self.max_memory
-    }
-
-    /// Set the current tenant for subsequent commands.
-    pub fn set_current_tenant(&mut self, tenant_id: TenantId) {
-        self.current_tenant = tenant_id;
-    }
-
-    /// Get the current tenant ID.
-    pub fn current_tenant(&self) -> TenantId {
-        self.current_tenant
-    }
-
-    /// Get per-tenant memory usage for a specific tenant.
-    pub fn tenant_memory_used(&self, tenant_id: TenantId) -> usize {
-        self.tenant_memory.get(&tenant_id).copied().unwrap_or(0)
     }
 
     /// Iterate over all entries in this shard.
@@ -175,8 +154,6 @@ impl ShardStore {
     pub fn insert_entry(&mut self, key: CompactKey, entry: KeyEntry) {
         let size = Self::estimate_key_entry_size(key.as_bytes(), &entry.value);
         self.memory_used += size;
-        let tenant = entry.tenant_id;
-        *self.tenant_memory.entry(tenant).or_insert(0) += size;
         self.entries.insert(key, entry);
     }
 
@@ -191,8 +168,6 @@ impl ShardStore {
             let new_size = entry.value.estimated_size();
             if old_size > new_size {
                 self.memory_used = self.memory_used.saturating_sub(old_size - new_size);
-                let tenant_mem = self.tenant_memory.entry(entry.tenant_id).or_insert(0);
-                *tenant_mem = tenant_mem.saturating_sub(old_size - new_size);
             }
             entry.set_tier(tier);
         }
@@ -209,12 +184,9 @@ impl ShardStore {
             if new_size > old_size {
                 let delta = new_size - old_size;
                 self.memory_used += delta;
-                *self.tenant_memory.entry(entry.tenant_id).or_insert(0) += delta;
             } else {
                 let delta = old_size - new_size;
                 self.memory_used = self.memory_used.saturating_sub(delta);
-                let tenant_mem = self.tenant_memory.entry(entry.tenant_id).or_insert(0);
-                *tenant_mem = tenant_mem.saturating_sub(delta);
             }
         }
     }
@@ -280,7 +252,6 @@ impl ShardStore {
     pub fn flush(&mut self) {
         self.entries.clear();
         self.memory_used = 0;
-        self.tenant_memory.clear();
         self.expire_scan_cursor = 0;
         self.stream_groups.clear();
     }
@@ -334,7 +305,6 @@ impl ShardStore {
 
     fn execute_inner(&mut self, cmd: Command) -> CommandResponse {
         match cmd {
-            // String commands
             Command::Get { key } => self.cmd_get(&key),
             Command::Set {
                 key,
@@ -372,7 +342,6 @@ impl ShardStore {
             } => self.cmd_getex(&key, ex, px, exat, pxat, persist),
             Command::MSetNx { entries } => self.cmd_msetnx(&entries),
 
-            // Key commands
             Command::Del { keys } => {
                 let count = keys.iter().filter(|k| self.del(k)).count();
                 CommandResponse::Integer(count as i64)
@@ -449,7 +418,6 @@ impl ShardStore {
                 CommandResponse::Ok
             }
 
-            // List commands
             Command::LPush { key, values } => self.cmd_lpush(&key, &values),
             Command::RPush { key, values } => self.cmd_rpush(&key, &values),
             Command::LPop { key } => self.cmd_lpop(&key),
@@ -484,7 +452,6 @@ impl ShardStore {
                 to_left,
             } => self.cmd_lmove(&source, &destination, from_left, to_left),
 
-            // Hash commands
             Command::HSet { key, fields } => self.cmd_hset(&key, &fields),
             Command::HGet { key, field } => self.cmd_hget(&key, &field),
             Command::HDel { key, fields } => self.cmd_hdel(&key, &fields),
@@ -511,7 +478,6 @@ impl ShardStore {
                 count,
             } => self.cmd_hscan(&key, cursor, pattern.as_deref(), count.unwrap_or(10)),
 
-            // Set commands
             Command::SAdd { key, members } => self.cmd_sadd(&key, &members),
             Command::SRem { key, members } => self.cmd_srem(&key, &members),
             Command::SMembers { key } => self.cmd_smembers(&key),
@@ -543,7 +509,6 @@ impl ShardStore {
                 count,
             } => self.cmd_sscan(&key, cursor, pattern.as_deref(), count.unwrap_or(10)),
 
-            // Sorted set commands
             Command::ZAdd { key, members } => self.cmd_zadd(&key, &members),
             Command::ZRem { key, members } => self.cmd_zrem(&key, &members),
             Command::ZScore { key, member } => self.cmd_zscore(&key, &member),
@@ -677,7 +642,6 @@ impl ShardStore {
             Command::XInfoStream { key } => self.cmd_xinfo_stream(&key),
             Command::XInfoGroups { key } => self.cmd_xinfo_groups(&key),
 
-            // Blocking commands: execute non-blocking variant (retry handled at connection layer)
             Command::BLPop { keys, .. } => {
                 for key in &keys {
                     let resp = self.cmd_lpop(key);
@@ -738,7 +702,6 @@ impl ShardStore {
                 CommandResponse::Nil
             }
 
-            // Server commands
             Command::Ping { message } => match message {
                 Some(msg) => CommandResponse::BulkString(msg),
                 None => CommandResponse::SimpleString("PONG".to_string()),
@@ -753,7 +716,6 @@ impl ShardStore {
             ),
             Command::CommandInfo { names } => command_info_response(&names),
 
-            // Dump: return all entries for RDB snapshot
             Command::Dump => {
                 let entries: Vec<CommandResponse> = self
                     .entries
@@ -769,7 +731,6 @@ impl ShardStore {
                 CommandResponse::Array(entries)
             }
 
-            // Multi-key commands handled at engine level, but provide per-shard fallback
             Command::MGet { keys } => {
                 let results: Vec<CommandResponse> = keys.iter().map(|k| self.cmd_get(k)).collect();
                 CommandResponse::Array(results)
@@ -781,7 +742,6 @@ impl ShardStore {
                 CommandResponse::Ok
             }
 
-            // Vector commands — handled per-shard when vector feature is enabled
             #[cfg(feature = "vector")]
             Command::VecSet {
                 key,
@@ -793,7 +753,6 @@ impl ShardStore {
             #[cfg(feature = "vector")]
             Command::VecDel { key } => self.cmd_vec_del(&key),
 
-            // Object commands
             Command::ObjectFreq { ref key } => {
                 let compact = CompactKey::new(key);
                 match self.entries.get(&compact) {
@@ -824,7 +783,6 @@ impl ShardStore {
             Command::StatsHotkeys { count } => self.cmd_stats_hotkeys(count),
             Command::StatsMemory { prefixes } => self.cmd_stats_memory(&prefixes),
 
-            // HyperLogLog commands
             Command::PfAdd { key, elements } => self.cmd_pfadd(&key, &elements),
             Command::PfCount { keys } => {
                 if keys.len() == 1 {
@@ -838,7 +796,6 @@ impl ShardStore {
                 sourcekeys,
             } => self.cmd_pfmerge(&destkey, &sourcekeys),
 
-            // Bitmap commands
             Command::SetBit { key, offset, value } => self.cmd_setbit(&key, offset, value),
             Command::GetBit { key, offset } => self.cmd_getbit(&key, offset),
             Command::BitCount {
@@ -861,7 +818,6 @@ impl ShardStore {
             } => self.cmd_bitpos(&key, bit, start, end, use_bit),
             Command::BitField { key, operations } => self.cmd_bitfield(&key, &operations),
 
-            // Geo commands
             Command::GeoAdd {
                 key,
                 nx,
@@ -901,7 +857,6 @@ impl ShardStore {
                 withhash,
             ),
 
-            // Transaction commands — handled at connection level
             Command::Multi
             | Command::Exec
             | Command::Discard
@@ -910,7 +865,6 @@ impl ShardStore {
                 CommandResponse::Error("ERR command handled at connection level".into())
             }
 
-            // Client commands — handled at connection level
             Command::ClientId
             | Command::ClientGetName
             | Command::ClientSetName { .. }
@@ -959,7 +913,6 @@ impl ShardStore {
             Command::CommandHelp => command_help_response(),
             Command::CommandDocs { names } => command_docs_response(&names),
 
-            // Commands handled at server/engine level — should not reach here
             Command::BgSave
             | Command::BgRewriteAof
             | Command::Hello { .. }
@@ -969,9 +922,6 @@ impl ShardStore {
             | Command::CdcGroupRead { .. }
             | Command::CdcAck { .. }
             | Command::CdcPending { .. }
-            | Command::ScriptLoad { .. }
-            | Command::ScriptCall { .. }
-            | Command::ScriptDel { .. }
             | Command::StatsLatency { .. }
             | Command::DocCreate { .. }
             | Command::DocDrop { .. }
@@ -1031,7 +981,6 @@ impl ShardStore {
     ) -> CommandResponse {
         let ttl = Command::ttl_duration(ex, px);
         let compact = CompactKey::new(key);
-        let tenant_id = self.current_tenant;
         match self.entries.entry(compact) {
             Entry::Occupied(mut occupied) => {
                 if occupied.get().is_expired() {
@@ -1039,17 +988,13 @@ impl ShardStore {
                     let old_size =
                         Self::estimate_key_entry_size(map_key.as_bytes(), &old_entry.value);
                     self.memory_used = self.memory_used.saturating_sub(old_size);
-                    let tm = self.tenant_memory.entry(old_entry.tenant_id).or_insert(0);
-                    *tm = tm.saturating_sub(old_size);
 
                     if xx {
                         return CommandResponse::Nil;
                     }
 
-                    let (entry, entry_size) =
-                        Self::build_string_entry(&map_key, value, ttl, tenant_id);
+                    let (entry, entry_size) = Self::build_string_entry(&map_key, value, ttl);
                     self.memory_used += entry_size;
-                    *self.tenant_memory.entry(tenant_id).or_insert(0) += entry_size;
                     self.entries.insert(map_key, entry);
                     CommandResponse::Ok
                 } else {
@@ -1068,28 +1013,8 @@ impl ShardStore {
                         self.memory_used = self.memory_used.saturating_sub((-size_delta) as usize);
                     }
 
-                    let old_tenant = occupied.get().tenant_id;
-                    if old_tenant == tenant_id {
-                        let tm = self.tenant_memory.entry(tenant_id).or_insert(0);
-                        if size_delta >= 0 {
-                            *tm += size_delta as usize;
-                        } else {
-                            *tm = tm.saturating_sub((-size_delta) as usize);
-                        }
-                    } else {
-                        let old_size = Self::estimate_key_entry_size(
-                            occupied.key().as_bytes(),
-                            &occupied.get().value,
-                        );
-                        let tm = self.tenant_memory.entry(old_tenant).or_insert(0);
-                        *tm = tm.saturating_sub(old_size);
-                        let new_size = old_size.wrapping_add_signed(size_delta);
-                        *self.tenant_memory.entry(tenant_id).or_insert(0) += new_size;
-                    }
-
                     let entry = occupied.get_mut();
                     entry.value = new_value;
-                    entry.tenant_id = tenant_id;
                     entry.client_flags = 0;
                     match ttl {
                         Some(dur) => entry.set_ttl(dur),
@@ -1105,13 +1030,11 @@ impl ShardStore {
 
                 let new_value = Value::from_raw_bytes(value);
                 let entry_size = Self::estimate_key_entry_size(vacant.key().as_bytes(), &new_value);
-                let mut entry =
-                    KeyEntry::new_with_tenant(vacant.key().clone(), new_value, tenant_id);
+                let mut entry = KeyEntry::new(vacant.key().clone(), new_value);
                 if let Some(dur) = ttl {
                     entry.set_ttl(dur);
                 }
                 self.memory_used += entry_size;
-                *self.tenant_memory.entry(tenant_id).or_insert(0) += entry_size;
                 vacant.insert(entry);
                 CommandResponse::Ok
             }
@@ -1364,23 +1287,18 @@ impl ShardStore {
             .unwrap_or(0);
         let new_value = Value::from_raw_bytes(&current);
         let new_size = Self::estimate_key_entry_size(key, &new_value);
-        let tenant_id = self.current_tenant;
         match self.entries.get_mut(key) {
             Some(entry) => {
                 entry.value = new_value;
                 if new_size > old_size {
                     self.memory_used += new_size - old_size;
-                    *self.tenant_memory.entry(entry.tenant_id).or_insert(0) += new_size - old_size;
                 } else {
                     self.memory_used = self.memory_used.saturating_sub(old_size - new_size);
-                    let tm = self.tenant_memory.entry(entry.tenant_id).or_insert(0);
-                    *tm = tm.saturating_sub(old_size - new_size);
                 }
             }
             None => {
-                let entry = KeyEntry::new_with_tenant(compact.clone(), new_value, tenant_id);
+                let entry = KeyEntry::new(compact.clone(), new_value);
                 self.memory_used += new_size;
-                *self.tenant_memory.entry(tenant_id).or_insert(0) += new_size;
                 self.entries.insert(compact, entry);
             }
         }
@@ -1574,24 +1492,15 @@ impl ShardStore {
         if nx && self.entries.contains_key(&dest_compact) {
             let size = Self::estimate_key_entry_size(key, &source_entry.value);
             self.memory_used += size;
-            *self
-                .tenant_memory
-                .entry(source_entry.tenant_id)
-                .or_insert(0) += size;
             self.entries.insert(source_compact, source_entry);
             return CommandResponse::Integer(0);
         }
         if let Some(_old) = self.remove_compact_entry(&dest_compact) {}
-        let mut new_entry = KeyEntry::new_with_tenant(
-            dest_compact.clone(),
-            source_entry.value.clone(),
-            source_entry.tenant_id,
-        );
+        let mut new_entry = KeyEntry::new(dest_compact.clone(), source_entry.value.clone());
         new_entry.ttl = source_entry.ttl;
         new_entry.lfu_counter = source_entry.lfu_counter;
         let size = Self::estimate_key_entry_size(newkey, &new_entry.value);
         self.memory_used += size;
-        *self.tenant_memory.entry(new_entry.tenant_id).or_insert(0) += size;
         self.entries.insert(dest_compact, new_entry);
         if nx {
             CommandResponse::Integer(1)
@@ -1603,8 +1512,8 @@ impl ShardStore {
     fn cmd_copy(&mut self, source: &[u8], destination: &[u8], replace: bool) -> CommandResponse {
         self.lazy_expire(source);
         let src_compact = CompactKey::new(source);
-        let (value, ttl, tenant_id) = match self.entries.get(&src_compact) {
-            Some(entry) if !entry.is_expired() => (entry.value.clone(), entry.ttl, entry.tenant_id),
+        let (value, ttl) = match self.entries.get(&src_compact) {
+            Some(entry) if !entry.is_expired() => (entry.value.clone(), entry.ttl),
             _ => return CommandResponse::Integer(0),
         };
         self.lazy_expire(destination);
@@ -1615,11 +1524,10 @@ impl ShardStore {
         if replace {
             let _ = self.remove_compact_entry(&dest_compact);
         }
-        let mut new_entry = KeyEntry::new_with_tenant(dest_compact.clone(), value, tenant_id);
+        let mut new_entry = KeyEntry::new(dest_compact.clone(), value);
         new_entry.ttl = ttl;
         let size = Self::estimate_key_entry_size(destination, &new_entry.value);
         self.memory_used += size;
-        *self.tenant_memory.entry(new_entry.tenant_id).or_insert(0) += size;
         self.entries.insert(dest_compact, new_entry);
         CommandResponse::Integer(1)
     }
@@ -1750,7 +1658,6 @@ impl ShardStore {
                 }
                 let len = deque.len() as i64;
                 self.memory_used += mem_delta;
-                *self.tenant_memory.entry(self.current_tenant).or_insert(0) += mem_delta;
                 CommandResponse::Integer(len)
             }
             Err(e) => e,
@@ -1782,7 +1689,6 @@ impl ShardStore {
                 }
                 let len = deque.len() as i64;
                 self.memory_used += mem_delta;
-                *self.tenant_memory.entry(self.current_tenant).or_insert(0) += mem_delta;
                 CommandResponse::Integer(len)
             }
             Err(e) => e,
@@ -1962,8 +1868,6 @@ impl ShardStore {
                             let insert_idx = if before { idx } else { idx + 1 };
                             let new_val = Value::from_raw_bytes(value);
                             self.memory_used += new_val.estimated_size();
-                            *self.tenant_memory.entry(self.current_tenant).or_insert(0) +=
-                                new_val.estimated_size();
                             deque.insert(insert_idx, new_val);
                             CommandResponse::Integer(deque.len() as i64)
                         }
@@ -2234,12 +2138,8 @@ impl ShardStore {
                 }
                 if memory_delta >= 0 {
                     self.memory_used += memory_delta as usize;
-                    *self.tenant_memory.entry(self.current_tenant).or_insert(0) +=
-                        memory_delta as usize;
                 } else {
                     self.memory_used = self.memory_used.saturating_sub(memory_delta.unsigned_abs());
-                    let tm = self.tenant_memory.entry(self.current_tenant).or_insert(0);
-                    *tm = tm.saturating_sub(memory_delta.unsigned_abs());
                 }
                 CommandResponse::Integer(count)
             }
@@ -2469,7 +2369,6 @@ impl ShardStore {
                 }
                 map.insert(fk, new_val);
                 self.memory_used += mem_delta;
-                *self.tenant_memory.entry(self.current_tenant).or_insert(0) += mem_delta;
                 CommandResponse::Integer(1)
             }
             Err(e) => e,
@@ -2673,7 +2572,6 @@ impl ShardStore {
                     }
                 }
                 self.memory_used += memory_delta;
-                *self.tenant_memory.entry(self.current_tenant).or_insert(0) += memory_delta;
                 CommandResponse::Integer(count as i64)
             }
             Err(e) => e,
@@ -2941,11 +2839,9 @@ impl ShardStore {
             for v in &result {
                 memory_delta += v.estimated_size();
             }
-            let entry =
-                KeyEntry::new_with_tenant(compact.clone(), Value::Set(result), self.current_tenant);
+            let entry = KeyEntry::new(compact.clone(), Value::Set(result));
             self.entries.insert(compact, entry);
             self.memory_used += memory_delta;
-            *self.tenant_memory.entry(self.current_tenant).or_insert(0) += memory_delta;
         }
         CommandResponse::Integer(count)
     }
@@ -3003,11 +2899,9 @@ impl ShardStore {
             for v in &result {
                 memory_delta += v.estimated_size();
             }
-            let entry =
-                KeyEntry::new_with_tenant(compact.clone(), Value::Set(result), self.current_tenant);
+            let entry = KeyEntry::new(compact.clone(), Value::Set(result));
             self.entries.insert(compact, entry);
             self.memory_used += memory_delta;
-            *self.tenant_memory.entry(self.current_tenant).or_insert(0) += memory_delta;
         }
         CommandResponse::Integer(count)
     }
@@ -3065,11 +2959,9 @@ impl ShardStore {
             for v in &result {
                 memory_delta += v.estimated_size();
             }
-            let entry =
-                KeyEntry::new_with_tenant(compact.clone(), Value::Set(result), self.current_tenant);
+            let entry = KeyEntry::new(compact.clone(), Value::Set(result));
             self.entries.insert(compact, entry);
             self.memory_used += memory_delta;
-            *self.tenant_memory.entry(self.current_tenant).or_insert(0) += memory_delta;
         }
         CommandResponse::Integer(count)
     }
@@ -3246,7 +3138,6 @@ impl ShardStore {
                     }
                 }
                 self.memory_used += memory_delta;
-                *self.tenant_memory.entry(self.current_tenant).or_insert(0) += memory_delta;
                 CommandResponse::Integer(added)
             }
             Err(e) => e,
@@ -3856,14 +3747,9 @@ impl ShardStore {
                     + std::mem::size_of::<KeyEntry>()
                     + HLL_REGISTER_BYTES;
             }
-            let entry = KeyEntry::new_with_tenant(
-                compact.clone(),
-                Value::from_raw_bytes(&registers),
-                self.current_tenant,
-            );
+            let entry = KeyEntry::new(compact.clone(), Value::from_raw_bytes(&registers));
             self.entries.insert(compact, entry);
             self.memory_used += memory_delta;
-            *self.tenant_memory.entry(self.current_tenant).or_insert(0) += memory_delta;
         }
 
         CommandResponse::Integer(if changed { 1 } else { 0 })
@@ -3971,14 +3857,9 @@ impl ShardStore {
                 + std::mem::size_of::<KeyEntry>()
                 + HLL_REGISTER_BYTES;
         }
-        let entry = KeyEntry::new_with_tenant(
-            dest_compact.clone(),
-            Value::from_raw_bytes(&merged),
-            self.current_tenant,
-        );
+        let entry = KeyEntry::new(dest_compact.clone(), Value::from_raw_bytes(&merged));
         self.entries.insert(dest_compact, entry);
         self.memory_used += memory_delta;
-        *self.tenant_memory.entry(self.current_tenant).or_insert(0) += memory_delta;
 
         CommandResponse::Ok
     }
@@ -3996,10 +3877,9 @@ impl ShardStore {
         let new_value = Value::from_raw_bytes(&data);
         if is_new {
             let size = Self::estimate_key_entry_size(key, &new_value);
-            let entry = KeyEntry::new_with_tenant(compact.clone(), new_value, self.current_tenant);
+            let entry = KeyEntry::new(compact.clone(), new_value);
             self.entries.insert(compact, entry);
             self.memory_used += size;
-            *self.tenant_memory.entry(self.current_tenant).or_insert(0) += size;
         } else {
             let entry = self
                 .entries
@@ -4010,11 +3890,8 @@ impl ShardStore {
             let new_size = entry.value.estimated_size();
             if new_size > old_size {
                 self.memory_used += new_size - old_size;
-                *self.tenant_memory.entry(self.current_tenant).or_insert(0) += new_size - old_size;
             } else {
                 self.memory_used = self.memory_used.saturating_sub(old_size - new_size);
-                let tm = self.tenant_memory.entry(self.current_tenant).or_insert(0);
-                *tm = tm.saturating_sub(old_size - new_size);
             }
         }
     }
@@ -4476,7 +4353,6 @@ impl ShardStore {
                     }
                 }
                 self.memory_used += memory_delta;
-                *self.tenant_memory.entry(self.current_tenant).or_insert(0) += memory_delta;
                 CommandResponse::Integer(count)
             }
             Err(e) => e,
@@ -4735,11 +4611,10 @@ impl ShardStore {
         key: &CompactKey,
         value: &[u8],
         ttl: Option<Duration>,
-        tenant_id: TenantId,
     ) -> (KeyEntry, usize) {
         let new_value = Value::from_raw_bytes(value);
         let entry_size = Self::estimate_key_entry_size(key.as_bytes(), &new_value);
-        let mut entry = KeyEntry::new_with_tenant(key.clone(), new_value, tenant_id);
+        let mut entry = KeyEntry::new(key.clone(), new_value);
         if let Some(dur) = ttl {
             entry.set_ttl(dur);
         }
@@ -4766,16 +4641,12 @@ impl ShardStore {
         }
     }
 
-    /// Evict keys using tenant-scoped LFU sampling when memory pressure is detected.
-    ///
-    /// Only considers keys belonging to `current_tenant`, so one tenant's cold
-    /// data cannot evict another tenant's hot data.
+    /// Evict keys using LFU sampling when memory pressure is detected.
     fn maybe_evict(&mut self) {
         if self.max_memory == 0 || self.memory_used < self.max_memory {
             return;
         }
 
-        let tenant_id = self.current_tenant;
         let sample_size = 5usize;
         let entry_count = self.entries.len();
         if entry_count == 0 {
@@ -4797,9 +4668,6 @@ impl ShardStore {
             if sampled >= sample_size {
                 break;
             }
-            if entry.tenant_id != tenant_id {
-                continue;
-            }
             sampled += 1;
             if entry.lfu_counter < lowest_counter {
                 lowest_counter = entry.lfu_counter;
@@ -4809,9 +4677,6 @@ impl ShardStore {
 
         if lowest_key.is_none() {
             for (key, entry) in self.entries.iter().take(sample_size * 3) {
-                if entry.tenant_id != tenant_id {
-                    continue;
-                }
                 if entry.lfu_counter < lowest_counter {
                     lowest_counter = entry.lfu_counter;
                     lowest_key = Some(key.clone());
@@ -4828,8 +4693,6 @@ impl ShardStore {
         let removed = self.entries.remove(key)?;
         let removed_size = Self::estimate_key_entry_size(key.as_bytes(), &removed.value);
         self.memory_used = self.memory_used.saturating_sub(removed_size);
-        let tenant_mem = self.tenant_memory.entry(removed.tenant_id).or_insert(0);
-        *tenant_mem = tenant_mem.saturating_sub(removed_size);
         Some(removed)
     }
 
@@ -4845,11 +4708,7 @@ impl ShardStore {
         key: &CompactKey,
     ) -> Result<&mut VecDeque<Value>, CommandResponse> {
         if !self.entries.contains_key(key) {
-            let entry = KeyEntry::new_with_tenant(
-                key.clone(),
-                Value::List(VecDeque::new()),
-                self.current_tenant,
-            );
+            let entry = KeyEntry::new(key.clone(), Value::List(VecDeque::new()));
             self.entries.insert(key.clone(), entry);
         }
         let entry = self.entries.get_mut(key).ok_or_else(|| {
@@ -4868,11 +4727,7 @@ impl ShardStore {
         key: &CompactKey,
     ) -> Result<&mut HashMap<CompactKey, Value>, CommandResponse> {
         if !self.entries.contains_key(key) {
-            let entry = KeyEntry::new_with_tenant(
-                key.clone(),
-                Value::Hash(HashMap::new()),
-                self.current_tenant,
-            );
+            let entry = KeyEntry::new(key.clone(), Value::Hash(HashMap::new()));
             self.entries.insert(key.clone(), entry);
         }
         let entry = self.entries.get_mut(key).ok_or_else(|| {
@@ -4891,11 +4746,7 @@ impl ShardStore {
         key: &CompactKey,
     ) -> Result<&mut BTreeMap<Vec<u8>, f64>, CommandResponse> {
         if !self.entries.contains_key(key) {
-            let entry = KeyEntry::new_with_tenant(
-                key.clone(),
-                Value::SortedSet(BTreeMap::new()),
-                self.current_tenant,
-            );
+            let entry = KeyEntry::new(key.clone(), Value::SortedSet(BTreeMap::new()));
             self.entries.insert(key.clone(), entry);
         }
         let entry = self.entries.get_mut(key).ok_or_else(|| {
@@ -4914,11 +4765,7 @@ impl ShardStore {
         key: &CompactKey,
     ) -> Result<&mut HashSet<Value>, CommandResponse> {
         if !self.entries.contains_key(key) {
-            let entry = KeyEntry::new_with_tenant(
-                key.clone(),
-                Value::Set(HashSet::new()),
-                self.current_tenant,
-            );
+            let entry = KeyEntry::new(key.clone(), Value::Set(HashSet::new()));
             self.entries.insert(key.clone(), entry);
         }
         let entry = self.entries.get_mut(key).ok_or_else(|| {
@@ -4941,11 +4788,7 @@ impl ShardStore {
                 entries: VecDeque::new(),
                 last_id: StreamId { ms: 0, seq: 0 },
             };
-            let entry = KeyEntry::new_with_tenant(
-                key.clone(),
-                Value::Stream(Box::new(log)),
-                self.current_tenant,
-            );
+            let entry = KeyEntry::new(key.clone(), Value::Stream(Box::new(log)));
             self.entries.insert(key.clone(), entry);
         }
         let entry = self.entries.get_mut(key).ok_or_else(|| {
@@ -5265,11 +5108,7 @@ impl ShardStore {
                 entries: VecDeque::new(),
                 last_id: StreamId { ms: 0, seq: 0 },
             };
-            let entry = KeyEntry::new_with_tenant(
-                compact.clone(),
-                Value::Stream(Box::new(log)),
-                self.current_tenant,
-            );
+            let entry = KeyEntry::new(compact.clone(), Value::Stream(Box::new(log)));
             self.entries.insert(compact.clone(), entry);
         }
 
@@ -5844,7 +5683,7 @@ impl ShardStore {
     }
 }
 
-/// Normalize a Redis-style index (supports negative indexing).
+/// Format a float with the minimum precision needed for round-trip fidelity.
 fn format_float(f: f64) -> String {
     if f.fract() == 0.0 && f.abs() < 1e17 {
         let i = f as i64;
@@ -7122,68 +6961,6 @@ mod tests {
                 key: b"zs".to_vec()
             }),
             CommandResponse::Integer(2)
-        );
-    }
-
-    #[test]
-    fn test_tenant_eviction_isolation() {
-        use crate::tenant::TenantId;
-
-        let mut store = ShardStore::new(0);
-        store.set_max_memory(2000);
-
-        store.set_current_tenant(TenantId(1));
-        for i in 0..5 {
-            store.execute(Command::Set {
-                key: format!("t1:key:{i}").into_bytes(),
-                value: b"value_for_tenant_one".to_vec(),
-                ex: None,
-                px: None,
-                nx: false,
-                xx: false,
-            });
-        }
-
-        let t1_keys_before: usize = store
-            .entries
-            .values()
-            .filter(|e| e.tenant_id == TenantId(1))
-            .count();
-        assert_eq!(t1_keys_before, 5);
-
-        store.set_current_tenant(TenantId(2));
-        for i in 0..5 {
-            store.execute(Command::Set {
-                key: format!("t2:key:{i}").into_bytes(),
-                value: b"value_for_tenant_two".to_vec(),
-                ex: None,
-                px: None,
-                nx: false,
-                xx: false,
-            });
-        }
-
-        let t1_remaining: usize = store
-            .entries
-            .values()
-            .filter(|e| e.tenant_id == TenantId(1))
-            .count();
-        assert_eq!(t1_remaining, 5);
-
-        let t2_remaining: usize = store
-            .entries
-            .values()
-            .filter(|e| e.tenant_id == TenantId(2))
-            .count();
-        assert!(
-            t2_remaining <= 5,
-            "tenant 2 should have had keys evicted or capped, got {t2_remaining}"
-        );
-
-        let total = store.entries.len();
-        assert!(
-            total < 10,
-            "total keys should be less than 10 due to memory pressure, got {total}"
         );
     }
 }

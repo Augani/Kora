@@ -6,7 +6,7 @@
 
 Kōra is a **multi-threaded, embeddable, memory-safe cache engine written in Rust**. It is Redis protocol (RESP2) compatible and designed to surpass Redis's single-threaded limitation using a shared-nothing threading architecture (inspired by Seastar/ScyllaDB/Dragonfly).
 
-**Current status:** Phases 0–4 complete. Core engine, storage, advanced features, and production hardening are all implemented.
+**Current status:** v0.1.0 — core engine, storage, advanced features, and production hardening are all implemented.
 
 ## Repository Structure
 
@@ -16,8 +16,7 @@ This is a **Rust workspace monorepo** with the following crate layout:
 kora/
 ├── Cargo.toml              # workspace root
 ├── CLAUDE.md               # this file
-├── PLAN.md                 # implementation plan & status
-├── README.md               # architecture specification
+├── README.md               # project overview & documentation
 ├── kora-core/              # data structures, shard engine, memory management
 │   ├── src/
 │   │   ├── command.rs      # Command/CommandResponse enums
@@ -41,8 +40,8 @@ kora/
 │   │   ├── lib.rs          # KoraServer, ServerConfig
 │   │   └── shard_io/       # ShardIoEngine, ShardRouter, connection handler
 │   └── tests/
-│       ├── integration.rs  # TCP integration tests (27 tests)
-│       └── real_app_traffic.rs # Redis vs Kora benchmarks
+│       ├── integration.rs  # TCP integration tests
+│       └── real_app_traffic.rs # Benchmark tests
 ├── kora-embedded/          # library mode — direct API, no network
 │   └── src/lib.rs          # Database struct with get/set/del/etc.
 ├── kora-storage/           # persistence layer
@@ -53,6 +52,11 @@ kora/
 │       ├── manager.rs      # StorageManager (WAL + RDB + backend)
 │       ├── rdb.rs          # RDB snapshot save/load
 │       └── wal.rs          # Write-Ahead Log
+├── kora-doc/               # JSON document database with secondary indexes
+│   └── src/
+│       ├── engine.rs       # DocEngine, collections, indexes
+│       ├── expr.rs         # WHERE expression parser & evaluator
+│       └── packed.rs       # PackedDoc binary format
 ├── kora-vector/            # HNSW vector index
 │   ├── src/
 │   │   ├── distance.rs     # Cosine, L2, InnerProduct
@@ -64,8 +68,6 @@ kora/
 │       └── subscription.rs # Subscription manager with glob patterns
 ├── kora-pubsub/            # publish/subscribe messaging
 │   └── src/broker.rs       # PubSubBroker with pattern matching
-├── kora-scripting/         # WASM runtime (wasmtime)
-│   └── src/lib.rs          # WasmRuntime, FunctionRegistry
 ├── kora-observability/     # statistics & hot-key detection
 │   └── src/
 │       ├── sketch.rs       # CountMinSketch
@@ -79,7 +81,7 @@ kora/
 ### Dependency Graph (strict, acyclic)
 
 ```
-cli → server → core, protocol, storage, vector, cdc, pubsub, scripting, observability
+cli → server → core, protocol, storage, vector, cdc, pubsub, observability, doc
 embedded → core, storage, vector, cdc, observability
 ```
 
@@ -90,7 +92,6 @@ embedded → core, storage, vector, cdc, observability
 - **Language:** Rust (edition 2021, MSRV 1.75)
 - **Build system:** Cargo workspace
 - **Async runtime:** Tokio (server crate)
-- **WASM runtime:** wasmtime (scripting crate)
 
 ## Key Architectural Principles
 
@@ -104,7 +105,7 @@ These principles are non-negotiable — all code must follow them:
 
 4. **Memory safety:** This is Rust — avoid `unsafe` unless absolutely required for performance-critical paths, and document every `unsafe` block with a safety comment.
 
-5. **Redis compatibility:** Commands should behave identically to Redis. When in doubt, match Redis behavior exactly.
+5. **RESP2 compatibility:** RESP2 wire protocol commands should behave correctly. When implementing standard commands, match expected Redis semantics.
 
 ## Build & Run Commands
 
@@ -174,7 +175,7 @@ cargo run -- --config kora.toml
 
 ### Core Engine (kora-core)
 - Sharded key-value store with configurable shard count
-- All Redis string commands: GET, SET, GETSET, APPEND, STRLEN, INCR, DECR, INCRBY, DECRBY, MGET, MSET, SETNX
+- String commands: GET, SET, GETSET, APPEND, STRLEN, INCR, DECR, INCRBY, DECRBY, MGET, MSET, SETNX
 - Key commands: DEL, EXISTS, EXPIRE, PEXPIRE, PERSIST, TTL, PTTL, TYPE, KEYS, SCAN, DBSIZE, FLUSHDB
 - List commands: LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX
 - Hash commands: HSET, HGET, HDEL, HGETALL, HLEN, HEXISTS, HINCRBY
@@ -219,6 +220,12 @@ cargo run -- --config kora.toml
 - Thread-safe PubSubBroker with glob-pattern matching
 - Push-mode delivery to subscriber connections
 
+### Document Database (kora-doc)
+- JSON document storage with PackedDoc binary format
+- Secondary indexes: hash, sorted, array, unique
+- WHERE expression parser and query executor
+- Field projection and LIMIT/OFFSET pagination
+
 ### CLI (kora-cli)
 - TOML config file support with layered configuration
 - CLI argument overrides (--bind, --port, --workers, --log-level, --data-dir)
@@ -227,7 +234,7 @@ cargo run -- --config kora.toml
 
 - **Don't add locks to the data path.** If you need shared state, use message passing via channels.
 - **Don't break the crate dependency graph.** `kora-core` must remain dependency-free within the workspace.
-- **Don't deviate from Redis command semantics** without explicit discussion.
+- **Don't deviate from expected RESP2 command semantics** without explicit discussion.
 - **Don't use `unsafe` without a `// SAFETY:` comment.**
 - **Escape brackets in doc comments** that rustdoc might interpret as links (e.g., `\[optional\]`).
 

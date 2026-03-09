@@ -1,6 +1,20 @@
-//! Kōra — A multi-threaded, embeddable, memory-safe cache engine.
+//! CLI entrypoint for the Kōra cache server.
 //!
-//! This is the CLI entrypoint that starts the Kōra server.
+//! This binary parses configuration from three sources, applied in order of
+//! increasing precedence:
+//!
+//! 1. **Built-in defaults** — sensible values for a single-node deployment
+//!    (bind `127.0.0.1:6379`, worker count auto-detected from CPU cores,
+//!    log level `info`, persistence disabled).
+//! 2. **TOML config file** — loaded from the path given by `--config`
+//!    (defaults to `kora.toml` in the working directory). Missing files are
+//!    silently ignored.
+//! 3. **CLI arguments** — any flag passed on the command line overrides the
+//!    corresponding value from the config file.
+//!
+//! After merging configuration the binary initialises a `current_thread` Tokio
+//! runtime, constructs a [`kora_server::KoraServer`], and runs it until a
+//! `SIGINT` (Ctrl-C) triggers graceful shutdown.
 
 mod config;
 
@@ -13,7 +27,10 @@ use kora_storage::wal::SyncPolicy;
 
 use crate::config::FileConfig;
 
-/// Kōra — A multi-threaded, embeddable, memory-safe cache engine.
+/// Command-line arguments for the Kōra server binary.
+///
+/// Every optional field mirrors a key in the TOML config file. When present,
+/// the CLI value takes precedence over the file value.
 #[derive(Parser)]
 #[command(name = "kora", version, about)]
 struct Args {
@@ -32,14 +49,6 @@ struct Args {
     /// Number of shard worker threads (defaults to available CPU cores).
     #[arg(short, long)]
     workers: Option<usize>,
-
-    /// Address to bind the optional memcached listener.
-    #[arg(long)]
-    memcached_bind: Option<String>,
-
-    /// Port for the optional memcached listener.
-    #[arg(long)]
-    memcached_port: Option<u16>,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(long)]
@@ -61,10 +70,6 @@ struct Args {
     #[arg(long)]
     cdc_capacity: Option<usize>,
 
-    /// WASM scripting fuel budget (0 = disabled).
-    #[arg(long)]
-    script_max_fuel: Option<u64>,
-
     /// Port for Prometheus metrics HTTP endpoint (0 = disabled).
     #[arg(long)]
     metrics_port: Option<u16>,
@@ -72,26 +77,20 @@ struct Args {
     /// Unix socket path.
     #[arg(long)]
     unix_socket: Option<String>,
-
-    /// Enable tenant resource-limit checks on command dispatch.
-    #[arg(long)]
-    tenant_limits: bool,
 }
 
+/// Parses configuration, initialises the Tokio runtime, and runs the server
+/// until shutdown is signalled.
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Load config file (defaults to kora.toml, ignored if not found)
     let file_config = FileConfig::load(&args.config)?;
 
-    // CLI args override config file, which overrides defaults
     let bind = args
         .bind
         .or(file_config.bind)
         .unwrap_or_else(|| "127.0.0.1".into());
     let port = args.port.or(file_config.port).unwrap_or(6379);
-    let memcached_bind = args.memcached_bind.or(file_config.memcached_bind);
-    let memcached_port = args.memcached_port.or(file_config.memcached_port);
     let log_level = args
         .log_level
         .or(file_config.log_level)
@@ -108,7 +107,6 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // Build storage config from file + CLI
     let data_dir = args.data_dir.or(file_config.storage.data_dir.clone());
     let storage = data_dir.map(|dir| {
         let wal_sync = match file_config
@@ -141,34 +139,21 @@ fn main() -> anyhow::Result<()> {
     });
 
     let cdc_capacity = args.cdc_capacity.or(file_config.cdc_capacity).unwrap_or(0);
-    let script_max_fuel = args
-        .script_max_fuel
-        .or(file_config.script_max_fuel)
-        .unwrap_or(0);
 
     let metrics_port = args.metrics_port.or(file_config.metrics_port).unwrap_or(0);
     let unix_socket = args
         .unix_socket
         .or(file_config.unix_socket)
         .map(PathBuf::from);
-    let memcached_bind_address = memcached_port.map(|port| {
-        let host = memcached_bind.unwrap_or_else(|| bind.clone());
-        format!("{}:{}", host, port)
-    });
-    let tenant_limits_enabled =
-        args.tenant_limits || file_config.tenant_limits_enabled.unwrap_or(false);
-
     let config = ServerConfig {
         bind_address: format!("{}:{}", bind, port),
-        memcached_bind_address,
         worker_count,
         storage,
         cdc_capacity,
-        script_max_fuel,
+
         metrics_port,
         unix_socket,
         password: None,
-        tenant_limits_enabled,
     };
 
     tracing::info!(
@@ -185,7 +170,6 @@ fn main() -> anyhow::Result<()> {
         let server = KoraServer::new(config);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        // Handle Ctrl+C
         tokio::spawn(async move {
             tokio::signal::ctrl_c().await.ok();
             tracing::info!("Received shutdown signal");

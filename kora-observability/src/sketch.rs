@@ -1,7 +1,13 @@
 //! Count-Min Sketch for hot key detection.
 //!
-//! A probabilistic data structure that uses ~4KB of memory to approximate
-//! key access frequencies with controlled error bounds.
+//! A probabilistic data structure that approximates key access frequencies
+//! with controlled error bounds. The default configuration uses ~2KB of
+//! memory (64 columns x 4 rows) and guarantees that frequency estimates
+//! never undercount — they may only overestimate due to hash collisions.
+//!
+//! Supports periodic [`CountMinSketch::decay`] to implement a sliding
+//! window over recent access patterns, preventing stale hot keys from
+//! dominating the frequency rankings.
 
 use std::hash::{Hash, Hasher};
 

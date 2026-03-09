@@ -1,4 +1,15 @@
 //! Streaming incremental RESP2/RESP3 parser.
+//!
+//! [`RespParser`] accepts arbitrary byte chunks via [`feed`](RespParser::feed)
+//! and yields complete [`RespValue`] frames via [`try_parse`](RespParser::try_parse).
+//! Incomplete input is buffered transparently -- callers simply keep feeding
+//! bytes until a frame is ready.
+//!
+//! For the highest-throughput command paths, the parser also exposes zero-copy
+//! fast-path extractors ([`try_parse_hot_command_with`](RespParser::try_parse_hot_command_with),
+//! [`try_parse_publish_with`](RespParser::try_parse_publish_with)) that hand
+//! borrowed slices directly from the internal buffer to a caller-supplied
+//! callback, avoiding per-command heap allocation entirely.
 
 use bytes::BytesMut;
 use memchr::memchr;
@@ -6,9 +17,11 @@ use memchr::memchr;
 use crate::error::ProtocolError;
 use crate::resp::RespValue;
 
-/// A streaming RESP parser that handles incremental data.
+/// A streaming, incremental RESP parser.
 ///
-/// Supports both RESP2 and RESP3 wire formats.
+/// Maintains an internal byte buffer. Callers [`feed`](Self::feed) raw bytes
+/// from the network and then call [`try_parse`](Self::try_parse) (or one of the
+/// fast-path methods) to extract complete frames.
 pub struct RespParser {
     buffer: BytesMut,
 }
@@ -43,14 +56,14 @@ pub enum HotCommandRef<'a> {
 }
 
 impl RespParser {
-    /// Create a new parser.
+    /// Create a new parser with a default 4 KiB initial buffer.
     pub fn new() -> Self {
         Self {
             buffer: BytesMut::with_capacity(4096),
         }
     }
 
-    /// Append raw bytes from a TCP read.
+    /// Append raw bytes received from the network.
     pub fn feed(&mut self, data: &[u8]) {
         self.buffer.extend_from_slice(data);
     }
@@ -538,7 +551,6 @@ fn parse_value(data: &[u8]) -> Result<(RespValue, usize), ProtocolError> {
         b':' => parse_integer(data),
         b'$' => parse_bulk_string(data),
         b'*' => parse_array(data),
-        // RESP3 types
         b'_' => parse_null(data),
         b',' => parse_double(data),
         b'#' => parse_boolean(data),
@@ -547,10 +559,7 @@ fn parse_value(data: &[u8]) -> Result<(RespValue, usize), ProtocolError> {
         b'(' => parse_big_number(data),
         b'=' => parse_verbatim_string(data),
         b'>' => parse_push(data),
-        _ => {
-            // Try to parse as inline command (plain text like "PING\r\n")
-            parse_inline(data)
-        }
+        _ => parse_inline(data),
     }
 }
 
@@ -665,8 +674,6 @@ fn parse_array(data: &[u8]) -> Result<(RespValue, usize), ProtocolError> {
 
     Ok((RespValue::Array(Some(items)), offset))
 }
-
-// ─── RESP3 parsers ─────────────────────────────────────────────────────
 
 fn parse_null(data: &[u8]) -> Result<(RespValue, usize), ProtocolError> {
     let crlf_pos = find_crlf(data).ok_or(ProtocolError::Incomplete)?;

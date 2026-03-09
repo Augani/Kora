@@ -1,8 +1,20 @@
-//! Prometheus exposition format output.
+//! Prometheus text exposition format renderer.
 //!
-//! Formats [`StatsSnapshot`] and [`CommandHistograms`] data as
-//! Prometheus text exposition format, suitable for scraping by a
-//! Prometheus server on an HTTP `/metrics` endpoint.
+//! Converts [`StatsSnapshot`] and [`CommandHistograms`] into the
+//! [Prometheus text exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/#text-based-format),
+//! suitable for scraping by a Prometheus server on an HTTP `/metrics`
+//! endpoint.
+//!
+//! Emitted metric families:
+//!
+//! | Metric | Type | Description |
+//! |---|---|---|
+//! | `kora_commands_total` | counter | Commands processed, labeled by type |
+//! | `kora_keys_total` | gauge | Current key count |
+//! | `kora_memory_used_bytes` | gauge | Approximate memory consumption |
+//! | `kora_bytes_in_total` | counter | Total bytes received from clients |
+//! | `kora_bytes_out_total` | counter | Total bytes sent to clients |
+//! | `kora_command_duration_seconds` | histogram | Latency distribution per command |
 
 use std::fmt::Write;
 
@@ -10,38 +22,9 @@ use crate::histogram::CommandHistograms;
 use crate::stats::StatsSnapshot;
 
 const CMD_NAMES: [&str; 32] = [
-    "get",
-    "set",
-    "del",
-    "incr",
-    "decr",
-    "mget",
-    "mset",
-    "exists",
-    "expire",
-    "ttl",
-    "lpush",
-    "rpush",
-    "lpop",
-    "rpop",
-    "hset",
-    "hget",
-    "hgetall",
-    "sadd",
-    "srem",
-    "ping",
-    "info",
-    "dbsize",
-    "flush",
-    "scan",
-    "vecset",
-    "vecquery",
-    "scriptcall",
-    "cmd27",
-    "cmd28",
-    "cmd29",
-    "cmd30",
-    "other",
+    "get", "set", "del", "incr", "decr", "mget", "mset", "exists", "expire", "ttl", "lpush",
+    "rpush", "lpop", "rpop", "hset", "hget", "hgetall", "sadd", "srem", "ping", "info", "dbsize",
+    "flush", "scan", "vecset", "vecquery", "cmd26", "cmd27", "cmd28", "cmd29", "cmd30", "other",
 ];
 
 /// Format metrics as Prometheus exposition text.

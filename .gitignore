@@ -30,3 +30,7 @@ flamegraph.svg
 # Fuzz artifacts
 fuzz/artifacts/
 fuzz/corpus/
+
+# Claude Code
+.claude/
+.claude-tasks.md

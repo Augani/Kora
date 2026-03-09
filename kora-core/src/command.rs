@@ -1,6 +1,18 @@
 //! Command and response types for the Kōra engine.
 //!
-//! These types define the interface between the protocol layer and the shard engine.
+//! `Command` is the parsed, type-safe representation of every operation the
+//! engine supports — strings, lists, sets, hashes, sorted sets, streams,
+//! HyperLogLog, bitmaps, geo, vectors, pub/sub, transactions, and server
+//! management. The protocol crate parses raw RESP frames into `Command`
+//! variants, and the shard engine pattern-matches on them for execution.
+//!
+//! `CommandResponse` is the corresponding output type. Variants map directly
+//! to RESP wire types (simple string, error, integer, bulk string, array, nil)
+//! plus a `BulkStringShared` variant that allows zero-copy responses via
+//! `Arc<[u8]>`.
+//!
+//! Helper methods on `Command` (`key()`, `is_multi_key()`, `is_mutation()`,
+//! `cmd_type()`) drive the engine's routing and WAL logic.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -636,10 +648,8 @@ pub enum Command {
         /// Requested protocol version (2 or 3).
         version: Option<u8>,
     },
-    /// AUTH \[tenant\] password — authenticate / set tenant.
+    /// AUTH password — authenticate the connection.
     Auth {
-        /// Optional tenant identifier.
-        tenant: Option<Vec<u8>>,
         /// Password.
         password: Vec<u8>,
     },
@@ -910,29 +920,6 @@ pub enum Command {
     VecDel {
         /// The key.
         key: Vec<u8>,
-    },
-
-    // -- Scripting commands --
-    /// SCRIPTLOAD name wasm\_bytes — load a WASM module.
-    ScriptLoad {
-        /// Function name.
-        name: Vec<u8>,
-        /// WASM module bytes.
-        wasm_bytes: Vec<u8>,
-    },
-    /// SCRIPTCALL name \[args...\] — call a loaded WASM function.
-    ScriptCall {
-        /// Function name.
-        name: Vec<u8>,
-        /// Integer arguments (for numeric-only calls).
-        args: Vec<i64>,
-        /// Byte arguments (for calls that pass binary data via WASM linear memory).
-        byte_args: Vec<Vec<u8>>,
-    },
-    /// SCRIPTDEL name — unload a WASM module.
-    ScriptDel {
-        /// Function name.
-        name: Vec<u8>,
     },
 
     // -- Sorted Set commands --
@@ -1844,9 +1831,6 @@ impl Command {
                 | Command::CdcGroupRead { .. }
                 | Command::CdcAck { .. }
                 | Command::CdcPending { .. }
-                | Command::ScriptLoad { .. }
-                | Command::ScriptCall { .. }
-                | Command::ScriptDel { .. }
                 | Command::StatsHotkeys { .. }
                 | Command::StatsLatency { .. }
                 | Command::StatsMemory { .. }
@@ -2028,7 +2012,6 @@ impl Command {
             Command::Keys { .. } | Command::Scan { .. } => 23,
             Command::VecSet { .. } => 24,
             Command::VecQuery { .. } => 25,
-            Command::ScriptCall { .. } => 26,
             Command::ZAdd { .. } => 27,
             Command::ZRange { .. }
             | Command::ZRevRange { .. }
@@ -2275,9 +2258,6 @@ pub const SUPPORTED_COMMAND_NAMES: &[&str] = &[
     "sadd",
     "scan",
     "scard",
-    "scriptcall",
-    "scriptdel",
-    "scriptload",
     "sdiff",
     "sdiffstore",
     "select",

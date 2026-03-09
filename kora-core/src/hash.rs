@@ -1,4 +1,11 @@
 //! Key hashing and shard routing.
+//!
+//! Provides the two functions that determine which shard owns a given key:
+//! `hash_key` computes a fast non-cryptographic hash (ahash), and
+//! `shard_for_key` maps that hash to a shard index via modular arithmetic.
+//!
+//! These functions sit on the hot path of every command dispatch, so they are
+//! `#[inline]` and allocation-free.
 
 use ahash::AHasher;
 use std::hash::{Hash, Hasher};

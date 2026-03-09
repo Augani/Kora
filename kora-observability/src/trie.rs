@@ -1,7 +1,14 @@
 //! Prefix trie for memory attribution by key prefix.
 //!
-//! Tracks cumulative memory usage per key prefix, allowing queries like
-//! "how much memory do keys starting with `user:` consume?"
+//! Tracks cumulative memory usage per key prefix, enabling operators to
+//! answer questions like "how much memory do keys starting with `user:`
+//! consume?" Each byte along a key path accumulates the size delta of
+//! every key that shares that prefix.
+//!
+//! Thread-safe: the trie structure is protected by a [`parking_lot::RwLock`],
+//! so multiple readers can query concurrently. Writes acquire an exclusive
+//! lock. Leaf-level counters use [`AtomicI64`](std::sync::atomic::AtomicI64)
+//! for future lock-free update support on existing prefixes.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};

@@ -1,4 +1,26 @@
-//! Dictionary encoding primitives for repeated field values.
+//! Dictionary encoding for low-cardinality string field values.
+//!
+//! When a field's unique value count stays below a configurable threshold,
+//! storing the same string bytes in every packed document wastes space.
+//! [`ValueDictionary`] assigns a compact `u32` dictionary ID to each unique
+//! byte sequence and returns a [`StoredValue::DictRef`] instead of inlining
+//! the full payload. High-cardinality fields (or values shorter than
+//! `min_len_for_dictionary`) fall back to [`StoredValue::Inline`].
+//!
+//! ## Cardinality Estimation
+//!
+//! Per-field cardinality is tracked with a `HashSet<u64>` of value hashes,
+//! giving exact counts up to the threshold and constant-space tracking
+//! thereafter. Once the cardinality of a field exceeds
+//! `low_cardinality_threshold`, all subsequent values for that field are
+//! stored inline.
+//!
+//! ## Encoding / Decoding
+//!
+//! - **Encode:** `encode(field_id, value_bytes)` returns `DictRef(id)` or
+//!   `Inline(bytes)`.
+//! - **Decode:** `decode(stored)` maps `DictRef(id)` back to owned bytes, or
+//!   clones `Inline(bytes)` directly.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};

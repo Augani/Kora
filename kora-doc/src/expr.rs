@@ -1,4 +1,36 @@
-//! WHERE expression parser for document queries.
+//! Recursive-descent parser for WHERE-clause filter expressions.
+//!
+//! Converts a human-readable query string like
+//! `city = "Accra" AND age >= 25` into an [`Expr`] AST that the document
+//! engine evaluates against packed documents or uses for index lookups.
+//!
+//! ## Grammar
+//!
+//! ```text
+//! expr     = or_expr
+//! or_expr  = and_expr ( "OR" and_expr )*
+//! and_expr = compare  ( "AND" compare )*
+//! compare  = IDENT op value
+//! op       = "=" | "!=" | ">" | ">=" | "<" | "<=" | "CONTAINS"
+//! value    = STRING | NUMBER | "true" | "false" | "null"
+//! ```
+//!
+//! `AND` binds tighter than `OR`, matching SQL precedence. Keywords (`AND`,
+//! `OR`, `CONTAINS`, `TRUE`, `FALSE`, `NULL`) are case-insensitive. Field
+//! names may contain dots to address nested paths (e.g., `address.city`).
+//!
+//! ## Lexer
+//!
+//! A single-pass byte-oriented [`Lexer`] tokenises the input into
+//! identifiers, string literals (single- or double-quoted), numeric
+//! literals (including negatives and decimals), operators, and keywords.
+//!
+//! ## Parser
+//!
+//! A top-down [`Parser`] consumes the token stream using the precedence
+//! climbing pattern: `parse_or` calls `parse_and`, which calls
+//! `parse_compare`, yielding left-associative trees for chained conjunctions
+//! and disjunctions.
 
 use thiserror::Error;
 

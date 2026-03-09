@@ -1,3 +1,10 @@
+//! Per-stage latency tracking for connection batch processing.
+//!
+//! Each RESP command batch flows through a fixed pipeline of stages: parse/dispatch,
+//! route, execute, foreign-shard wait, serialize, and socket write. This module
+//! records per-stage latency distributions using HdrHistogram so operators can
+//! identify bottlenecks via the `INFO STAGES` command or the Prometheus endpoint.
+
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -21,6 +28,7 @@ const BATCH_STAGE_NAMES: [&str; NUM_BATCH_STAGES] = [
     "remote_delivery",
 ];
 
+/// Identifies a stage in the connection batch processing pipeline.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum BatchStage {
     ParseDispatch = 0,
@@ -44,6 +52,7 @@ impl BatchStage {
     }
 }
 
+/// Aggregated latency histograms and counters for each [`BatchStage`].
 pub(crate) struct BatchStageMetrics {
     enabled: AtomicBool,
     counts: [AtomicU64; NUM_BATCH_STAGES],
@@ -52,6 +61,7 @@ pub(crate) struct BatchStageMetrics {
 }
 
 impl BatchStageMetrics {
+    /// Creates a new metrics collector, optionally enabled from the start.
     pub(crate) fn new(enabled: bool) -> Self {
         Self {
             enabled: AtomicBool::new(enabled),
@@ -68,14 +78,17 @@ impl BatchStageMetrics {
         }
     }
 
+    /// Enables recording (idempotent).
     pub(crate) fn enable(&self) {
         self.enabled.store(true, Ordering::Relaxed);
     }
 
+    /// Returns whether recording is currently enabled.
     pub(crate) fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed)
     }
 
+    /// Records a single observation for the given stage (no-op when disabled).
     pub(crate) fn record(&self, stage: BatchStage, duration_ns: u64) {
         if !self.is_enabled() {
             return;
@@ -90,14 +103,17 @@ impl BatchStageMetrics {
         let _ = hist.record(clamped);
     }
 
+    /// Returns the total number of observations for a stage.
     pub(crate) fn count(&self, stage: BatchStage) -> u64 {
         self.counts[stage.as_index()].load(Ordering::Relaxed)
     }
 
+    /// Returns the cumulative duration in nanoseconds for a stage.
     pub(crate) fn sum_ns(&self, stage: BatchStage) -> u64 {
         self.sums_ns[stage.as_index()].load(Ordering::Relaxed)
     }
 
+    /// Returns the mean duration in nanoseconds for a stage, or 0 if no observations.
     pub(crate) fn average_ns(&self, stage: BatchStage) -> u64 {
         let count = self.count(stage);
         if count == 0 {
@@ -106,6 +122,7 @@ impl BatchStageMetrics {
         self.sum_ns(stage) / count
     }
 
+    /// Returns the value at the given percentile (0.0..100.0) for a stage.
     pub(crate) fn percentile_ns(&self, stage: BatchStage, percentile: f64) -> u64 {
         let hist = self.histograms[stage.as_index()].lock();
         if hist.is_empty() {
@@ -114,6 +131,7 @@ impl BatchStageMetrics {
         hist.value_at_percentile(percentile)
     }
 
+    /// Returns all stage variants in pipeline order.
     pub(crate) fn stages() -> [BatchStage; NUM_BATCH_STAGES] {
         [
             BatchStage::ParseDispatch,
@@ -135,6 +153,7 @@ impl Default for BatchStageMetrics {
     }
 }
 
+/// Formats stage metrics as a human-readable INFO section.
 pub(crate) fn format_stage_metrics_info(metrics: &BatchStageMetrics) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "# StageMetrics");
@@ -165,6 +184,7 @@ pub(crate) fn format_stage_metrics_info(metrics: &BatchStageMetrics) -> String {
     out
 }
 
+/// Formats stage metrics as Prometheus exposition text (summary type).
 pub(crate) fn format_stage_metrics_prometheus(metrics: &BatchStageMetrics) -> String {
     let mut out = String::new();
     let _ = writeln!(
