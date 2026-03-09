@@ -1,6 +1,7 @@
 # Build artifacts
 /target/
 **/target/
+.worktrees/
 
 # Cargo lock is committed for binaries, generated for libraries
 # Since this workspace includes a binary (kora-cli), we commit Cargo.lock
