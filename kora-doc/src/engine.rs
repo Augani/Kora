@@ -355,9 +355,9 @@ impl DocEngine {
             .segment(collection_id)
             .ok_or_else(|| DocError::UnknownCollection(collection.to_string()))?;
 
-        let field_id = segment
-            .field_id(field_path)
-            .ok_or(IndexError::NotFound(0))?;
+        let field_id = segment.field_id(field_path).ok_or_else(|| {
+            DocError::InvalidMutation(format!("no index found for field '{field_path}'"))
+        })?;
 
         state.index_config.remove(field_id)?;
         state.indexes.remove_field(field_id);
@@ -840,16 +840,25 @@ impl DocEngine {
         let index_type = field_id.and_then(|fid| state.index_config.lookup(fid));
 
         match (expr, index_type, field_id) {
-            (Expr::Eq(_, ExprValue::Null), _, _) => Ok(Vec::new()),
-
             (Expr::Eq(_, value), Some(IndexType::Hash), Some(fid)) => {
                 let Some(hashed) = expr_value_to_hash(value) else {
-                    return Ok(Vec::new());
+                    return self.fallback_scan(collection_id, state, expr);
                 };
                 Ok(state
                     .indexes
                     .hash(fid)
                     .map_or_else(Vec::new, |idx| idx.lookup(hashed).to_vec()))
+            }
+
+            (Expr::Eq(_, value), Some(IndexType::Unique), Some(fid)) => {
+                let Some(hashed) = expr_value_to_hash(value) else {
+                    return self.fallback_scan(collection_id, state, expr);
+                };
+                Ok(state
+                    .indexes
+                    .unique(fid)
+                    .and_then(|idx| idx.lookup(hashed))
+                    .map_or_else(Vec::new, |doc_id| vec![doc_id]))
             }
 
             (Expr::Eq(_, ExprValue::Number(n)), Some(IndexType::Sorted), Some(fid)) => Ok(state
@@ -899,7 +908,7 @@ impl DocEngine {
 
             (Expr::Contains(_, value), Some(IndexType::Array), Some(fid)) => {
                 let Some(hashed) = expr_value_to_hash(value) else {
-                    return Ok(Vec::new());
+                    return self.fallback_scan(collection_id, state, expr);
                 };
                 Ok(state
                     .indexes
@@ -989,6 +998,7 @@ fn value_to_hash(value: &Value) -> Option<u32> {
         Value::String(s) => Some(hash32(s.as_bytes())),
         Value::Bool(true) => Some(hash32(b"true")),
         Value::Bool(false) => Some(hash32(b"false")),
+        Value::Number(n) => Some(hash32(n.to_string().as_bytes())),
         _ => None,
     }
 }
@@ -1023,8 +1033,8 @@ fn add_single_field_entry(
             if let Value::Array(items) = value {
                 let array_idx = indexes.get_or_create_array(field_id);
                 for item in items {
-                    if let Value::String(s) = item {
-                        array_idx.add(hash32(s.as_bytes()), doc_id);
+                    if let Some(hashed) = value_to_hash(item) {
+                        array_idx.add(hashed, doc_id);
                     }
                 }
             }
@@ -1064,8 +1074,8 @@ fn remove_single_field_entry(
             if let Value::Array(items) = value {
                 let array_idx = indexes.get_or_create_array(field_id);
                 for item in items {
-                    if let Value::String(s) = item {
-                        array_idx.remove(hash32(s.as_bytes()), doc_id);
+                    if let Some(hashed) = value_to_hash(item) {
+                        array_idx.remove(hashed, doc_id);
                     }
                 }
             }
@@ -1096,7 +1106,8 @@ fn expr_value_to_hash(value: &ExprValue) -> Option<u32> {
         ExprValue::String(s) => Some(hash32(s.as_bytes())),
         ExprValue::Bool(true) => Some(hash32(b"true")),
         ExprValue::Bool(false) => Some(hash32(b"false")),
-        ExprValue::Number(_) | ExprValue::Null => None,
+        ExprValue::Number(n) => Some(hash32(n.to_string().as_bytes())),
+        ExprValue::Null => None,
     }
 }
 

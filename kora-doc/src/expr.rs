@@ -408,8 +408,8 @@ mod tests {
 
     #[test]
     fn parse_float_number() {
-        let expr = parse_where("score >= 3.14").unwrap();
-        assert_eq!(expr, Expr::Gte("score".into(), 3.14));
+        let expr = parse_where("score >= 3.15").unwrap();
+        assert_eq!(expr, Expr::Gte("score".into(), 3.15));
     }
 
     #[test]
