@@ -1237,7 +1237,9 @@ fn process_hot_command(
                 let resp = {
                     let mut s = store.borrow_mut();
                     let r = s.set_bytes(key, value, None, None, false, false);
-                    s.stamp_key_version(key);
+                    if !matches!(r, CommandResponse::Error(_)) {
+                        s.stamp_key_version(key);
+                    }
                     r
                 };
                 maybe_elapsed(execute_start, &mut stage_durations.execute_ns);
@@ -1273,7 +1275,9 @@ fn process_hot_command(
                 let resp = {
                     let mut s = store.borrow_mut();
                     let r = s.incr_by_bytes(key, 1);
-                    s.stamp_key_version(key);
+                    if !matches!(r, CommandResponse::Error(_)) {
+                        s.stamp_key_version(key);
+                    }
                     r
                 };
                 maybe_elapsed(execute_start, &mut stage_durations.execute_ns);

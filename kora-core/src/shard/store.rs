@@ -352,6 +352,7 @@ impl ShardStore {
         };
 
         let is_mut = cmd.is_mutation();
+        let cmd_for_stamp = if is_mut { Some(cmd.clone()) } else { None };
         let mutation_keys: Vec<CompactKey> = if is_mut {
             cmd.collect_mutation_keys()
                 .iter()
@@ -374,14 +375,16 @@ impl ShardStore {
 
         let response = self.execute_inner(cmd);
 
-        if !mutation_keys.is_empty() {
-            self.mutation_version += 1;
-            let ver = self.mutation_version;
-            for key in mutation_keys {
-                if let Some(entry) = self.entries.get_mut(&key) {
-                    entry.version = ver;
-                } else {
-                    self.key_deletion_versions.insert(key, ver);
+        if let Some(cmd_for_stamp) = cmd_for_stamp.as_ref() {
+            if !mutation_keys.is_empty() && Self::should_stamp_mutation(cmd_for_stamp, &response) {
+                self.mutation_version += 1;
+                let ver = self.mutation_version;
+                for key in mutation_keys {
+                    if let Some(entry) = self.entries.get_mut(&key) {
+                        entry.version = ver;
+                    } else {
+                        self.key_deletion_versions.insert(key, ver);
+                    }
                 }
             }
         }
@@ -400,6 +403,76 @@ impl ShardStore {
         }
 
         response
+    }
+
+    fn should_stamp_mutation(cmd: &Command, response: &CommandResponse) -> bool {
+        if matches!(response, CommandResponse::Error(_)) {
+            return false;
+        }
+
+        match cmd {
+            // Deletions already stamp exact keys through remove_compact_entry.
+            Command::Del { .. } | Command::Unlink { .. } => false,
+
+            // Conditional writes and ttl updates that report 0 for no-op.
+            Command::SetNx { .. }
+            | Command::MSetNx { .. }
+            | Command::Expire { .. }
+            | Command::PExpire { .. }
+            | Command::ExpireAt { .. }
+            | Command::PExpireAt { .. }
+            | Command::Persist { .. }
+            | Command::RenameNx { .. }
+            | Command::Copy { .. }
+            | Command::SAdd { .. }
+            | Command::SRem { .. }
+            | Command::SMove { .. }
+            | Command::HDel { .. }
+            | Command::ZRem { .. } => !matches!(response, CommandResponse::Integer(0)),
+
+            // SET with NX/XX returns Nil when preconditions fail.
+            Command::Set { .. } => !matches!(response, CommandResponse::Nil),
+
+            // Pop/move operations can return nil/empty without mutating.
+            Command::LPop { .. }
+            | Command::RPop { .. }
+            | Command::RPopLPush { .. }
+            | Command::LMove { .. }
+            | Command::BLPop { .. }
+            | Command::BRPop { .. }
+            | Command::BLMove { .. }
+            | Command::BZPopMin { .. }
+            | Command::BZPopMax { .. }
+            | Command::SPop { .. }
+            | Command::GetDel { .. } => match response {
+                CommandResponse::Nil => false,
+                CommandResponse::Array(items) if items.is_empty() => false,
+                _ => true,
+            },
+
+            // GETEX without modifiers is read-only (equivalent to GET).
+            Command::GetEx {
+                ex,
+                px,
+                exat,
+                pxat,
+                persist,
+                ..
+            } => {
+                if ex.is_none() && px.is_none() && exat.is_none() && pxat.is_none() && !persist {
+                    return false;
+                }
+                !matches!(response, CommandResponse::Nil)
+            }
+
+            // SETBIT returns the previous bit; no mutation if bit value does not change.
+            Command::SetBit { value, .. } => match response {
+                CommandResponse::Integer(previous) => *previous != *value as i64,
+                _ => true,
+            },
+
+            _ => true,
+        }
     }
 
     fn execute_inner(&mut self, cmd: Command) -> CommandResponse {

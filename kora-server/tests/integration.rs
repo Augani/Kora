@@ -3725,6 +3725,81 @@ async fn test_watch_multiple_keys_accumulate() {
 }
 
 #[tokio::test]
+async fn test_watch_not_invalidated_by_failed_mutation() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut c1 = connect(port).await;
+    let mut c2 = connect(port).await;
+
+    cmd(&mut c1, &["SET", "wfail", "not-an-int"]).await;
+    cmd(&mut c1, &["WATCH", "wfail"]).await;
+
+    let bad = cmd(&mut c2, &["INCR", "wfail"]).await;
+    assert_resp_prefix(&bad, b"-ERR");
+
+    cmd(&mut c1, &["MULTI"]).await;
+    cmd(&mut c1, &["GET", "wfail"]).await;
+    let resp = cmd(&mut c1, &["EXEC"]).await;
+    assert!(
+        resp.starts_with(b"*1\r\n"),
+        "failed mutation should not dirty watch, got: {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_watch_not_invalidated_by_noop_del_missing_key() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut c1 = connect(port).await;
+    let mut c2 = connect(port).await;
+
+    cmd(&mut c1, &["DEL", "wmissing"]).await;
+    cmd(&mut c1, &["WATCH", "wmissing"]).await;
+
+    let del_resp = cmd(&mut c2, &["DEL", "wmissing"]).await;
+    assert_resp(&del_resp, b":0\r\n");
+
+    cmd(&mut c1, &["MULTI"]).await;
+    cmd(&mut c1, &["GET", "wmissing"]).await;
+    let resp = cmd(&mut c1, &["EXEC"]).await;
+    assert!(
+        resp.starts_with(b"*1\r\n"),
+        "noop DEL should not dirty watch, got: {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_watch_not_invalidated_by_getex_without_options() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut c1 = connect(port).await;
+    let mut c2 = connect(port).await;
+
+    cmd(&mut c1, &["SET", "wgetex", "v"]).await;
+    cmd(&mut c1, &["WATCH", "wgetex"]).await;
+
+    let getex_resp = cmd(&mut c2, &["GETEX", "wgetex"]).await;
+    assert_resp(&getex_resp, b"$1\r\nv\r\n");
+
+    cmd(&mut c1, &["MULTI"]).await;
+    cmd(&mut c1, &["GET", "wgetex"]).await;
+    let resp = cmd(&mut c1, &["EXEC"]).await;
+    assert!(
+        resp.starts_with(b"*1\r\n"),
+        "GETEX without options should not dirty watch, got: {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
 async fn test_discard_clears_watch_state() {
     let port = free_port().await;
     let shutdown = start_server(port).await;
