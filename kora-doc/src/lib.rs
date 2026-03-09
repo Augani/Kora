@@ -15,6 +15,7 @@ pub mod collection;
 pub mod decompose;
 pub mod dictionary;
 pub mod engine;
+pub mod expr;
 pub mod index;
 pub mod key;
 pub mod packed;
@@ -28,6 +29,7 @@ pub use engine::{
     CollectionInfo, DictionaryFieldInfo, DictionaryInfo, DocEngine, DocError, DocMutation,
     SetResult, StorageInfo,
 };
+pub use expr::{Expr, ExprError, ExprValue};
 pub use index::{hash32, CollectionIndexes, IndexConfig, IndexError, IndexType};
 pub use key::{
     decode_cdc_event_key, decode_cold_doc_key, decode_collection_key, decode_compound_index_key,
