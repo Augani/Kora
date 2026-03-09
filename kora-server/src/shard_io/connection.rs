@@ -11,10 +11,11 @@ use kora_cdc::consumer::ConsumerGroupManager;
 use kora_cdc::ring::CdcRing;
 use kora_core::command::{
     command_docs_response, command_help_response, command_info_response, command_list_response,
-    supported_command_count, Command, CommandResponse,
+    supported_command_count, Command, CommandResponse, DocUpdateMutation,
 };
 use kora_core::shard::{ShardStore, WalRecord, WalWriter};
 use kora_core::tenant::TenantId;
+use kora_doc::{CollectionConfig, CompressionProfile, DocEngine, DocMutation};
 use kora_protocol::{parse_command, serialize_response_versioned, HotCommandRef, RespParser};
 use kora_pubsub::{MessageSink, PubSubMessage};
 use parking_lot::Mutex;
@@ -1222,6 +1223,61 @@ fn try_handle_local_affinity(
         Command::CommandList => Some(command_list_response()),
         Command::CommandHelp => Some(command_help_response()),
         Command::CommandDocs { names } => Some(command_docs_response(names)),
+        Command::DocCreate {
+            collection,
+            compression,
+        } => Some(handle_doc_create(
+            &shared.doc_engine,
+            collection,
+            compression,
+        )),
+        Command::DocDrop { collection } => Some(handle_doc_drop(&shared.doc_engine, collection)),
+        Command::DocInfo { collection } => Some(handle_doc_info(&shared.doc_engine, collection)),
+        Command::DocDictInfo { collection } => {
+            Some(handle_doc_dictinfo(&shared.doc_engine, collection))
+        }
+        Command::DocStorage { collection } => {
+            Some(handle_doc_storage(&shared.doc_engine, collection))
+        }
+        Command::DocSet {
+            collection,
+            doc_id,
+            json,
+        } => Some(handle_doc_set(&shared.doc_engine, collection, doc_id, json)),
+        Command::DocMSet {
+            collection,
+            entries,
+        } => Some(handle_doc_mset(&shared.doc_engine, collection, entries)),
+        Command::DocGet {
+            collection,
+            doc_id,
+            fields,
+        } => Some(handle_doc_get(
+            &shared.doc_engine,
+            collection,
+            doc_id,
+            fields,
+        )),
+        Command::DocMGet {
+            collection,
+            doc_ids,
+        } => Some(handle_doc_mget(&shared.doc_engine, collection, doc_ids)),
+        Command::DocUpdate {
+            collection,
+            doc_id,
+            mutations,
+        } => Some(handle_doc_update(
+            &shared.doc_engine,
+            collection,
+            doc_id,
+            mutations,
+        )),
+        Command::DocDel { collection, doc_id } => {
+            Some(handle_doc_del(&shared.doc_engine, collection, doc_id))
+        }
+        Command::DocExists { collection, doc_id } => {
+            Some(handle_doc_exists(&shared.doc_engine, collection, doc_id))
+        }
         Command::CdcPoll { cursor, count } => {
             Some(handle_cdc_poll(&shared.cdc_rings, *cursor, *count))
         }
@@ -1315,6 +1371,475 @@ fn handle_bgsave_affinity(shared: &Arc<AffinitySharedState>) -> CommandResponse 
     match super::start_manual_snapshot(shared) {
         Ok(()) => CommandResponse::SimpleString("Background saving started".into()),
         Err(err) => CommandResponse::Error(err),
+    }
+}
+
+fn handle_doc_create(
+    doc_engine: &Mutex<DocEngine>,
+    collection: &[u8],
+    compression: &Option<Vec<u8>>,
+) -> CommandResponse {
+    let collection = match parse_utf8_arg(collection, "collection") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let compression = match compression
+        .as_ref()
+        .map(|value| parse_compression_profile(value))
+        .transpose()
+    {
+        Ok(profile) => profile.unwrap_or(CompressionProfile::Balanced),
+        Err(err) => return err,
+    };
+
+    let config = CollectionConfig { compression };
+    match doc_engine.lock().create_collection(&collection, config) {
+        Ok(_) => CommandResponse::Ok,
+        Err(err) => CommandResponse::Error(format!("ERR {}", err)),
+    }
+}
+
+fn handle_doc_drop(doc_engine: &Mutex<DocEngine>, collection: &[u8]) -> CommandResponse {
+    let collection = match parse_utf8_arg(collection, "collection") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+
+    if doc_engine.lock().drop_collection(&collection) {
+        CommandResponse::Integer(1)
+    } else {
+        CommandResponse::Integer(0)
+    }
+}
+
+fn handle_doc_info(doc_engine: &Mutex<DocEngine>, collection: &[u8]) -> CommandResponse {
+    let collection = match parse_utf8_arg(collection, "collection") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+
+    let Some(info) = doc_engine.lock().collection_info(&collection) else {
+        return CommandResponse::Nil;
+    };
+
+    CommandResponse::Map(vec![
+        (
+            CommandResponse::BulkString(b"id".to_vec()),
+            CommandResponse::Integer(info.id as i64),
+        ),
+        (
+            CommandResponse::BulkString(b"name".to_vec()),
+            CommandResponse::BulkString(info.name.into_bytes()),
+        ),
+        (
+            CommandResponse::BulkString(b"created_at".to_vec()),
+            CommandResponse::Integer(info.created_at as i64),
+        ),
+        (
+            CommandResponse::BulkString(b"compression".to_vec()),
+            CommandResponse::BulkString(compression_name(info.compression).as_bytes().to_vec()),
+        ),
+        (
+            CommandResponse::BulkString(b"doc_count".to_vec()),
+            CommandResponse::Integer(info.doc_count as i64),
+        ),
+        (
+            CommandResponse::BulkString(b"dictionary_entries".to_vec()),
+            CommandResponse::Integer(info.dictionary_entries as i64),
+        ),
+    ])
+}
+
+fn handle_doc_dictinfo(doc_engine: &Mutex<DocEngine>, collection: &[u8]) -> CommandResponse {
+    let collection = match parse_utf8_arg(collection, "collection") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+
+    let info = match doc_engine.lock().dictionary_info(&collection) {
+        Ok(info) => info,
+        Err(err) => return CommandResponse::Error(format!("ERR {}", err)),
+    };
+
+    let mut fields = Vec::with_capacity(info.fields.len());
+    for field in info.fields {
+        fields.push(CommandResponse::Map(vec![
+            (
+                CommandResponse::BulkString(b"field_id".to_vec()),
+                CommandResponse::Integer(field.field_id as i64),
+            ),
+            (
+                CommandResponse::BulkString(b"path".to_vec()),
+                CommandResponse::BulkString(field.path.into_bytes()),
+            ),
+            (
+                CommandResponse::BulkString(b"cardinality_estimate".to_vec()),
+                CommandResponse::Integer(field.cardinality_estimate as i64),
+            ),
+        ]));
+    }
+
+    CommandResponse::Map(vec![
+        (
+            CommandResponse::BulkString(b"id".to_vec()),
+            CommandResponse::Integer(info.collection_id as i64),
+        ),
+        (
+            CommandResponse::BulkString(b"name".to_vec()),
+            CommandResponse::BulkString(info.collection_name.into_bytes()),
+        ),
+        (
+            CommandResponse::BulkString(b"dictionary_entries".to_vec()),
+            CommandResponse::Integer(info.dictionary_entries as i64),
+        ),
+        (
+            CommandResponse::BulkString(b"fields".to_vec()),
+            CommandResponse::Array(fields),
+        ),
+    ])
+}
+
+fn handle_doc_storage(doc_engine: &Mutex<DocEngine>, collection: &[u8]) -> CommandResponse {
+    let collection = match parse_utf8_arg(collection, "collection") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+
+    let info = match doc_engine.lock().storage_info(&collection) {
+        Ok(info) => info,
+        Err(err) => return CommandResponse::Error(format!("ERR {}", err)),
+    };
+
+    CommandResponse::Map(vec![
+        (
+            CommandResponse::BulkString(b"id".to_vec()),
+            CommandResponse::Integer(info.collection_id as i64),
+        ),
+        (
+            CommandResponse::BulkString(b"name".to_vec()),
+            CommandResponse::BulkString(info.collection_name.into_bytes()),
+        ),
+        (
+            CommandResponse::BulkString(b"doc_count".to_vec()),
+            CommandResponse::Integer(info.doc_count as i64),
+        ),
+        (
+            CommandResponse::BulkString(b"total_packed_bytes".to_vec()),
+            CommandResponse::Integer(info.total_packed_bytes as i64),
+        ),
+        (
+            CommandResponse::BulkString(b"min_doc_bytes".to_vec()),
+            CommandResponse::Integer(info.min_doc_bytes as i64),
+        ),
+        (
+            CommandResponse::BulkString(b"max_doc_bytes".to_vec()),
+            CommandResponse::Integer(info.max_doc_bytes as i64),
+        ),
+        (
+            CommandResponse::BulkString(b"avg_doc_bytes".to_vec()),
+            CommandResponse::Integer(info.avg_doc_bytes as i64),
+        ),
+    ])
+}
+
+fn handle_doc_set(
+    doc_engine: &Mutex<DocEngine>,
+    collection: &[u8],
+    doc_id: &[u8],
+    json: &[u8],
+) -> CommandResponse {
+    let collection = match parse_utf8_arg(collection, "collection") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let doc_id = match parse_utf8_arg(doc_id, "doc_id") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let json = match serde_json::from_slice::<serde_json::Value>(json) {
+        Ok(value) => value,
+        Err(err) => return CommandResponse::Error(format!("ERR invalid JSON: {}", err)),
+    };
+
+    match doc_engine.lock().set(&collection, &doc_id, &json) {
+        Ok(_) => CommandResponse::Ok,
+        Err(err) => CommandResponse::Error(format!("ERR {}", err)),
+    }
+}
+
+fn handle_doc_mset(
+    doc_engine: &Mutex<DocEngine>,
+    collection: &[u8],
+    entries: &[(Vec<u8>, Vec<u8>)],
+) -> CommandResponse {
+    let collection = match parse_utf8_arg(collection, "collection") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+
+    let mut parsed_entries = Vec::with_capacity(entries.len());
+    for (doc_id, json_bytes) in entries {
+        let doc_id = match parse_utf8_arg(doc_id, "doc_id") {
+            Ok(value) => value,
+            Err(err) => return err,
+        };
+        let json = match serde_json::from_slice::<serde_json::Value>(json_bytes) {
+            Ok(value) => value,
+            Err(err) => return CommandResponse::Error(format!("ERR invalid JSON: {}", err)),
+        };
+        parsed_entries.push((doc_id, json));
+    }
+
+    let mut engine = doc_engine.lock();
+    for (doc_id, json) in &parsed_entries {
+        if let Err(err) = engine.set(&collection, doc_id, json) {
+            return CommandResponse::Error(format!("ERR {}", err));
+        }
+    }
+
+    CommandResponse::Ok
+}
+
+fn handle_doc_get(
+    doc_engine: &Mutex<DocEngine>,
+    collection: &[u8],
+    doc_id: &[u8],
+    fields: &[Vec<u8>],
+) -> CommandResponse {
+    let collection = match parse_utf8_arg(collection, "collection") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let doc_id = match parse_utf8_arg(doc_id, "doc_id") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let field_strings = match parse_utf8_args(fields, "field") {
+        Ok(values) => values,
+        Err(err) => return err,
+    };
+    let projection_vec = (!field_strings.is_empty())
+        .then(|| field_strings.iter().map(String::as_str).collect::<Vec<_>>());
+
+    let doc = match doc_engine
+        .lock()
+        .get(&collection, &doc_id, projection_vec.as_deref())
+    {
+        Ok(value) => value,
+        Err(err) => return CommandResponse::Error(format!("ERR {}", err)),
+    };
+
+    match doc {
+        Some(value) => match serde_json::to_vec(&value) {
+            Ok(bytes) => CommandResponse::BulkString(bytes),
+            Err(err) => CommandResponse::Error(format!("ERR JSON serialization failed: {}", err)),
+        },
+        None => CommandResponse::Nil,
+    }
+}
+
+fn handle_doc_mget(
+    doc_engine: &Mutex<DocEngine>,
+    collection: &[u8],
+    doc_ids: &[Vec<u8>],
+) -> CommandResponse {
+    let collection = match parse_utf8_arg(collection, "collection") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let doc_ids = match parse_utf8_args(doc_ids, "doc_id") {
+        Ok(values) => values,
+        Err(err) => return err,
+    };
+
+    let engine = doc_engine.lock();
+    let mut results = Vec::with_capacity(doc_ids.len());
+    for doc_id in doc_ids {
+        match engine.get(&collection, &doc_id, None) {
+            Ok(Some(value)) => match serde_json::to_vec(&value) {
+                Ok(bytes) => results.push(CommandResponse::BulkString(bytes)),
+                Err(err) => {
+                    return CommandResponse::Error(format!(
+                        "ERR JSON serialization failed: {}",
+                        err
+                    ));
+                }
+            },
+            Ok(None) => results.push(CommandResponse::Nil),
+            Err(err) => return CommandResponse::Error(format!("ERR {}", err)),
+        }
+    }
+
+    CommandResponse::Array(results)
+}
+
+fn handle_doc_update(
+    doc_engine: &Mutex<DocEngine>,
+    collection: &[u8],
+    doc_id: &[u8],
+    mutations: &[DocUpdateMutation],
+) -> CommandResponse {
+    if mutations.is_empty() {
+        return CommandResponse::Error("ERR DOC.UPDATE requires at least one mutation".into());
+    }
+
+    let collection = match parse_utf8_arg(collection, "collection") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let doc_id = match parse_utf8_arg(doc_id, "doc_id") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+
+    let mut parsed = Vec::with_capacity(mutations.len());
+    for mutation in mutations {
+        match mutation {
+            DocUpdateMutation::Set { path, value } => {
+                let path = match parse_utf8_arg(path, "path") {
+                    Ok(value) => value,
+                    Err(err) => return err,
+                };
+                let value = match serde_json::from_slice::<serde_json::Value>(value) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return CommandResponse::Error(format!("ERR invalid JSON: {}", err))
+                    }
+                };
+                parsed.push(DocMutation::Set { path, value });
+            }
+            DocUpdateMutation::Del { path } => {
+                let path = match parse_utf8_arg(path, "path") {
+                    Ok(value) => value,
+                    Err(err) => return err,
+                };
+                parsed.push(DocMutation::Del { path });
+            }
+            DocUpdateMutation::Incr { path, delta } => {
+                if !delta.is_finite() {
+                    return CommandResponse::Error(
+                        "ERR DOC.UPDATE INCR delta must be finite".into(),
+                    );
+                }
+                let path = match parse_utf8_arg(path, "path") {
+                    Ok(value) => value,
+                    Err(err) => return err,
+                };
+                parsed.push(DocMutation::Incr {
+                    path,
+                    delta: *delta,
+                });
+            }
+            DocUpdateMutation::Push { path, value } => {
+                let path = match parse_utf8_arg(path, "path") {
+                    Ok(value) => value,
+                    Err(err) => return err,
+                };
+                let value = match serde_json::from_slice::<serde_json::Value>(value) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return CommandResponse::Error(format!("ERR invalid JSON: {}", err))
+                    }
+                };
+                parsed.push(DocMutation::Push { path, value });
+            }
+            DocUpdateMutation::Pull { path, value } => {
+                let path = match parse_utf8_arg(path, "path") {
+                    Ok(value) => value,
+                    Err(err) => return err,
+                };
+                let value = match serde_json::from_slice::<serde_json::Value>(value) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return CommandResponse::Error(format!("ERR invalid JSON: {}", err))
+                    }
+                };
+                parsed.push(DocMutation::Pull { path, value });
+            }
+        }
+    }
+
+    match doc_engine.lock().update(&collection, &doc_id, &parsed) {
+        Ok(true) => CommandResponse::Integer(1),
+        Ok(false) => CommandResponse::Integer(0),
+        Err(err) => CommandResponse::Error(format!("ERR {}", err)),
+    }
+}
+
+fn handle_doc_del(
+    doc_engine: &Mutex<DocEngine>,
+    collection: &[u8],
+    doc_id: &[u8],
+) -> CommandResponse {
+    let collection = match parse_utf8_arg(collection, "collection") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let doc_id = match parse_utf8_arg(doc_id, "doc_id") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+
+    match doc_engine.lock().del(&collection, &doc_id) {
+        Ok(true) => CommandResponse::Integer(1),
+        Ok(false) => CommandResponse::Integer(0),
+        Err(err) => CommandResponse::Error(format!("ERR {}", err)),
+    }
+}
+
+fn handle_doc_exists(
+    doc_engine: &Mutex<DocEngine>,
+    collection: &[u8],
+    doc_id: &[u8],
+) -> CommandResponse {
+    let collection = match parse_utf8_arg(collection, "collection") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let doc_id = match parse_utf8_arg(doc_id, "doc_id") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+
+    match doc_engine.lock().exists(&collection, &doc_id) {
+        Ok(true) => CommandResponse::Integer(1),
+        Ok(false) => CommandResponse::Integer(0),
+        Err(err) => CommandResponse::Error(format!("ERR {}", err)),
+    }
+}
+
+fn parse_utf8_arg(bytes: &[u8], arg_name: &str) -> Result<String, CommandResponse> {
+    std::str::from_utf8(bytes)
+        .map(|value| value.to_string())
+        .map_err(|_| CommandResponse::Error(format!("ERR invalid UTF-8 in {}", arg_name)))
+}
+
+fn parse_utf8_args(values: &[Vec<u8>], arg_name: &str) -> Result<Vec<String>, CommandResponse> {
+    values
+        .iter()
+        .map(|value| parse_utf8_arg(value, arg_name))
+        .collect()
+}
+
+fn parse_compression_profile(raw: &[u8]) -> Result<CompressionProfile, CommandResponse> {
+    let value = parse_utf8_arg(raw, "compression profile")?;
+    match value.to_ascii_lowercase().as_str() {
+        "none" => Ok(CompressionProfile::None),
+        "dictionary" => Ok(CompressionProfile::Dictionary),
+        "balanced" => Ok(CompressionProfile::Balanced),
+        "compact" => Ok(CompressionProfile::Compact),
+        _ => Err(CommandResponse::Error(
+            "ERR invalid compression profile (expected none|dictionary|balanced|compact)".into(),
+        )),
+    }
+}
+
+fn compression_name(profile: CompressionProfile) -> &'static str {
+    match profile {
+        CompressionProfile::None => "none",
+        CompressionProfile::Dictionary => "dictionary",
+        CompressionProfile::Balanced => "balanced",
+        CompressionProfile::Compact => "compact",
     }
 }
 

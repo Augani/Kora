@@ -12,9 +12,28 @@ use std::time::Duration;
 
 use kora_core::command::{Command, CommandResponse};
 use kora_core::shard::ShardEngine;
+use kora_doc::{
+    CollectionConfig, CollectionInfo, DictionaryInfo, DocEngine, DocError, DocMutation, SetResult,
+    StorageInfo,
+};
+use parking_lot::RwLock;
+use serde_json::Value;
 
 #[cfg(feature = "server")]
 use tokio::task::JoinHandle;
+
+/// Document collection configuration alias for embedded API consumers.
+pub type DocCollectionConfig = CollectionConfig;
+/// Document collection info alias for embedded API consumers.
+pub type DocCollectionInfo = CollectionInfo;
+/// Document write result alias for embedded API consumers.
+pub type DocSetResult = SetResult;
+/// Document update mutation alias for embedded API consumers.
+pub type DocUpdateMutation = DocMutation;
+/// Dictionary stats alias for embedded API consumers.
+pub type DocDictionaryInfo = DictionaryInfo;
+/// Storage stats alias for embedded API consumers.
+pub type DocStorageInfo = StorageInfo;
 
 /// Configuration for the embedded database.
 pub struct Config {
@@ -38,13 +57,15 @@ impl Default for Config {
 /// via direct function calls instead of TCP.
 pub struct Database {
     engine: Arc<ShardEngine>,
+    doc_engine: Arc<RwLock<DocEngine>>,
 }
 
 impl Database {
     /// Open a new database with the given configuration.
     pub fn open(config: Config) -> Self {
         let engine = Arc::new(ShardEngine::new(config.shard_count));
-        Self { engine }
+        let doc_engine = Arc::new(RwLock::new(DocEngine::new()));
+        Self { engine, doc_engine }
     }
 
     /// Get a reference to the underlying engine.
@@ -55,6 +76,117 @@ impl Database {
     /// Get a shared reference to the engine (for hybrid mode).
     pub fn shared_engine(&self) -> Arc<ShardEngine> {
         self.engine.clone()
+    }
+
+    /// Get a shared handle to the embedded document engine.
+    #[must_use]
+    pub fn shared_doc_engine(&self) -> Arc<RwLock<DocEngine>> {
+        self.doc_engine.clone()
+    }
+
+    // ─── Document operations ─────────────────────────────────────
+
+    /// Create a document collection.
+    pub fn doc_create_collection(
+        &self,
+        collection: &str,
+        config: DocCollectionConfig,
+    ) -> Result<u16, DocError> {
+        self.doc_engine
+            .write()
+            .create_collection(collection, config)
+    }
+
+    /// Drop a document collection and all documents in it.
+    pub fn doc_drop_collection(&self, collection: &str) -> bool {
+        self.doc_engine.write().drop_collection(collection)
+    }
+
+    /// Get collection metadata when present.
+    #[must_use]
+    pub fn doc_collection_info(&self, collection: &str) -> Option<DocCollectionInfo> {
+        self.doc_engine.read().collection_info(collection)
+    }
+
+    /// Get dictionary statistics for one collection.
+    pub fn doc_dictionary_info(&self, collection: &str) -> Result<DocDictionaryInfo, DocError> {
+        self.doc_engine.read().dictionary_info(collection)
+    }
+
+    /// Get packed storage statistics for one collection.
+    pub fn doc_storage_info(&self, collection: &str) -> Result<DocStorageInfo, DocError> {
+        self.doc_engine.read().storage_info(collection)
+    }
+
+    /// Insert or replace one JSON document.
+    pub fn doc_set(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        json: &Value,
+    ) -> Result<DocSetResult, DocError> {
+        self.doc_engine.write().set(collection, doc_id, json)
+    }
+
+    /// Insert or replace multiple JSON documents in one collection.
+    pub fn doc_mset(
+        &self,
+        collection: &str,
+        entries: &[(&str, &Value)],
+    ) -> Result<Vec<DocSetResult>, DocError> {
+        let mut engine = self.doc_engine.write();
+        entries
+            .iter()
+            .map(|(doc_id, json)| engine.set(collection, doc_id, json))
+            .collect()
+    }
+
+    /// Read one JSON document. Optional field projection accepts dotted paths.
+    pub fn doc_get(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        projection: Option<&[&str]>,
+    ) -> Result<Option<Value>, DocError> {
+        self.doc_engine.read().get(collection, doc_id, projection)
+    }
+
+    /// Read multiple JSON documents from one collection.
+    pub fn doc_mget(
+        &self,
+        collection: &str,
+        doc_ids: &[&str],
+    ) -> Result<Vec<Option<Value>>, DocError> {
+        let engine = self.doc_engine.read();
+        doc_ids
+            .iter()
+            .map(|doc_id| engine.get(collection, doc_id, None))
+            .collect()
+    }
+
+    /// Apply one or more field-level mutations to an existing document.
+    ///
+    /// Returns `Ok(true)` when the document existed and was rewritten, `Ok(false)` when the
+    /// target document is missing.
+    pub fn doc_update(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        mutations: &[DocUpdateMutation],
+    ) -> Result<bool, DocError> {
+        self.doc_engine
+            .write()
+            .update(collection, doc_id, mutations)
+    }
+
+    /// Delete one document.
+    pub fn doc_del(&self, collection: &str, doc_id: &str) -> Result<bool, DocError> {
+        self.doc_engine.write().del(collection, doc_id)
+    }
+
+    /// Check if one document exists.
+    pub fn doc_exists(&self, collection: &str, doc_id: &str) -> Result<bool, DocError> {
+        self.doc_engine.read().exists(collection, doc_id)
     }
 
     // ─── String operations ───────────────────────────────────────
@@ -637,6 +769,8 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -759,5 +893,165 @@ mod tests {
         let db = Database::open(Config { shard_count: 2 });
         let results = db.vector_search("nonexistent", &[1.0, 2.0], 5).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_document_crud() {
+        let db = Database::open(Config { shard_count: 2 });
+        db.doc_create_collection("users", DocCollectionConfig::default())
+            .expect("collection should be created");
+
+        let set = db
+            .doc_set(
+                "users",
+                "doc:1",
+                &json!({
+                    "name": "Augustus",
+                    "age": 30,
+                    "address": {"city": "Accra"}
+                }),
+            )
+            .expect("set should succeed");
+        assert!(set.created);
+        assert!(db
+            .doc_exists("users", "doc:1")
+            .expect("exists should succeed"));
+
+        let full = db
+            .doc_get("users", "doc:1", None)
+            .expect("get should succeed")
+            .expect("document should exist");
+        assert_eq!(
+            full,
+            json!({
+                "name": "Augustus",
+                "age": 30,
+                "address": {"city": "Accra"}
+            })
+        );
+
+        let projection = db
+            .doc_get("users", "doc:1", Some(&["name", "address.city"]))
+            .expect("projected get should succeed")
+            .expect("document should exist");
+        assert_eq!(
+            projection,
+            json!({"name": "Augustus", "address": {"city": "Accra"}})
+        );
+
+        assert!(db.doc_del("users", "doc:1").expect("delete should succeed"));
+        assert!(!db
+            .doc_exists("users", "doc:1")
+            .expect("exists should succeed"));
+    }
+
+    #[test]
+    fn test_document_collection_drop() {
+        let db = Database::open(Config { shard_count: 2 });
+        db.doc_create_collection("users", DocCollectionConfig::default())
+            .expect("collection should be created");
+        db.doc_set("users", "doc:1", &json!({"name": "Augustus"}))
+            .expect("set should succeed");
+
+        let info = db
+            .doc_collection_info("users")
+            .expect("collection info should exist");
+        assert_eq!(info.doc_count, 1);
+
+        assert!(db.doc_drop_collection("users"));
+        assert!(!db.doc_drop_collection("users"));
+        assert!(db.doc_collection_info("users").is_none());
+    }
+
+    #[test]
+    fn test_document_batch_ops() {
+        let db = Database::open(Config { shard_count: 2 });
+        db.doc_create_collection("users", DocCollectionConfig::default())
+            .expect("collection should be created");
+
+        let first = json!({"name": "Augustus", "age": 30});
+        let second = json!({"name": "Ada", "age": 28});
+        let results = db
+            .doc_mset("users", &[("doc:1", &first), ("doc:2", &second)])
+            .expect("mset should succeed");
+        assert_eq!(results.len(), 2);
+        assert!(results[0].created);
+        assert!(results[1].created);
+
+        let docs = db
+            .doc_mget("users", &["doc:1", "doc:2", "doc:missing"])
+            .expect("mget should succeed");
+        assert_eq!(docs, vec![Some(first), Some(second), None]);
+
+        let dictinfo = db
+            .doc_dictionary_info("users")
+            .expect("dictionary info should succeed");
+        assert_eq!(dictinfo.collection_name, "users");
+        assert!(dictinfo.dictionary_entries >= 1);
+
+        let storage = db
+            .doc_storage_info("users")
+            .expect("storage info should succeed");
+        assert_eq!(storage.collection_name, "users");
+        assert_eq!(storage.doc_count, 2);
+        assert!(storage.total_packed_bytes > 0);
+    }
+
+    #[test]
+    fn test_document_update_ops() {
+        let db = Database::open(Config { shard_count: 2 });
+        db.doc_create_collection("users", DocCollectionConfig::default())
+            .expect("collection should be created");
+        db.doc_set(
+            "users",
+            "doc:1",
+            &json!({
+                "name": "Augustus",
+                "score": 10,
+                "address": {"city": "Accra"},
+                "tags": ["rust", "systems", "rust"]
+            }),
+        )
+        .expect("set should succeed");
+
+        let updated = db
+            .doc_update(
+                "users",
+                "doc:1",
+                &[
+                    DocUpdateMutation::Set {
+                        path: "address.city".to_string(),
+                        value: json!("London"),
+                    },
+                    DocUpdateMutation::Incr {
+                        path: "score".to_string(),
+                        delta: 0.5,
+                    },
+                    DocUpdateMutation::Push {
+                        path: "tags".to_string(),
+                        value: json!("cache"),
+                    },
+                    DocUpdateMutation::Pull {
+                        path: "tags".to_string(),
+                        value: json!("rust"),
+                    },
+                ],
+            )
+            .expect("update should succeed");
+        assert!(updated);
+
+        let doc = db
+            .doc_get("users", "doc:1", None)
+            .expect("get should succeed")
+            .expect("doc should exist");
+        assert_eq!(
+            doc,
+            json!({
+                "name": "Augustus",
+                "score": 10.5,
+                "address": {"city": "London"},
+                "tags": ["systems", "cache"]
+            })
+        );
     }
 }

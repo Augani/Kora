@@ -18,6 +18,7 @@ use kora_core::hash::shard_for_key;
 use kora_core::shard::{command_to_wal_record, ShardStore, WalWriter};
 use kora_core::tenant::{TenantConfig, TenantId, TenantRegistry};
 use kora_core::types::Value;
+use kora_doc::DocEngine;
 use kora_observability::histogram::CommandHistograms;
 use kora_protocol::{MemcacheResponse, MemcacheStoreMode};
 use kora_pubsub::PubSubBroker;
@@ -228,6 +229,7 @@ pub(crate) struct AffinitySharedState {
     pub pub_sub: PubSubBroker,
     pub cdc_rings: Vec<Mutex<CdcRing>>,
     pub cdc_groups: Mutex<ConsumerGroupManager>,
+    pub doc_engine: Mutex<DocEngine>,
     pub scripts: Mutex<Option<FunctionRegistry>>,
     pub histograms: Arc<CommandHistograms>,
     pub track_latency: AtomicBool,
@@ -324,6 +326,7 @@ impl ShardIoEngine {
             pub_sub,
             cdc_rings,
             cdc_groups: Mutex::new(ConsumerGroupManager::default()),
+            doc_engine: Mutex::new(DocEngine::new()),
             scripts,
             histograms,
             track_latency: AtomicBool::new(metrics_port > 0),

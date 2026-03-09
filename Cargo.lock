@@ -995,11 +995,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kora-doc"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "kora-embedded"
 version = "0.1.0"
 dependencies = [
  "kora-core",
+ "kora-doc",
  "kora-server",
+ "parking_lot",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -1060,6 +1071,7 @@ dependencies = [
  "hyper-util",
  "kora-cdc",
  "kora-core",
+ "kora-doc",
  "kora-observability",
  "kora-protocol",
  "kora-pubsub",
@@ -1067,6 +1079,7 @@ dependencies = [
  "kora-storage",
  "parking_lot",
  "rand",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

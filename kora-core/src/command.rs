@@ -717,6 +717,90 @@ pub enum Command {
         names: Vec<Vec<u8>>,
     },
 
+    // -- Document commands --
+    /// DOC.CREATE collection \[COMPRESSION profile\] — create a collection.
+    DocCreate {
+        /// Collection name.
+        collection: Vec<u8>,
+        /// Optional compression profile name.
+        compression: Option<Vec<u8>>,
+    },
+    /// DOC.DROP collection — drop a collection.
+    DocDrop {
+        /// Collection name.
+        collection: Vec<u8>,
+    },
+    /// DOC.INFO collection — collection metadata.
+    DocInfo {
+        /// Collection name.
+        collection: Vec<u8>,
+    },
+    /// DOC.DICTINFO collection — dictionary statistics for a collection.
+    DocDictInfo {
+        /// Collection name.
+        collection: Vec<u8>,
+    },
+    /// DOC.STORAGE collection — storage statistics for a collection.
+    DocStorage {
+        /// Collection name.
+        collection: Vec<u8>,
+    },
+    /// DOC.SET collection doc_id json — insert or replace a document.
+    DocSet {
+        /// Collection name.
+        collection: Vec<u8>,
+        /// External document ID.
+        doc_id: Vec<u8>,
+        /// JSON payload bytes.
+        json: Vec<u8>,
+    },
+    /// DOC.MSET collection doc_id json \[doc_id json ...\] — batch insert/replace.
+    DocMSet {
+        /// Collection name.
+        collection: Vec<u8>,
+        /// Batch entries as `(doc_id, json_payload)`.
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    /// DOC.GET collection doc_id \[FIELDS path ...\] — fetch a document.
+    DocGet {
+        /// Collection name.
+        collection: Vec<u8>,
+        /// External document ID.
+        doc_id: Vec<u8>,
+        /// Optional projection paths. Empty means full document.
+        fields: Vec<Vec<u8>>,
+    },
+    /// DOC.MGET collection doc_id \[doc_id ...\] — batch fetch.
+    DocMGet {
+        /// Collection name.
+        collection: Vec<u8>,
+        /// External document IDs.
+        doc_ids: Vec<Vec<u8>>,
+    },
+    /// DOC.UPDATE collection doc_id <mutation...> — apply field-level mutations.
+    DocUpdate {
+        /// Collection name.
+        collection: Vec<u8>,
+        /// External document ID.
+        doc_id: Vec<u8>,
+        /// Mutation operations to apply in order.
+        mutations: Vec<DocUpdateMutation>,
+    },
+    /// DOC.DEL collection doc_id — delete a document.
+    DocDel {
+        /// Collection name.
+        collection: Vec<u8>,
+        /// External document ID.
+        doc_id: Vec<u8>,
+    },
+    /// DOC.EXISTS collection doc_id — check document existence.
+    DocExists {
+        /// Collection name.
+        collection: Vec<u8>,
+        /// External document ID.
+        doc_id: Vec<u8>,
+    },
+
     // -- CDC commands --
     /// CDCPOLL cursor count — poll CDC events from a shard.
     CdcPoll {
@@ -1409,6 +1493,44 @@ pub enum Command {
     },
 }
 
+/// One `DOC.UPDATE` mutation operation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DocUpdateMutation {
+    /// `SET path value` — set path to JSON value.
+    Set {
+        /// Dotted path bytes.
+        path: Vec<u8>,
+        /// JSON value bytes.
+        value: Vec<u8>,
+    },
+    /// `DEL path` — remove path.
+    Del {
+        /// Dotted path bytes.
+        path: Vec<u8>,
+    },
+    /// `INCR path delta` — increment numeric value at path.
+    Incr {
+        /// Dotted path bytes.
+        path: Vec<u8>,
+        /// Increment amount.
+        delta: f64,
+    },
+    /// `PUSH path value` — append JSON value to array at path.
+    Push {
+        /// Dotted path bytes.
+        path: Vec<u8>,
+        /// JSON value bytes.
+        value: Vec<u8>,
+    },
+    /// `PULL path value` — remove matching JSON value(s) from array at path.
+    Pull {
+        /// Dotted path bytes.
+        path: Vec<u8>,
+        /// JSON value bytes.
+        value: Vec<u8>,
+    },
+}
+
 /// Bitwise operation for BITOP command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BitOperation {
@@ -1715,6 +1837,18 @@ impl Command {
                 | Command::CommandList
                 | Command::CommandHelp
                 | Command::CommandDocs { .. }
+                | Command::DocCreate { .. }
+                | Command::DocDrop { .. }
+                | Command::DocInfo { .. }
+                | Command::DocDictInfo { .. }
+                | Command::DocStorage { .. }
+                | Command::DocSet { .. }
+                | Command::DocMSet { .. }
+                | Command::DocGet { .. }
+                | Command::DocMGet { .. }
+                | Command::DocUpdate { .. }
+                | Command::DocDel { .. }
+                | Command::DocExists { .. }
         )
     }
 
@@ -1796,6 +1930,12 @@ impl Command {
                 | Command::XClaim { .. }
                 | Command::XAutoClaim { .. }
                 | Command::XDel { .. }
+                | Command::DocCreate { .. }
+                | Command::DocDrop { .. }
+                | Command::DocSet { .. }
+                | Command::DocMSet { .. }
+                | Command::DocUpdate { .. }
+                | Command::DocDel { .. }
         )
     }
 
@@ -1931,6 +2071,18 @@ impl Command {
             | Command::XInfoStream { .. }
             | Command::XInfoGroups { .. }
             | Command::XDel { .. } => 49,
+            Command::DocCreate { .. }
+            | Command::DocDrop { .. }
+            | Command::DocInfo { .. }
+            | Command::DocDictInfo { .. }
+            | Command::DocStorage { .. }
+            | Command::DocSet { .. }
+            | Command::DocMSet { .. }
+            | Command::DocGet { .. }
+            | Command::DocMGet { .. }
+            | Command::DocUpdate { .. }
+            | Command::DocDel { .. }
+            | Command::DocExists { .. } => 50,
             _ => 32,
         }
     }
@@ -1975,6 +2127,18 @@ pub const SUPPORTED_COMMAND_NAMES: &[&str] = &[
     "decrby",
     "del",
     "discard",
+    "doc.create",
+    "doc.del",
+    "doc.dictinfo",
+    "doc.drop",
+    "doc.exists",
+    "doc.get",
+    "doc.info",
+    "doc.mget",
+    "doc.mset",
+    "doc.set",
+    "doc.storage",
+    "doc.update",
     "dump",
     "echo",
     "exec",

@@ -8,10 +8,13 @@ description = "Embeddable library mode for Kōra — use as a direct API without
 
 [dependencies]
 kora-core.workspace = true
+kora-doc.workspace = true
+parking_lot.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, optional = true }
 kora-server = { workspace = true, optional = true }
+serde_json = "1"
 
 [features]
 default = []

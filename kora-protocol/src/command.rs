@@ -2,7 +2,7 @@
 
 use kora_core::command::{
     BitFieldEncoding, BitFieldOffset, BitFieldOperation, BitFieldOverflow, BitOperation, Command,
-    GeoUnit,
+    DocUpdateMutation, GeoUnit,
 };
 
 use crate::error::ProtocolError;
@@ -128,6 +128,59 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
     let args = &parts[1..];
 
     match cmd_name.as_slice() {
+        // Document commands
+        b"DOC.CREATE" => parse_doc_create(args),
+        b"DOC.DROP" => {
+            check_arity("DOC.DROP", args, 1)?;
+            Ok(Command::DocDrop {
+                collection: extract_bytes(&args[0])?,
+            })
+        }
+        b"DOC.INFO" => {
+            check_arity("DOC.INFO", args, 1)?;
+            Ok(Command::DocInfo {
+                collection: extract_bytes(&args[0])?,
+            })
+        }
+        b"DOC.DICTINFO" => {
+            check_arity("DOC.DICTINFO", args, 1)?;
+            Ok(Command::DocDictInfo {
+                collection: extract_bytes(&args[0])?,
+            })
+        }
+        b"DOC.STORAGE" => {
+            check_arity("DOC.STORAGE", args, 1)?;
+            Ok(Command::DocStorage {
+                collection: extract_bytes(&args[0])?,
+            })
+        }
+        b"DOC.SET" => {
+            check_arity("DOC.SET", args, 3)?;
+            Ok(Command::DocSet {
+                collection: extract_bytes(&args[0])?,
+                doc_id: extract_bytes(&args[1])?,
+                json: extract_bytes(&args[2])?,
+            })
+        }
+        b"DOC.MSET" => parse_doc_mset(args),
+        b"DOC.GET" => parse_doc_get(args),
+        b"DOC.MGET" => parse_doc_mget(args),
+        b"DOC.UPDATE" => parse_doc_update(args),
+        b"DOC.DEL" => {
+            check_arity("DOC.DEL", args, 2)?;
+            Ok(Command::DocDel {
+                collection: extract_bytes(&args[0])?,
+                doc_id: extract_bytes(&args[1])?,
+            })
+        }
+        b"DOC.EXISTS" => {
+            check_arity("DOC.EXISTS", args, 2)?;
+            Ok(Command::DocExists {
+                collection: extract_bytes(&args[0])?,
+                doc_id: extract_bytes(&args[1])?,
+            })
+        }
+
         // String commands
         b"GET" => {
             check_arity("GET", args, 1)?;
@@ -1903,6 +1956,177 @@ fn parse_getex(args: &[RespValue]) -> Result<Command, ProtocolError> {
     })
 }
 
+fn parse_doc_create(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    if args.len() == 1 {
+        return Ok(Command::DocCreate {
+            collection: extract_bytes(&args[0])?,
+            compression: None,
+        });
+    }
+
+    if args.len() != 3 {
+        return Err(ProtocolError::WrongArity("DOC.CREATE".into()));
+    }
+
+    if !extract_string(&args[1])?.eq_ignore_ascii_case(b"COMPRESSION") {
+        return Err(ProtocolError::InvalidData(
+            "DOC.CREATE only supports optional COMPRESSION clause".into(),
+        ));
+    }
+
+    Ok(Command::DocCreate {
+        collection: extract_bytes(&args[0])?,
+        compression: Some(extract_bytes(&args[2])?),
+    })
+}
+
+fn parse_doc_get(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    if args.len() == 2 {
+        return Ok(Command::DocGet {
+            collection: extract_bytes(&args[0])?,
+            doc_id: extract_bytes(&args[1])?,
+            fields: Vec::new(),
+        });
+    }
+
+    if args.len() < 4 {
+        return Err(ProtocolError::WrongArity("DOC.GET".into()));
+    }
+
+    if !extract_string(&args[2])?.eq_ignore_ascii_case(b"FIELDS") {
+        return Err(ProtocolError::InvalidData(
+            "DOC.GET optional arguments must start with FIELDS".into(),
+        ));
+    }
+
+    let fields = args[3..]
+        .iter()
+        .map(extract_bytes)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if fields.is_empty() {
+        return Err(ProtocolError::WrongArity("DOC.GET".into()));
+    }
+
+    Ok(Command::DocGet {
+        collection: extract_bytes(&args[0])?,
+        doc_id: extract_bytes(&args[1])?,
+        fields,
+    })
+}
+
+fn parse_doc_mset(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    if args.len() < 3 || args.len() % 2 == 0 {
+        return Err(ProtocolError::WrongArity("DOC.MSET".into()));
+    }
+
+    let collection = extract_bytes(&args[0])?;
+    let entries = args[1..]
+        .chunks(2)
+        .map(|chunk| Ok((extract_bytes(&chunk[0])?, extract_bytes(&chunk[1])?)))
+        .collect::<Result<Vec<_>, ProtocolError>>()?;
+
+    Ok(Command::DocMSet {
+        collection,
+        entries,
+    })
+}
+
+fn parse_doc_mget(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    if args.len() < 2 {
+        return Err(ProtocolError::WrongArity("DOC.MGET".into()));
+    }
+
+    let collection = extract_bytes(&args[0])?;
+    let doc_ids = args[1..]
+        .iter()
+        .map(extract_bytes)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Command::DocMGet {
+        collection,
+        doc_ids,
+    })
+}
+
+fn parse_doc_update(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    if args.len() < 4 {
+        return Err(ProtocolError::WrongArity("DOC.UPDATE".into()));
+    }
+
+    let collection = extract_bytes(&args[0])?;
+    let doc_id = extract_bytes(&args[1])?;
+    let mut mutations = Vec::new();
+    let mut i = 2usize;
+
+    while i < args.len() {
+        let op = extract_string(&args[i])?.to_ascii_uppercase();
+        i += 1;
+        match op.as_slice() {
+            b"SET" => {
+                if i + 1 >= args.len() {
+                    return Err(ProtocolError::WrongArity("DOC.UPDATE".into()));
+                }
+                mutations.push(DocUpdateMutation::Set {
+                    path: extract_bytes(&args[i])?,
+                    value: extract_bytes(&args[i + 1])?,
+                });
+                i += 2;
+            }
+            b"DEL" => {
+                if i >= args.len() {
+                    return Err(ProtocolError::WrongArity("DOC.UPDATE".into()));
+                }
+                mutations.push(DocUpdateMutation::Del {
+                    path: extract_bytes(&args[i])?,
+                });
+                i += 1;
+            }
+            b"INCR" => {
+                if i + 1 >= args.len() {
+                    return Err(ProtocolError::WrongArity("DOC.UPDATE".into()));
+                }
+                mutations.push(DocUpdateMutation::Incr {
+                    path: extract_bytes(&args[i])?,
+                    delta: parse_f64(&args[i + 1])?,
+                });
+                i += 2;
+            }
+            b"PUSH" => {
+                if i + 1 >= args.len() {
+                    return Err(ProtocolError::WrongArity("DOC.UPDATE".into()));
+                }
+                mutations.push(DocUpdateMutation::Push {
+                    path: extract_bytes(&args[i])?,
+                    value: extract_bytes(&args[i + 1])?,
+                });
+                i += 2;
+            }
+            b"PULL" => {
+                if i + 1 >= args.len() {
+                    return Err(ProtocolError::WrongArity("DOC.UPDATE".into()));
+                }
+                mutations.push(DocUpdateMutation::Pull {
+                    path: extract_bytes(&args[i])?,
+                    value: extract_bytes(&args[i + 1])?,
+                });
+                i += 2;
+            }
+            _ => {
+                return Err(ProtocolError::InvalidData(
+                    "DOC.UPDATE expects SET|DEL|INCR|PUSH|PULL clauses".into(),
+                ));
+            }
+        }
+    }
+
+    Ok(Command::DocUpdate {
+        collection,
+        doc_id,
+        mutations,
+    })
+}
+
 fn parse_set(args: &[RespValue]) -> Result<Command, ProtocolError> {
     if args.len() < 2 {
         return Err(ProtocolError::WrongArity("SET".into()));
@@ -3199,6 +3423,212 @@ mod tests {
     fn test_parse_vecdel() {
         let cmd = parse_command(make_cmd(&[b"VECDEL", b"mykey"])).unwrap();
         assert!(matches!(cmd, Command::VecDel { key } if key == b"mykey"));
+    }
+
+    #[test]
+    fn test_parse_doc_create() {
+        let cmd = parse_command(make_cmd(&[b"DOC.CREATE", b"users"])).unwrap();
+        assert!(matches!(
+            cmd,
+            Command::DocCreate {
+                collection,
+                compression: None
+            } if collection == b"users"
+        ));
+
+        let dictinfo = parse_command(make_cmd(&[b"DOC.DICTINFO", b"users"])).unwrap();
+        assert!(matches!(
+            dictinfo,
+            Command::DocDictInfo { collection } if collection == b"users"
+        ));
+
+        let storage = parse_command(make_cmd(&[b"DOC.STORAGE", b"users"])).unwrap();
+        assert!(matches!(
+            storage,
+            Command::DocStorage { collection } if collection == b"users"
+        ));
+
+        let cmd = parse_command(make_cmd(&[
+            b"DOC.CREATE",
+            b"users",
+            b"COMPRESSION",
+            b"dictionary",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            cmd,
+            Command::DocCreate {
+                collection,
+                compression: Some(profile)
+            } if collection == b"users" && profile == b"dictionary"
+        ));
+    }
+
+    #[test]
+    fn test_parse_doc_set_get_del_exists() {
+        let set = parse_command(make_cmd(&[
+            b"DOC.SET",
+            b"users",
+            b"doc:1",
+            br#"{"name":"A"}"#,
+        ]))
+        .unwrap();
+        assert!(matches!(
+            set,
+            Command::DocSet {
+                collection,
+                doc_id,
+                json
+            } if collection == b"users" && doc_id == b"doc:1" && json == br#"{"name":"A"}"#
+        ));
+
+        let mset = parse_command(make_cmd(&[
+            b"DOC.MSET",
+            b"users",
+            b"doc:1",
+            br#"{"name":"A"}"#,
+            b"doc:2",
+            br#"{"name":"B"}"#,
+        ]))
+        .unwrap();
+        assert!(matches!(
+            mset,
+            Command::DocMSet { collection, entries }
+                if collection == b"users"
+                    && entries == vec![
+                        (b"doc:1".to_vec(), br#"{"name":"A"}"#.to_vec()),
+                        (b"doc:2".to_vec(), br#"{"name":"B"}"#.to_vec())
+                    ]
+        ));
+
+        let get = parse_command(make_cmd(&[b"DOC.GET", b"users", b"doc:1"])).unwrap();
+        assert!(matches!(
+            get,
+            Command::DocGet {
+                collection,
+                doc_id,
+                fields
+            } if collection == b"users" && doc_id == b"doc:1" && fields.is_empty()
+        ));
+
+        let get_fields = parse_command(make_cmd(&[
+            b"DOC.GET",
+            b"users",
+            b"doc:1",
+            b"FIELDS",
+            b"name",
+            b"address.city",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            get_fields,
+            Command::DocGet {
+                collection,
+                doc_id,
+                fields
+            } if collection == b"users"
+                && doc_id == b"doc:1"
+                && fields == vec![b"name".to_vec(), b"address.city".to_vec()]
+        ));
+
+        let mget = parse_command(make_cmd(&[b"DOC.MGET", b"users", b"doc:1", b"doc:2"])).unwrap();
+        assert!(matches!(
+            mget,
+            Command::DocMGet {
+                collection,
+                doc_ids
+            } if collection == b"users" && doc_ids == vec![b"doc:1".to_vec(), b"doc:2".to_vec()]
+        ));
+
+        let update = parse_command(make_cmd(&[
+            b"DOC.UPDATE",
+            b"users",
+            b"doc:1",
+            b"SET",
+            b"address.city",
+            br#""London""#,
+            b"INCR",
+            b"score",
+            b"1.5",
+            b"PUSH",
+            b"tags",
+            br#""cache""#,
+            b"PULL",
+            b"tags",
+            br#""rust""#,
+            b"DEL",
+            b"active",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            update,
+            Command::DocUpdate {
+                collection,
+                doc_id,
+                mutations
+            } if collection == b"users"
+                && doc_id == b"doc:1"
+                && mutations == vec![
+                    DocUpdateMutation::Set {
+                        path: b"address.city".to_vec(),
+                        value: br#""London""#.to_vec()
+                    },
+                    DocUpdateMutation::Incr {
+                        path: b"score".to_vec(),
+                        delta: 1.5
+                    },
+                    DocUpdateMutation::Push {
+                        path: b"tags".to_vec(),
+                        value: br#""cache""#.to_vec()
+                    },
+                    DocUpdateMutation::Pull {
+                        path: b"tags".to_vec(),
+                        value: br#""rust""#.to_vec()
+                    },
+                    DocUpdateMutation::Del {
+                        path: b"active".to_vec()
+                    }
+                ]
+        ));
+
+        let del = parse_command(make_cmd(&[b"DOC.DEL", b"users", b"doc:1"])).unwrap();
+        assert!(matches!(
+            del,
+            Command::DocDel { collection, doc_id } if collection == b"users" && doc_id == b"doc:1"
+        ));
+
+        let exists = parse_command(make_cmd(&[b"DOC.EXISTS", b"users", b"doc:1"])).unwrap();
+        assert!(matches!(
+            exists,
+            Command::DocExists { collection, doc_id } if collection == b"users" && doc_id == b"doc:1"
+        ));
+    }
+
+    #[test]
+    fn test_parse_doc_get_invalid_optional_clause() {
+        let err =
+            parse_command(make_cmd(&[b"DOC.GET", b"users", b"doc:1", b"LIMIT", b"1"])).unwrap_err();
+        assert!(matches!(err, ProtocolError::InvalidData(_)));
+    }
+
+    #[test]
+    fn test_parse_doc_mset_wrong_arity() {
+        let err = parse_command(make_cmd(&[b"DOC.MSET", b"users", b"doc:1"])).unwrap_err();
+        assert!(matches!(err, ProtocolError::WrongArity(_)));
+    }
+
+    #[test]
+    fn test_parse_doc_update_invalid_clause() {
+        let err = parse_command(make_cmd(&[
+            b"DOC.UPDATE",
+            b"users",
+            b"doc:1",
+            b"RENAME",
+            b"name",
+            b"full_name",
+        ]))
+        .unwrap_err();
+        assert!(matches!(err, ProtocolError::InvalidData(_)));
     }
 
     #[test]

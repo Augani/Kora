@@ -11,6 +11,7 @@ ahash.workspace = true
 bytes.workspace = true
 crossbeam-channel.workspace = true
 kora-core.workspace = true
+kora-doc.workspace = true
 kora-protocol.workspace = true
 kora-pubsub.workspace = true
 kora-storage.workspace = true
@@ -25,6 +26,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
 hdrhistogram.workspace = true
+serde_json = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

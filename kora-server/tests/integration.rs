@@ -3,10 +3,12 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use kora_core::hash::shard_for_key;
+use kora_protocol::{RespParser, RespValue};
 use kora_server::{KoraServer, ServerConfig};
 use kora_storage::manager::StorageConfig;
 use kora_storage::wal::SyncPolicy;
@@ -148,6 +150,32 @@ fn extract_info_metric(resp: &[u8], key: &str) -> Option<u64> {
     value.parse().ok()
 }
 
+fn decode_bulk_string(resp: &[u8]) -> Option<String> {
+    if !resp.starts_with(b"$") {
+        return None;
+    }
+    let first_crlf = resp.windows(2).position(|w| w == b"\r\n")?;
+    let len = std::str::from_utf8(&resp[1..first_crlf])
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
+    let payload_start = first_crlf + 2;
+    let payload_end = payload_start + len;
+    if resp.len() < payload_end + 2 || &resp[payload_end..payload_end + 2] != b"\r\n" {
+        return None;
+    }
+    String::from_utf8(resp[payload_start..payload_end].to_vec()).ok()
+}
+
+fn parse_resp_frame(resp: &[u8]) -> RespValue {
+    let mut parser = RespParser::new();
+    parser.feed(resp);
+    parser
+        .try_parse()
+        .expect("response should parse")
+        .expect("response should contain one frame")
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -252,6 +280,279 @@ async fn test_incr() {
     cmd(&mut stream, &["SET", "num", "10"]).await;
     let resp = cmd(&mut stream, &["INCR", "num"]).await;
     assert_resp(&resp, b":11\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_doc_commands_basic() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(
+        &mut stream,
+        &["DOC.CREATE", "users", "COMPRESSION", "dictionary"],
+    )
+    .await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "DOC.SET",
+            "users",
+            "doc:1",
+            r#"{"name":"Augustus","age":30,"address":{"city":"Accra"}}"#,
+        ],
+    )
+    .await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["DOC.EXISTS", "users", "doc:1"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &["DOC.GET", "users", "doc:1", "FIELDS", "name"],
+    )
+    .await;
+    let payload = decode_bulk_string(&resp).expect("DOC.GET should return bulk JSON");
+    assert_eq!(payload, r#"{"name":"Augustus"}"#);
+
+    let resp = cmd(&mut stream, &["DOC.DEL", "users", "doc:1"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["DOC.EXISTS", "users", "doc:1"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let resp = cmd(&mut stream, &["DOC.DROP", "users"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_doc_batch_commands() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["DOC.CREATE", "users"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "DOC.MSET",
+            "users",
+            "doc:1",
+            r#"{"name":"A"}"#,
+            "doc:2",
+            r#"{"name":"B"}"#,
+        ],
+    )
+    .await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &["DOC.MGET", "users", "doc:1", "doc:2", "doc:3"],
+    )
+    .await;
+    assert_resp(
+        &resp,
+        b"*3\r\n$12\r\n{\"name\":\"A\"}\r\n$12\r\n{\"name\":\"B\"}\r\n$-1\r\n",
+    );
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_doc_update_commands() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["DOC.CREATE", "users"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "DOC.SET",
+            "users",
+            "doc:1",
+            r#"{"name":"Augustus","score":10,"active":true,"address":{"city":"Accra"},"tags":["rust","systems","rust"]}"#,
+        ],
+    )
+    .await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "DOC.UPDATE",
+            "users",
+            "doc:1",
+            "SET",
+            "address.city",
+            r#""London""#,
+            "INCR",
+            "score",
+            "2.5",
+            "PUSH",
+            "tags",
+            r#""cache""#,
+            "PULL",
+            "tags",
+            r#""rust""#,
+            "DEL",
+            "active",
+        ],
+    )
+    .await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["DOC.GET", "users", "doc:1"]).await;
+    let payload = decode_bulk_string(&resp).expect("DOC.GET should return bulk JSON");
+    let parsed: Value = serde_json::from_str(&payload).expect("payload should be valid JSON");
+    assert_eq!(
+        parsed,
+        json!({
+            "name": "Augustus",
+            "score": 12.5,
+            "address": {"city": "London"},
+            "tags": ["systems", "cache"]
+        })
+    );
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_doc_dictinfo_command() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["DOC.CREATE", "users"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "DOC.SET",
+            "users",
+            "doc:1",
+            r#"{"city":"Accra","status":"active"}"#,
+        ],
+    )
+    .await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "DOC.SET",
+            "users",
+            "doc:2",
+            r#"{"city":"Accra","status":"inactive"}"#,
+        ],
+    )
+    .await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["HELLO", "3"]).await;
+    assert_resp_prefix(&resp, b"%");
+
+    let resp = cmd(&mut stream, &["DOC.DICTINFO", "users"]).await;
+    let frame = parse_resp_frame(&resp);
+    let RespValue::Map(entries) = frame else {
+        panic!("expected RESP3 map for DOC.DICTINFO");
+    };
+
+    let mut dictionary_entries = None;
+    let mut fields = None;
+    for (key, value) in entries {
+        if let RespValue::SimpleString(key) | RespValue::BulkString(Some(key)) = key {
+            if key == b"dictionary_entries" {
+                if let RespValue::Integer(count) = value {
+                    dictionary_entries = Some(count);
+                }
+            }
+            if key == b"fields" {
+                fields = Some(value);
+            }
+        }
+    }
+
+    assert!(dictionary_entries.expect("dictionary_entries should exist") >= 2);
+    let fields = fields.expect("fields entry should exist");
+    let RespValue::Array(Some(items)) = fields else {
+        panic!("fields should be an array");
+    };
+    assert!(!items.is_empty(), "fields array should not be empty");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_doc_storage_command() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["DOC.CREATE", "users"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "DOC.SET",
+            "users",
+            "doc:1",
+            r#"{"name":"Augustus","age":30}"#,
+        ],
+    )
+    .await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &["DOC.SET", "users", "doc:2", r#"{"name":"Ada","age":28}"#],
+    )
+    .await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["HELLO", "3"]).await;
+    assert_resp_prefix(&resp, b"%");
+
+    let resp = cmd(&mut stream, &["DOC.STORAGE", "users"]).await;
+    let frame = parse_resp_frame(&resp);
+    let RespValue::Map(entries) = frame else {
+        panic!("expected RESP3 map for DOC.STORAGE");
+    };
+
+    let mut doc_count = None;
+    let mut total_packed_bytes = None;
+    for (key, value) in entries {
+        if let RespValue::SimpleString(key) | RespValue::BulkString(Some(key)) = key {
+            if key == b"doc_count" {
+                if let RespValue::Integer(count) = value {
+                    doc_count = Some(count);
+                }
+            }
+            if key == b"total_packed_bytes" {
+                if let RespValue::Integer(bytes) = value {
+                    total_packed_bytes = Some(bytes);
+                }
+            }
+        }
+    }
+
+    assert_eq!(doc_count, Some(2));
+    assert!(total_packed_bytes.expect("total_packed_bytes should exist") > 0);
 
     let _ = shutdown.send(true);
 }

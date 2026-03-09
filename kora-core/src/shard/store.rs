@@ -973,6 +973,18 @@ impl ShardStore {
             | Command::ScriptCall { .. }
             | Command::ScriptDel { .. }
             | Command::StatsLatency { .. }
+            | Command::DocCreate { .. }
+            | Command::DocDrop { .. }
+            | Command::DocInfo { .. }
+            | Command::DocDictInfo { .. }
+            | Command::DocStorage { .. }
+            | Command::DocSet { .. }
+            | Command::DocMSet { .. }
+            | Command::DocGet { .. }
+            | Command::DocMGet { .. }
+            | Command::DocUpdate { .. }
+            | Command::DocDel { .. }
+            | Command::DocExists { .. }
             | Command::Subscribe { .. }
             | Command::Unsubscribe { .. }
             | Command::PSubscribe { .. }

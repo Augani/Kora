@@ -11,6 +11,7 @@ members = [
     "kora-scripting",
     "kora-observability",
     "kora-pubsub",
+    "kora-doc",
     "kora-cli",
 ]
 
@@ -86,6 +87,7 @@ kora-cdc = { path = "kora-cdc" }
 kora-scripting = { path = "kora-scripting" }
 kora-observability = { path = "kora-observability" }
 kora-pubsub = { path = "kora-pubsub" }
+kora-doc = { path = "kora-doc" }
 kora-cli = { path = "kora-cli" }
 
 [profile.release]
