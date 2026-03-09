@@ -1,6 +1,9 @@
 //! Translate parsed RESP arrays into typed kora_core::Command values.
 
-use kora_core::command::Command;
+use kora_core::command::{
+    BitFieldEncoding, BitFieldOffset, BitFieldOperation, BitFieldOverflow, BitOperation, Command,
+    GeoUnit,
+};
 
 use crate::error::ProtocolError;
 use crate::resp::RespValue;
@@ -201,6 +204,68 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
                 .collect::<Result<_, ProtocolError>>()?;
             Ok(Command::MSet { entries })
         }
+        b"SETEX" => {
+            check_arity("SETEX", args, 3)?;
+            Ok(Command::Set {
+                key: extract_bytes(&args[0])?,
+                value: extract_bytes(&args[2])?,
+                ex: Some(parse_u64(&args[1])?),
+                px: None,
+                nx: false,
+                xx: false,
+            })
+        }
+        b"PSETEX" => {
+            check_arity("PSETEX", args, 3)?;
+            Ok(Command::Set {
+                key: extract_bytes(&args[0])?,
+                value: extract_bytes(&args[2])?,
+                ex: None,
+                px: Some(parse_u64(&args[1])?),
+                nx: false,
+                xx: false,
+            })
+        }
+        b"INCRBYFLOAT" => {
+            check_arity("INCRBYFLOAT", args, 2)?;
+            Ok(Command::IncrByFloat {
+                key: extract_bytes(&args[0])?,
+                delta: parse_f64(&args[1])?,
+            })
+        }
+        b"GETRANGE" | b"SUBSTR" => {
+            check_arity("GETRANGE", args, 3)?;
+            Ok(Command::GetRange {
+                key: extract_bytes(&args[0])?,
+                start: parse_i64(&args[1])?,
+                end: parse_i64(&args[2])?,
+            })
+        }
+        b"SETRANGE" => {
+            check_arity("SETRANGE", args, 3)?;
+            Ok(Command::SetRange {
+                key: extract_bytes(&args[0])?,
+                offset: parse_u64(&args[1])? as usize,
+                value: extract_bytes(&args[2])?,
+            })
+        }
+        b"GETDEL" => {
+            check_arity("GETDEL", args, 1)?;
+            Ok(Command::GetDel {
+                key: extract_bytes(&args[0])?,
+            })
+        }
+        b"GETEX" => parse_getex(args),
+        b"MSETNX" => {
+            if args.len() < 2 || args.len() % 2 != 0 {
+                return Err(ProtocolError::WrongArity("MSETNX".into()));
+            }
+            let entries = args
+                .chunks(2)
+                .map(|chunk| Ok((extract_bytes(&chunk[0])?, extract_bytes(&chunk[1])?)))
+                .collect::<Result<_, ProtocolError>>()?;
+            Ok(Command::MSetNx { entries })
+        }
 
         // Key commands
         b"DEL" => {
@@ -263,6 +328,71 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             Ok(Command::DbSize)
         }
         b"FLUSHDB" => Ok(Command::FlushDb),
+        b"EXPIREAT" => {
+            check_arity("EXPIREAT", args, 2)?;
+            Ok(Command::ExpireAt {
+                key: extract_bytes(&args[0])?,
+                timestamp: parse_u64(&args[1])?,
+            })
+        }
+        b"PEXPIREAT" => {
+            check_arity("PEXPIREAT", args, 2)?;
+            Ok(Command::PExpireAt {
+                key: extract_bytes(&args[0])?,
+                timestamp_ms: parse_u64(&args[1])?,
+            })
+        }
+        b"RENAME" => {
+            check_arity("RENAME", args, 2)?;
+            Ok(Command::Rename {
+                key: extract_bytes(&args[0])?,
+                newkey: extract_bytes(&args[1])?,
+            })
+        }
+        b"RENAMENX" => {
+            check_arity("RENAMENX", args, 2)?;
+            Ok(Command::RenameNx {
+                key: extract_bytes(&args[0])?,
+                newkey: extract_bytes(&args[1])?,
+            })
+        }
+        b"UNLINK" => {
+            check_min_arity("UNLINK", args, 1)?;
+            let keys = args.iter().map(extract_bytes).collect::<Result<_, _>>()?;
+            Ok(Command::Unlink { keys })
+        }
+        b"COPY" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Err(ProtocolError::WrongArity("COPY".into()));
+            }
+            let source = extract_bytes(&args[0])?;
+            let destination = extract_bytes(&args[1])?;
+            let replace = if args.len() == 3 {
+                let flag = extract_string(&args[2])?.to_ascii_uppercase();
+                if flag != b"REPLACE" {
+                    return Err(ProtocolError::InvalidData(
+                        "ERR unsupported COPY flag".into(),
+                    ));
+                }
+                true
+            } else {
+                false
+            };
+            Ok(Command::Copy {
+                source,
+                destination,
+                replace,
+            })
+        }
+        b"RANDOMKEY" => {
+            check_arity("RANDOMKEY", args, 0)?;
+            Ok(Command::RandomKey)
+        }
+        b"TOUCH" => {
+            check_min_arity("TOUCH", args, 1)?;
+            let keys = args.iter().map(extract_bytes).collect::<Result<_, _>>()?;
+            Ok(Command::Touch { keys })
+        }
 
         // List commands
         b"LPUSH" => {
@@ -316,6 +446,86 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             Ok(Command::LIndex {
                 key: extract_bytes(&args[0])?,
                 index: parse_i64(&args[1])?,
+            })
+        }
+        b"LSET" => {
+            check_arity("LSET", args, 3)?;
+            Ok(Command::LSet {
+                key: extract_bytes(&args[0])?,
+                index: parse_i64(&args[1])?,
+                value: extract_bytes(&args[2])?,
+            })
+        }
+        b"LINSERT" => {
+            check_arity("LINSERT", args, 4)?;
+            let direction = extract_string(&args[1])?.to_ascii_uppercase();
+            let before = match direction.as_slice() {
+                b"BEFORE" => true,
+                b"AFTER" => false,
+                _ => {
+                    return Err(ProtocolError::InvalidData(
+                        "ERR syntax error, BEFORE or AFTER required".into(),
+                    ))
+                }
+            };
+            Ok(Command::LInsert {
+                key: extract_bytes(&args[0])?,
+                before,
+                pivot: extract_bytes(&args[2])?,
+                value: extract_bytes(&args[3])?,
+            })
+        }
+        b"LREM" => {
+            check_arity("LREM", args, 3)?;
+            Ok(Command::LRem {
+                key: extract_bytes(&args[0])?,
+                count: parse_i64(&args[1])?,
+                value: extract_bytes(&args[2])?,
+            })
+        }
+        b"LTRIM" => {
+            check_arity("LTRIM", args, 3)?;
+            Ok(Command::LTrim {
+                key: extract_bytes(&args[0])?,
+                start: parse_i64(&args[1])?,
+                stop: parse_i64(&args[2])?,
+            })
+        }
+        b"LPOS" => parse_lpos(args),
+        b"RPOPLPUSH" => {
+            check_arity("RPOPLPUSH", args, 2)?;
+            Ok(Command::RPopLPush {
+                source: extract_bytes(&args[0])?,
+                destination: extract_bytes(&args[1])?,
+            })
+        }
+        b"LMOVE" => {
+            check_arity("LMOVE", args, 4)?;
+            let from_dir = extract_string(&args[2])?.to_ascii_uppercase();
+            let to_dir = extract_string(&args[3])?.to_ascii_uppercase();
+            let from_left = match from_dir.as_slice() {
+                b"LEFT" => true,
+                b"RIGHT" => false,
+                _ => {
+                    return Err(ProtocolError::InvalidData(
+                        "ERR syntax error, LEFT or RIGHT required".into(),
+                    ))
+                }
+            };
+            let to_left = match to_dir.as_slice() {
+                b"LEFT" => true,
+                b"RIGHT" => false,
+                _ => {
+                    return Err(ProtocolError::InvalidData(
+                        "ERR syntax error, LEFT or RIGHT required".into(),
+                    ))
+                }
+            };
+            Ok(Command::LMove {
+                source: extract_bytes(&args[0])?,
+                destination: extract_bytes(&args[1])?,
+                from_left,
+                to_left,
             })
         }
 
@@ -375,6 +585,57 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
                 delta: parse_i64(&args[2])?,
             })
         }
+        b"HMGET" => {
+            check_min_arity("HMGET", args, 2)?;
+            Ok(Command::HMGet {
+                key: extract_bytes(&args[0])?,
+                fields: args[1..]
+                    .iter()
+                    .map(extract_bytes)
+                    .collect::<Result<_, _>>()?,
+            })
+        }
+        b"HMSET" => {
+            if args.len() < 3 || (args.len() - 1) % 2 != 0 {
+                return Err(ProtocolError::WrongArity("HMSET".into()));
+            }
+            let key = extract_bytes(&args[0])?;
+            let fields = args[1..]
+                .chunks(2)
+                .map(|chunk| Ok((extract_bytes(&chunk[0])?, extract_bytes(&chunk[1])?)))
+                .collect::<Result<_, ProtocolError>>()?;
+            Ok(Command::HSet { key, fields })
+        }
+        b"HKEYS" => {
+            check_arity("HKEYS", args, 1)?;
+            Ok(Command::HKeys {
+                key: extract_bytes(&args[0])?,
+            })
+        }
+        b"HVALS" => {
+            check_arity("HVALS", args, 1)?;
+            Ok(Command::HVals {
+                key: extract_bytes(&args[0])?,
+            })
+        }
+        b"HSETNX" => {
+            check_arity("HSETNX", args, 3)?;
+            Ok(Command::HSetNx {
+                key: extract_bytes(&args[0])?,
+                field: extract_bytes(&args[1])?,
+                value: extract_bytes(&args[2])?,
+            })
+        }
+        b"HINCRBYFLOAT" => {
+            check_arity("HINCRBYFLOAT", args, 3)?;
+            Ok(Command::HIncrByFloat {
+                key: extract_bytes(&args[0])?,
+                field: extract_bytes(&args[1])?,
+                delta: parse_f64(&args[2])?,
+            })
+        }
+        b"HRANDFIELD" => parse_hrandfield(args),
+        b"HSCAN" => parse_hscan(args),
 
         // Set commands
         b"SADD" => {
@@ -416,6 +677,88 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
                 key: extract_bytes(&args[0])?,
             })
         }
+        b"SPOP" => {
+            check_min_arity("SPOP", args, 1)?;
+            let key = extract_bytes(&args[0])?;
+            let count = if args.len() >= 2 {
+                Some(parse_u64(&args[1])? as usize)
+            } else {
+                None
+            };
+            Ok(Command::SPop { key, count })
+        }
+        b"SRANDMEMBER" => {
+            check_min_arity("SRANDMEMBER", args, 1)?;
+            let key = extract_bytes(&args[0])?;
+            let count = if args.len() >= 2 {
+                Some(parse_i64(&args[1])?)
+            } else {
+                None
+            };
+            Ok(Command::SRandMember { key, count })
+        }
+        b"SUNION" => {
+            check_min_arity("SUNION", args, 1)?;
+            let keys = args.iter().map(extract_bytes).collect::<Result<_, _>>()?;
+            Ok(Command::SUnion { keys })
+        }
+        b"SUNIONSTORE" => {
+            check_min_arity("SUNIONSTORE", args, 2)?;
+            let destination = extract_bytes(&args[0])?;
+            let keys = args[1..]
+                .iter()
+                .map(extract_bytes)
+                .collect::<Result<_, _>>()?;
+            Ok(Command::SUnionStore { destination, keys })
+        }
+        b"SINTER" => {
+            check_min_arity("SINTER", args, 1)?;
+            let keys = args.iter().map(extract_bytes).collect::<Result<_, _>>()?;
+            Ok(Command::SInter { keys })
+        }
+        b"SINTERSTORE" => {
+            check_min_arity("SINTERSTORE", args, 2)?;
+            let destination = extract_bytes(&args[0])?;
+            let keys = args[1..]
+                .iter()
+                .map(extract_bytes)
+                .collect::<Result<_, _>>()?;
+            Ok(Command::SInterStore { destination, keys })
+        }
+        b"SDIFF" => {
+            check_min_arity("SDIFF", args, 1)?;
+            let keys = args.iter().map(extract_bytes).collect::<Result<_, _>>()?;
+            Ok(Command::SDiff { keys })
+        }
+        b"SDIFFSTORE" => {
+            check_min_arity("SDIFFSTORE", args, 2)?;
+            let destination = extract_bytes(&args[0])?;
+            let keys = args[1..]
+                .iter()
+                .map(extract_bytes)
+                .collect::<Result<_, _>>()?;
+            Ok(Command::SDiffStore { destination, keys })
+        }
+        b"SINTERCARD" => parse_sintercard(args),
+        b"SMOVE" => {
+            check_arity("SMOVE", args, 3)?;
+            Ok(Command::SMove {
+                source: extract_bytes(&args[0])?,
+                destination: extract_bytes(&args[1])?,
+                member: extract_bytes(&args[2])?,
+            })
+        }
+        b"SMISMEMBER" => {
+            check_min_arity("SMISMEMBER", args, 2)?;
+            Ok(Command::SMisMember {
+                key: extract_bytes(&args[0])?,
+                members: args[1..]
+                    .iter()
+                    .map(extract_bytes)
+                    .collect::<Result<_, _>>()?,
+            })
+        }
+        b"SSCAN" => parse_sscan(args),
 
         // Sorted set commands
         b"ZADD" => {
@@ -564,6 +907,86 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
                 max: parse_score(&args[2])?,
             })
         }
+        b"ZREVRANGEBYSCORE" => {
+            check_min_arity("ZREVRANGEBYSCORE", args, 3)?;
+            let key = extract_bytes(&args[0])?;
+            let max = parse_score(&args[1])?;
+            let min = parse_score(&args[2])?;
+            let mut withscores = false;
+            let mut offset = None;
+            let mut count = None;
+            let mut i = 3;
+            while i < args.len() {
+                let flag = extract_string(&args[i])?.to_ascii_uppercase();
+                match flag.as_slice() {
+                    b"WITHSCORES" => withscores = true,
+                    b"LIMIT" => {
+                        if i + 2 >= args.len() {
+                            return Err(ProtocolError::WrongArity("ZREVRANGEBYSCORE".into()));
+                        }
+                        offset = Some(parse_u64(&args[i + 1])? as usize);
+                        count = Some(parse_u64(&args[i + 2])? as usize);
+                        i += 2;
+                    }
+                    _ => {
+                        return Err(ProtocolError::InvalidData(
+                            "unsupported ZREVRANGEBYSCORE flag".into(),
+                        ))
+                    }
+                }
+                i += 1;
+            }
+            Ok(Command::ZRevRangeByScore {
+                key,
+                max,
+                min,
+                withscores,
+                offset,
+                count,
+            })
+        }
+        b"ZPOPMIN" => {
+            check_min_arity("ZPOPMIN", args, 1)?;
+            let key = extract_bytes(&args[0])?;
+            let count = if args.len() >= 2 {
+                Some(parse_u64(&args[1])? as usize)
+            } else {
+                None
+            };
+            Ok(Command::ZPopMin { key, count })
+        }
+        b"ZPOPMAX" => {
+            check_min_arity("ZPOPMAX", args, 1)?;
+            let key = extract_bytes(&args[0])?;
+            let count = if args.len() >= 2 {
+                Some(parse_u64(&args[1])? as usize)
+            } else {
+                None
+            };
+            Ok(Command::ZPopMax { key, count })
+        }
+        b"ZRANGEBYLEX" => parse_zrangebylex(args),
+        b"ZREVRANGEBYLEX" => parse_zrevrangebylex(args),
+        b"ZLEXCOUNT" => {
+            check_arity("ZLEXCOUNT", args, 3)?;
+            Ok(Command::ZLexCount {
+                key: extract_bytes(&args[0])?,
+                min: extract_bytes(&args[1])?,
+                max: extract_bytes(&args[2])?,
+            })
+        }
+        b"ZMSCORE" => {
+            check_min_arity("ZMSCORE", args, 2)?;
+            Ok(Command::ZMScore {
+                key: extract_bytes(&args[0])?,
+                members: args[1..]
+                    .iter()
+                    .map(extract_bytes)
+                    .collect::<Result<_, _>>()?,
+            })
+        }
+        b"ZRANDMEMBER" => parse_zrandmember(args),
+        b"ZSCAN" => parse_zscan(args),
 
         // Server commands
         b"PING" => Ok(Command::Ping {
@@ -581,7 +1004,42 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
                 .and_then(|a| extract_bytes(a).ok())
                 .map(|b| String::from_utf8_lossy(&b).into_owned()),
         }),
-        b"COMMAND" => Ok(Command::CommandInfo),
+        b"COMMAND" => {
+            if args.is_empty() {
+                return Ok(Command::CommandInfo { names: Vec::new() });
+            }
+            let subcmd = extract_string(&args[0])?.to_ascii_uppercase();
+            match subcmd.as_slice() {
+                b"COUNT" => {
+                    check_arity("COMMAND COUNT", &args[1..], 0)?;
+                    Ok(Command::CommandCount)
+                }
+                b"LIST" => {
+                    check_arity("COMMAND LIST", &args[1..], 0)?;
+                    Ok(Command::CommandList)
+                }
+                b"INFO" => Ok(Command::CommandInfo {
+                    names: args[1..]
+                        .iter()
+                        .map(extract_bytes)
+                        .collect::<Result<_, _>>()?,
+                }),
+                b"DOCS" => Ok(Command::CommandDocs {
+                    names: args[1..]
+                        .iter()
+                        .map(extract_bytes)
+                        .collect::<Result<_, _>>()?,
+                }),
+                b"HELP" => {
+                    check_arity("COMMAND HELP", &args[1..], 0)?;
+                    Ok(Command::CommandHelp)
+                }
+                _ => Err(ProtocolError::InvalidData(format!(
+                    "unknown COMMAND subcommand '{}'. Try COMMAND HELP.",
+                    String::from_utf8_lossy(&subcmd).to_ascii_lowercase()
+                ))),
+            }
+        }
 
         // Server / admin commands
         b"BGSAVE" => {
@@ -735,15 +1193,34 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
 
         // Object commands
         b"OBJECT" => {
-            check_min_arity("OBJECT", args, 2)?;
+            check_min_arity("OBJECT", args, 1)?;
             let subcmd = extract_string(&args[0])?.to_ascii_uppercase();
             match subcmd.as_slice() {
-                b"FREQ" => Ok(Command::ObjectFreq {
-                    key: extract_bytes(&args[1])?,
-                }),
-                b"ENCODING" => Ok(Command::ObjectEncoding {
-                    key: extract_bytes(&args[1])?,
-                }),
+                b"FREQ" => {
+                    check_arity("OBJECT FREQ", &args[1..], 1)?;
+                    Ok(Command::ObjectFreq {
+                        key: extract_bytes(&args[1])?,
+                    })
+                }
+                b"ENCODING" => {
+                    check_arity("OBJECT ENCODING", &args[1..], 1)?;
+                    Ok(Command::ObjectEncoding {
+                        key: extract_bytes(&args[1])?,
+                    })
+                }
+                b"REFCOUNT" => {
+                    check_arity("OBJECT REFCOUNT", &args[1..], 1)?;
+                    Ok(Command::ObjectRefCount {
+                        key: extract_bytes(&args[1])?,
+                    })
+                }
+                b"IDLETIME" => {
+                    check_arity("OBJECT IDLETIME", &args[1..], 1)?;
+                    Ok(Command::ObjectIdleTime {
+                        key: extract_bytes(&args[1])?,
+                    })
+                }
+                b"HELP" => Ok(Command::ObjectHelp),
                 _ => Err(ProtocolError::InvalidData(format!(
                     "unknown OBJECT subcommand: {}",
                     String::from_utf8_lossy(&subcmd)
@@ -814,10 +1291,515 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
             })
         }
 
+        // HyperLogLog commands
+        b"PFADD" => {
+            check_min_arity("PFADD", args, 1)?;
+            Ok(Command::PfAdd {
+                key: extract_bytes(&args[0])?,
+                elements: args[1..]
+                    .iter()
+                    .map(extract_bytes)
+                    .collect::<Result<_, _>>()?,
+            })
+        }
+        b"PFCOUNT" => {
+            check_min_arity("PFCOUNT", args, 1)?;
+            let keys = args.iter().map(extract_bytes).collect::<Result<_, _>>()?;
+            Ok(Command::PfCount { keys })
+        }
+        b"PFMERGE" => {
+            check_min_arity("PFMERGE", args, 2)?;
+            let destkey = extract_bytes(&args[0])?;
+            let sourcekeys = args[1..]
+                .iter()
+                .map(extract_bytes)
+                .collect::<Result<_, _>>()?;
+            Ok(Command::PfMerge {
+                destkey,
+                sourcekeys,
+            })
+        }
+
+        // Bitmap commands
+        b"SETBIT" => {
+            check_arity("SETBIT", args, 3)?;
+            let value = parse_u64(&args[2])?;
+            if value > 1 {
+                return Err(ProtocolError::InvalidData(
+                    "ERR bit is not an integer or out of range".into(),
+                ));
+            }
+            Ok(Command::SetBit {
+                key: extract_bytes(&args[0])?,
+                offset: parse_u64(&args[1])?,
+                value: value as u8,
+            })
+        }
+        b"GETBIT" => {
+            check_arity("GETBIT", args, 2)?;
+            Ok(Command::GetBit {
+                key: extract_bytes(&args[0])?,
+                offset: parse_u64(&args[1])?,
+            })
+        }
+        b"BITCOUNT" => parse_bitcount(args),
+        b"BITOP" => parse_bitop(args),
+        b"BITPOS" => parse_bitpos(args),
+        b"BITFIELD" => parse_bitfield(args),
+
+        // Geo commands
+        b"GEOADD" => parse_geoadd(args),
+        b"GEODIST" => parse_geodist(args),
+        b"GEOHASH" => {
+            check_min_arity("GEOHASH", args, 2)?;
+            Ok(Command::GeoHash {
+                key: extract_bytes(&args[0])?,
+                members: args[1..]
+                    .iter()
+                    .map(extract_bytes)
+                    .collect::<Result<_, _>>()?,
+            })
+        }
+        b"GEOPOS" => {
+            check_min_arity("GEOPOS", args, 2)?;
+            Ok(Command::GeoPos {
+                key: extract_bytes(&args[0])?,
+                members: args[1..]
+                    .iter()
+                    .map(extract_bytes)
+                    .collect::<Result<_, _>>()?,
+            })
+        }
+        b"GEOSEARCH" => parse_geosearch(args),
+
+        // Transaction commands
+        b"MULTI" => {
+            check_arity("MULTI", args, 0)?;
+            Ok(Command::Multi)
+        }
+        b"EXEC" => {
+            check_arity("EXEC", args, 0)?;
+            Ok(Command::Exec)
+        }
+        b"DISCARD" => {
+            check_arity("DISCARD", args, 0)?;
+            Ok(Command::Discard)
+        }
+        b"WATCH" => {
+            check_min_arity("WATCH", args, 1)?;
+            let keys = args.iter().map(extract_bytes).collect::<Result<_, _>>()?;
+            Ok(Command::Watch { keys })
+        }
+        b"UNWATCH" => {
+            check_arity("UNWATCH", args, 0)?;
+            Ok(Command::Unwatch)
+        }
+
+        // Server commands (Phase 5)
+        b"CONFIG" => {
+            if args.is_empty() {
+                return Err(ProtocolError::WrongArity("CONFIG".into()));
+            }
+            let subcmd = extract_string(&args[0])?.to_ascii_uppercase();
+            match subcmd.as_slice() {
+                b"GET" => {
+                    check_arity("CONFIG GET", &args[1..], 1)?;
+                    let pattern = String::from_utf8_lossy(&extract_bytes(&args[1])?).into_owned();
+                    Ok(Command::ConfigGet { pattern })
+                }
+                b"SET" => {
+                    check_arity("CONFIG SET", &args[1..], 2)?;
+                    let parameter = String::from_utf8_lossy(&extract_bytes(&args[1])?).into_owned();
+                    let value = String::from_utf8_lossy(&extract_bytes(&args[2])?).into_owned();
+                    Ok(Command::ConfigSet { parameter, value })
+                }
+                b"RESETSTAT" => {
+                    check_arity("CONFIG RESETSTAT", &args[1..], 0)?;
+                    Ok(Command::ConfigResetStat)
+                }
+                _ => Err(ProtocolError::InvalidData(format!(
+                    "unknown CONFIG subcommand: {}",
+                    String::from_utf8_lossy(&subcmd)
+                ))),
+            }
+        }
+        b"CLIENT" => {
+            if args.is_empty() {
+                return Err(ProtocolError::WrongArity("CLIENT".into()));
+            }
+            let subcmd = extract_string(&args[0])?.to_ascii_uppercase();
+            match subcmd.as_slice() {
+                b"ID" => {
+                    check_arity("CLIENT ID", &args[1..], 0)?;
+                    Ok(Command::ClientId)
+                }
+                b"GETNAME" => {
+                    check_arity("CLIENT GETNAME", &args[1..], 0)?;
+                    Ok(Command::ClientGetName)
+                }
+                b"SETNAME" => {
+                    check_arity("CLIENT SETNAME", &args[1..], 1)?;
+                    Ok(Command::ClientSetName {
+                        name: extract_bytes(&args[1])?,
+                    })
+                }
+                b"LIST" => Ok(Command::ClientList),
+                b"INFO" => Ok(Command::ClientInfo),
+                _ => Err(ProtocolError::InvalidData(format!(
+                    "unknown CLIENT subcommand: {}",
+                    String::from_utf8_lossy(&subcmd)
+                ))),
+            }
+        }
+        b"TIME" => {
+            check_arity("TIME", args, 0)?;
+            Ok(Command::Time)
+        }
+        b"SELECT" => {
+            check_arity("SELECT", args, 1)?;
+            Ok(Command::Select {
+                db: parse_i64(&args[0])?,
+            })
+        }
+        b"QUIT" => Ok(Command::Quit),
+        b"WAIT" => {
+            check_arity("WAIT", args, 2)?;
+            Ok(Command::Wait {
+                numreplicas: parse_i64(&args[0])?,
+                timeout: parse_i64(&args[1])?,
+            })
+        }
+
+        // Blocking operations
+        b"BLPOP" => parse_blpop(args),
+        b"BRPOP" => parse_brpop(args),
+        b"BLMOVE" => parse_blmove(args),
+        b"BZPOPMIN" => parse_bzpopmin(args),
+        b"BZPOPMAX" => parse_bzpopmax(args),
+
+        // Stream consumer group commands
+        b"XGROUP" => parse_xgroup(args),
+        b"XREADGROUP" => parse_xreadgroup(args),
+        b"XACK" => parse_xack(args),
+        b"XPENDING" => parse_xpending(args),
+        b"XCLAIM" => parse_xclaim(args),
+        b"XAUTOCLAIM" => parse_xautoclaim(args),
+        b"XINFO" => parse_xinfo(args),
+        b"XDEL" => parse_xdel(args),
+
         _ => Err(ProtocolError::UnknownCommand(
             String::from_utf8_lossy(&cmd_name).into_owned(),
         )),
     }
+}
+
+fn parse_blpop(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("BLPOP", args, 2)?;
+    let timeout = parse_f64(args.last().unwrap())?;
+    let keys = args[..args.len() - 1]
+        .iter()
+        .map(extract_bytes)
+        .collect::<Result<_, _>>()?;
+    Ok(Command::BLPop { keys, timeout })
+}
+
+fn parse_brpop(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("BRPOP", args, 2)?;
+    let timeout = parse_f64(args.last().unwrap())?;
+    let keys = args[..args.len() - 1]
+        .iter()
+        .map(extract_bytes)
+        .collect::<Result<_, _>>()?;
+    Ok(Command::BRPop { keys, timeout })
+}
+
+fn parse_blmove(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_arity("BLMOVE", args, 5)?;
+    let source = extract_bytes(&args[0])?;
+    let destination = extract_bytes(&args[1])?;
+    let from_dir = extract_string(&args[2])?.to_ascii_uppercase();
+    let to_dir = extract_string(&args[3])?.to_ascii_uppercase();
+    let from_left = match from_dir.as_slice() {
+        b"LEFT" => true,
+        b"RIGHT" => false,
+        _ => {
+            return Err(ProtocolError::InvalidData(
+                "ERR syntax error, LEFT or RIGHT required".into(),
+            ))
+        }
+    };
+    let to_left = match to_dir.as_slice() {
+        b"LEFT" => true,
+        b"RIGHT" => false,
+        _ => {
+            return Err(ProtocolError::InvalidData(
+                "ERR syntax error, LEFT or RIGHT required".into(),
+            ))
+        }
+    };
+    let timeout = parse_f64(&args[4])?;
+    Ok(Command::BLMove {
+        source,
+        destination,
+        from_left,
+        to_left,
+        timeout,
+    })
+}
+
+fn parse_bzpopmin(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("BZPOPMIN", args, 2)?;
+    let timeout = parse_f64(args.last().unwrap())?;
+    let keys = args[..args.len() - 1]
+        .iter()
+        .map(extract_bytes)
+        .collect::<Result<_, _>>()?;
+    Ok(Command::BZPopMin { keys, timeout })
+}
+
+fn parse_bzpopmax(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("BZPOPMAX", args, 2)?;
+    let timeout = parse_f64(args.last().unwrap())?;
+    let keys = args[..args.len() - 1]
+        .iter()
+        .map(extract_bytes)
+        .collect::<Result<_, _>>()?;
+    Ok(Command::BZPopMax { keys, timeout })
+}
+
+fn parse_xgroup(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    if args.is_empty() {
+        return Err(ProtocolError::WrongArity("XGROUP".into()));
+    }
+    let subcmd = extract_string(&args[0])?.to_ascii_uppercase();
+    match subcmd.as_slice() {
+        b"CREATE" => {
+            check_min_arity("XGROUP CREATE", &args[1..], 3)?;
+            let key = extract_bytes(&args[1])?;
+            let group = String::from_utf8_lossy(&extract_bytes(&args[2])?).into_owned();
+            let id = String::from_utf8_lossy(&extract_bytes(&args[3])?).into_owned();
+            let mkstream = if args.len() > 4 {
+                let flag = extract_string(&args[4])?.to_ascii_uppercase();
+                flag == b"MKSTREAM"
+            } else {
+                false
+            };
+            Ok(Command::XGroupCreate {
+                key,
+                group,
+                id,
+                mkstream,
+            })
+        }
+        b"DESTROY" => {
+            check_arity("XGROUP DESTROY", &args[1..], 2)?;
+            let key = extract_bytes(&args[1])?;
+            let group = String::from_utf8_lossy(&extract_bytes(&args[2])?).into_owned();
+            Ok(Command::XGroupDestroy { key, group })
+        }
+        b"DELCONSUMER" => {
+            check_arity("XGROUP DELCONSUMER", &args[1..], 3)?;
+            let key = extract_bytes(&args[1])?;
+            let group = String::from_utf8_lossy(&extract_bytes(&args[2])?).into_owned();
+            let consumer = String::from_utf8_lossy(&extract_bytes(&args[3])?).into_owned();
+            Ok(Command::XGroupDelConsumer {
+                key,
+                group,
+                consumer,
+            })
+        }
+        _ => Err(ProtocolError::InvalidData(format!(
+            "unknown XGROUP subcommand: {}",
+            String::from_utf8_lossy(&subcmd)
+        ))),
+    }
+}
+
+fn parse_xreadgroup(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("XREADGROUP", args, 6)?;
+    let first = extract_string(&args[0])?.to_ascii_uppercase();
+    if first != b"GROUP" {
+        return Err(ProtocolError::InvalidData(
+            "ERR syntax error, GROUP expected".into(),
+        ));
+    }
+    let group = String::from_utf8_lossy(&extract_bytes(&args[1])?).into_owned();
+    let consumer = String::from_utf8_lossy(&extract_bytes(&args[2])?).into_owned();
+
+    let mut idx = 3;
+    let mut count = None;
+
+    while idx < args.len() {
+        let token = extract_string(&args[idx])?.to_ascii_uppercase();
+        match token.as_slice() {
+            b"COUNT" => {
+                idx += 1;
+                if idx >= args.len() {
+                    return Err(ProtocolError::WrongArity("XREADGROUP".into()));
+                }
+                count = Some(parse_u64(&args[idx])? as usize);
+                idx += 1;
+            }
+            b"BLOCK" => {
+                idx += 2;
+            }
+            b"STREAMS" => {
+                idx += 1;
+                break;
+            }
+            _ => {
+                return Err(ProtocolError::InvalidData(format!(
+                    "unsupported XREADGROUP option: {}",
+                    String::from_utf8_lossy(&token)
+                )));
+            }
+        }
+    }
+
+    let remaining = &args[idx..];
+    if remaining.is_empty() || remaining.len() % 2 != 0 {
+        return Err(ProtocolError::WrongArity("XREADGROUP".into()));
+    }
+
+    let half = remaining.len() / 2;
+    let keys = remaining[..half]
+        .iter()
+        .map(extract_bytes)
+        .collect::<Result<Vec<_>, _>>()?;
+    let ids = remaining[half..]
+        .iter()
+        .map(extract_bytes)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Command::XReadGroup {
+        group,
+        consumer,
+        count,
+        keys,
+        ids,
+    })
+}
+
+fn parse_xack(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("XACK", args, 3)?;
+    let key = extract_bytes(&args[0])?;
+    let group = String::from_utf8_lossy(&extract_bytes(&args[1])?).into_owned();
+    let ids = args[2..]
+        .iter()
+        .map(extract_bytes)
+        .collect::<Result<_, _>>()?;
+    Ok(Command::XAck { key, group, ids })
+}
+
+fn parse_xpending(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("XPENDING", args, 2)?;
+    let key = extract_bytes(&args[0])?;
+    let group = String::from_utf8_lossy(&extract_bytes(&args[1])?).into_owned();
+    let (start, end, count) = if args.len() >= 5 {
+        (
+            Some(extract_bytes(&args[2])?),
+            Some(extract_bytes(&args[3])?),
+            Some(parse_u64(&args[4])? as usize),
+        )
+    } else {
+        (None, None, None)
+    };
+    Ok(Command::XPending {
+        key,
+        group,
+        start,
+        end,
+        count,
+    })
+}
+
+fn parse_xclaim(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("XCLAIM", args, 5)?;
+    let key = extract_bytes(&args[0])?;
+    let group = String::from_utf8_lossy(&extract_bytes(&args[1])?).into_owned();
+    let consumer = String::from_utf8_lossy(&extract_bytes(&args[2])?).into_owned();
+    let min_idle_time = parse_u64(&args[3])?;
+    let mut ids = Vec::new();
+    for arg in &args[4..] {
+        let val = extract_bytes(arg)?;
+        let upper = extract_string(arg)?.to_ascii_uppercase();
+        if upper == b"IDLE"
+            || upper == b"TIME"
+            || upper == b"RETRYCOUNT"
+            || upper == b"FORCE"
+            || upper == b"JUSTID"
+        {
+            break;
+        }
+        ids.push(val);
+    }
+    if ids.is_empty() {
+        return Err(ProtocolError::WrongArity("XCLAIM".into()));
+    }
+    Ok(Command::XClaim {
+        key,
+        group,
+        consumer,
+        min_idle_time,
+        ids,
+    })
+}
+
+fn parse_xautoclaim(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("XAUTOCLAIM", args, 5)?;
+    let key = extract_bytes(&args[0])?;
+    let group = String::from_utf8_lossy(&extract_bytes(&args[1])?).into_owned();
+    let consumer = String::from_utf8_lossy(&extract_bytes(&args[2])?).into_owned();
+    let min_idle_time = parse_u64(&args[3])?;
+    let start = extract_bytes(&args[4])?;
+    let mut count = None;
+    if args.len() >= 7 {
+        let flag = extract_string(&args[5])?.to_ascii_uppercase();
+        if flag == b"COUNT" {
+            count = Some(parse_u64(&args[6])? as usize);
+        }
+    }
+    Ok(Command::XAutoClaim {
+        key,
+        group,
+        consumer,
+        min_idle_time,
+        start,
+        count,
+    })
+}
+
+fn parse_xinfo(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    if args.is_empty() {
+        return Err(ProtocolError::WrongArity("XINFO".into()));
+    }
+    let subcmd = extract_string(&args[0])?.to_ascii_uppercase();
+    match subcmd.as_slice() {
+        b"STREAM" => {
+            check_min_arity("XINFO STREAM", &args[1..], 1)?;
+            let key = extract_bytes(&args[1])?;
+            Ok(Command::XInfoStream { key })
+        }
+        b"GROUPS" => {
+            check_min_arity("XINFO GROUPS", &args[1..], 1)?;
+            let key = extract_bytes(&args[1])?;
+            Ok(Command::XInfoGroups { key })
+        }
+        _ => Err(ProtocolError::InvalidData(format!(
+            "unknown XINFO subcommand: {}",
+            String::from_utf8_lossy(&subcmd)
+        ))),
+    }
+}
+
+fn parse_xdel(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("XDEL", args, 2)?;
+    let key = extract_bytes(&args[0])?;
+    let ids = args[1..]
+        .iter()
+        .map(extract_bytes)
+        .collect::<Result<_, _>>()?;
+    Ok(Command::XDel { key, ids })
 }
 
 fn parse_cdc_group(args: &[RespValue]) -> Result<Command, ProtocolError> {
@@ -855,6 +1837,70 @@ fn parse_cdc_group(args: &[RespValue]) -> Result<Command, ProtocolError> {
             String::from_utf8_lossy(&subcmd)
         ))),
     }
+}
+
+fn parse_getex(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("GETEX", args, 1)?;
+    let key = extract_bytes(&args[0])?;
+    let mut ex = None;
+    let mut px = None;
+    let mut exat = None;
+    let mut pxat = None;
+    let mut persist = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        let flag = extract_string(&args[i])?.to_ascii_uppercase();
+        match flag.as_slice() {
+            b"EX" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtocolError::WrongArity("GETEX".into()));
+                }
+                ex = Some(parse_u64(&args[i])?);
+            }
+            b"PX" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtocolError::WrongArity("GETEX".into()));
+                }
+                px = Some(parse_u64(&args[i])?);
+            }
+            b"EXAT" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtocolError::WrongArity("GETEX".into()));
+                }
+                exat = Some(parse_u64(&args[i])?);
+            }
+            b"PXAT" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtocolError::WrongArity("GETEX".into()));
+                }
+                pxat = Some(parse_u64(&args[i])?);
+            }
+            b"PERSIST" => {
+                persist = true;
+            }
+            _ => {
+                return Err(ProtocolError::InvalidData(format!(
+                    "unsupported GETEX flag: {}",
+                    String::from_utf8_lossy(&flag)
+                )));
+            }
+        }
+        i += 1;
+    }
+
+    Ok(Command::GetEx {
+        key,
+        ex,
+        px,
+        exat,
+        pxat,
+        persist,
+    })
 }
 
 fn parse_set(args: &[RespValue]) -> Result<Command, ProtocolError> {
@@ -926,6 +1972,357 @@ fn parse_scan(args: &[RespValue]) -> Result<Command, ProtocolError> {
         i += 1;
     }
     Ok(Command::Scan {
+        cursor,
+        pattern,
+        count,
+    })
+}
+
+fn parse_lpos(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("LPOS", args, 2)?;
+    let key = extract_bytes(&args[0])?;
+    let value = extract_bytes(&args[1])?;
+    let mut rank = None;
+    let mut count = None;
+    let mut maxlen = None;
+    let mut i = 2;
+    while i < args.len() {
+        let flag = extract_string(&args[i])?.to_ascii_uppercase();
+        match flag.as_slice() {
+            b"RANK" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtocolError::WrongArity("LPOS".into()));
+                }
+                rank = Some(parse_i64(&args[i])?);
+            }
+            b"COUNT" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtocolError::WrongArity("LPOS".into()));
+                }
+                count = Some(parse_i64(&args[i])?);
+            }
+            b"MAXLEN" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtocolError::WrongArity("LPOS".into()));
+                }
+                maxlen = Some(parse_i64(&args[i])?);
+            }
+            _ => {
+                return Err(ProtocolError::InvalidData(format!(
+                    "unsupported LPOS option: {}",
+                    String::from_utf8_lossy(&flag)
+                )));
+            }
+        }
+        i += 1;
+    }
+    Ok(Command::LPos {
+        key,
+        value,
+        rank,
+        count,
+        maxlen,
+    })
+}
+
+fn parse_hrandfield(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("HRANDFIELD", args, 1)?;
+    let key = extract_bytes(&args[0])?;
+    if args.len() == 1 {
+        return Ok(Command::HRandField {
+            key,
+            count: None,
+            withvalues: false,
+        });
+    }
+    let count = Some(parse_i64(&args[1])?);
+    let withvalues = if args.len() >= 3 {
+        let flag = extract_string(&args[2])?.to_ascii_uppercase();
+        if flag != b"WITHVALUES" {
+            return Err(ProtocolError::InvalidData(
+                "ERR syntax error, WITHVALUES expected".into(),
+            ));
+        }
+        true
+    } else {
+        false
+    };
+    if args.len() > 3 {
+        return Err(ProtocolError::WrongArity("HRANDFIELD".into()));
+    }
+    Ok(Command::HRandField {
+        key,
+        count,
+        withvalues,
+    })
+}
+
+fn parse_hscan(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("HSCAN", args, 2)?;
+    let key = extract_bytes(&args[0])?;
+    let cursor = parse_u64(&args[1])?;
+    let mut pattern = None;
+    let mut count = None;
+    let mut i = 2;
+    while i < args.len() {
+        let flag = extract_string(&args[i])?.to_ascii_uppercase();
+        match flag.as_slice() {
+            b"MATCH" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtocolError::WrongArity("HSCAN".into()));
+                }
+                pattern = Some(String::from_utf8_lossy(&extract_bytes(&args[i])?).into_owned());
+            }
+            b"COUNT" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtocolError::WrongArity("HSCAN".into()));
+                }
+                count = Some(parse_u64(&args[i])? as usize);
+            }
+            _ => {
+                return Err(ProtocolError::InvalidData(format!(
+                    "unsupported HSCAN option: {}",
+                    String::from_utf8_lossy(&flag)
+                )));
+            }
+        }
+        i += 1;
+    }
+    Ok(Command::HScan {
+        key,
+        cursor,
+        pattern,
+        count,
+    })
+}
+
+fn parse_sintercard(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("SINTERCARD", args, 2)?;
+    let numkeys = parse_u64(&args[0])? as usize;
+    if numkeys == 0 {
+        return Err(ProtocolError::InvalidData(
+            "ERR numkeys can't be zero".into(),
+        ));
+    }
+    if args.len() < 1 + numkeys {
+        return Err(ProtocolError::WrongArity("SINTERCARD".into()));
+    }
+    let keys = args[1..1 + numkeys]
+        .iter()
+        .map(extract_bytes)
+        .collect::<Result<_, _>>()?;
+    let mut limit = None;
+    let mut i = 1 + numkeys;
+    while i < args.len() {
+        let flag = extract_string(&args[i])?.to_ascii_uppercase();
+        match flag.as_slice() {
+            b"LIMIT" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtocolError::WrongArity("SINTERCARD".into()));
+                }
+                limit = Some(parse_u64(&args[i])? as usize);
+            }
+            _ => {
+                return Err(ProtocolError::InvalidData(
+                    "unsupported SINTERCARD option".into(),
+                ))
+            }
+        }
+        i += 1;
+    }
+    Ok(Command::SInterCard {
+        numkeys,
+        keys,
+        limit,
+    })
+}
+
+fn parse_sscan(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("SSCAN", args, 2)?;
+    let key = extract_bytes(&args[0])?;
+    let cursor = parse_u64(&args[1])?;
+    let mut pattern = None;
+    let mut count = None;
+    let mut i = 2;
+    while i < args.len() {
+        let flag = extract_string(&args[i])?.to_ascii_uppercase();
+        match flag.as_slice() {
+            b"MATCH" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtocolError::WrongArity("SSCAN".into()));
+                }
+                pattern = Some(String::from_utf8_lossy(&extract_bytes(&args[i])?).into_owned());
+            }
+            b"COUNT" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtocolError::WrongArity("SSCAN".into()));
+                }
+                count = Some(parse_u64(&args[i])? as usize);
+            }
+            _ => {
+                return Err(ProtocolError::InvalidData(format!(
+                    "unsupported SSCAN option: {}",
+                    String::from_utf8_lossy(&flag)
+                )));
+            }
+        }
+        i += 1;
+    }
+    Ok(Command::SScan {
+        key,
+        cursor,
+        pattern,
+        count,
+    })
+}
+
+fn parse_zrangebylex(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("ZRANGEBYLEX", args, 3)?;
+    let key = extract_bytes(&args[0])?;
+    let min = extract_bytes(&args[1])?;
+    let max = extract_bytes(&args[2])?;
+    let mut offset = None;
+    let mut count = None;
+    let mut i = 3;
+    while i < args.len() {
+        let flag = extract_string(&args[i])?.to_ascii_uppercase();
+        match flag.as_slice() {
+            b"LIMIT" => {
+                if i + 2 >= args.len() {
+                    return Err(ProtocolError::WrongArity("ZRANGEBYLEX".into()));
+                }
+                offset = Some(parse_u64(&args[i + 1])? as usize);
+                count = Some(parse_u64(&args[i + 2])? as usize);
+                i += 2;
+            }
+            _ => {
+                return Err(ProtocolError::InvalidData(
+                    "unsupported ZRANGEBYLEX flag".into(),
+                ))
+            }
+        }
+        i += 1;
+    }
+    Ok(Command::ZRangeByLex {
+        key,
+        min,
+        max,
+        offset,
+        count,
+    })
+}
+
+fn parse_zrevrangebylex(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("ZREVRANGEBYLEX", args, 3)?;
+    let key = extract_bytes(&args[0])?;
+    let max = extract_bytes(&args[1])?;
+    let min = extract_bytes(&args[2])?;
+    let mut offset = None;
+    let mut count = None;
+    let mut i = 3;
+    while i < args.len() {
+        let flag = extract_string(&args[i])?.to_ascii_uppercase();
+        match flag.as_slice() {
+            b"LIMIT" => {
+                if i + 2 >= args.len() {
+                    return Err(ProtocolError::WrongArity("ZREVRANGEBYLEX".into()));
+                }
+                offset = Some(parse_u64(&args[i + 1])? as usize);
+                count = Some(parse_u64(&args[i + 2])? as usize);
+                i += 2;
+            }
+            _ => {
+                return Err(ProtocolError::InvalidData(
+                    "unsupported ZREVRANGEBYLEX flag".into(),
+                ))
+            }
+        }
+        i += 1;
+    }
+    Ok(Command::ZRevRangeByLex {
+        key,
+        max,
+        min,
+        offset,
+        count,
+    })
+}
+
+fn parse_zrandmember(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("ZRANDMEMBER", args, 1)?;
+    let key = extract_bytes(&args[0])?;
+    if args.len() == 1 {
+        return Ok(Command::ZRandMember {
+            key,
+            count: None,
+            withscores: false,
+        });
+    }
+    let count = Some(parse_i64(&args[1])?);
+    let withscores = if args.len() >= 3 {
+        let flag = extract_string(&args[2])?.to_ascii_uppercase();
+        if flag != b"WITHSCORES" {
+            return Err(ProtocolError::InvalidData(
+                "ERR syntax error, WITHSCORES expected".into(),
+            ));
+        }
+        true
+    } else {
+        false
+    };
+    if args.len() > 3 {
+        return Err(ProtocolError::WrongArity("ZRANDMEMBER".into()));
+    }
+    Ok(Command::ZRandMember {
+        key,
+        count,
+        withscores,
+    })
+}
+
+fn parse_zscan(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("ZSCAN", args, 2)?;
+    let key = extract_bytes(&args[0])?;
+    let cursor = parse_u64(&args[1])?;
+    let mut pattern = None;
+    let mut count = None;
+    let mut i = 2;
+    while i < args.len() {
+        let flag = extract_string(&args[i])?.to_ascii_uppercase();
+        match flag.as_slice() {
+            b"MATCH" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtocolError::WrongArity("ZSCAN".into()));
+                }
+                pattern = Some(String::from_utf8_lossy(&extract_bytes(&args[i])?).into_owned());
+            }
+            b"COUNT" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtocolError::WrongArity("ZSCAN".into()));
+                }
+                count = Some(parse_u64(&args[i])? as usize);
+            }
+            _ => {
+                return Err(ProtocolError::InvalidData(format!(
+                    "unsupported ZSCAN option: {}",
+                    String::from_utf8_lossy(&flag)
+                )));
+            }
+        }
+        i += 1;
+    }
+    Ok(Command::ZScan {
+        key,
         cursor,
         pattern,
         count,
@@ -1171,6 +2568,440 @@ fn parse_xread(args: &[RespValue]) -> Result<Command, ProtocolError> {
     Ok(Command::XRead { keys, ids, count })
 }
 
+fn parse_bitcount(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("BITCOUNT", args, 1)?;
+    let key = extract_bytes(&args[0])?;
+    if args.len() == 1 {
+        return Ok(Command::BitCount {
+            key,
+            start: None,
+            end: None,
+            use_bit: false,
+        });
+    }
+    if args.len() < 3 {
+        return Err(ProtocolError::WrongArity("BITCOUNT".into()));
+    }
+    let start = Some(parse_i64(&args[1])?);
+    let end = Some(parse_i64(&args[2])?);
+    let use_bit = if args.len() >= 4 {
+        let mode = extract_string(&args[3])?.to_ascii_uppercase();
+        match mode.as_slice() {
+            b"BIT" => true,
+            b"BYTE" => false,
+            _ => {
+                return Err(ProtocolError::InvalidData(
+                    "ERR syntax error, BIT or BYTE expected".into(),
+                ))
+            }
+        }
+    } else {
+        false
+    };
+    Ok(Command::BitCount {
+        key,
+        start,
+        end,
+        use_bit,
+    })
+}
+
+fn parse_bitop(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("BITOP", args, 3)?;
+    let op_str = extract_string(&args[0])?.to_ascii_uppercase();
+    let operation = match op_str.as_slice() {
+        b"AND" => BitOperation::And,
+        b"OR" => BitOperation::Or,
+        b"XOR" => BitOperation::Xor,
+        b"NOT" => {
+            if args.len() != 3 {
+                return Err(ProtocolError::InvalidData(
+                    "ERR BITOP NOT requires one source key".into(),
+                ));
+            }
+            BitOperation::Not
+        }
+        _ => {
+            return Err(ProtocolError::InvalidData(
+                "ERR syntax error, AND|OR|XOR|NOT expected".into(),
+            ))
+        }
+    };
+    let destkey = extract_bytes(&args[1])?;
+    let keys = args[2..]
+        .iter()
+        .map(extract_bytes)
+        .collect::<Result<_, _>>()?;
+    Ok(Command::BitOp {
+        operation,
+        destkey,
+        keys,
+    })
+}
+
+fn parse_bitpos(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("BITPOS", args, 2)?;
+    let key = extract_bytes(&args[0])?;
+    let bit_val = parse_u64(&args[1])?;
+    if bit_val > 1 {
+        return Err(ProtocolError::InvalidData(
+            "ERR bit is not an integer or out of range".into(),
+        ));
+    }
+    let bit = bit_val as u8;
+    let mut start = None;
+    let mut end = None;
+    let mut use_bit = false;
+    if args.len() >= 3 {
+        start = Some(parse_i64(&args[2])?);
+    }
+    if args.len() >= 4 {
+        end = Some(parse_i64(&args[3])?);
+    }
+    if args.len() >= 5 {
+        let mode = extract_string(&args[4])?.to_ascii_uppercase();
+        match mode.as_slice() {
+            b"BIT" => use_bit = true,
+            b"BYTE" => use_bit = false,
+            _ => {
+                return Err(ProtocolError::InvalidData(
+                    "ERR syntax error, BIT or BYTE expected".into(),
+                ))
+            }
+        }
+    }
+    Ok(Command::BitPos {
+        key,
+        bit,
+        start,
+        end,
+        use_bit,
+    })
+}
+
+fn parse_bitfield(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("BITFIELD", args, 2)?;
+    let key = extract_bytes(&args[0])?;
+    let mut operations = Vec::new();
+    let mut i = 1usize;
+
+    while i < args.len() {
+        let subcmd = extract_string(&args[i])?.to_ascii_uppercase();
+        match subcmd.as_slice() {
+            b"GET" => {
+                if i + 2 >= args.len() {
+                    return Err(ProtocolError::WrongArity("BITFIELD".into()));
+                }
+                let encoding = parse_bitfield_encoding(&args[i + 1])?;
+                let offset = parse_bitfield_offset(&args[i + 2])?;
+                operations.push(BitFieldOperation::Get { encoding, offset });
+                i += 3;
+            }
+            b"SET" => {
+                if i + 3 >= args.len() {
+                    return Err(ProtocolError::WrongArity("BITFIELD".into()));
+                }
+                let encoding = parse_bitfield_encoding(&args[i + 1])?;
+                let offset = parse_bitfield_offset(&args[i + 2])?;
+                let value = parse_i64(&args[i + 3])?;
+                operations.push(BitFieldOperation::Set {
+                    encoding,
+                    offset,
+                    value,
+                });
+                i += 4;
+            }
+            b"INCRBY" => {
+                if i + 3 >= args.len() {
+                    return Err(ProtocolError::WrongArity("BITFIELD".into()));
+                }
+                let encoding = parse_bitfield_encoding(&args[i + 1])?;
+                let offset = parse_bitfield_offset(&args[i + 2])?;
+                let increment = parse_i64(&args[i + 3])?;
+                operations.push(BitFieldOperation::IncrBy {
+                    encoding,
+                    offset,
+                    increment,
+                });
+                i += 4;
+            }
+            b"OVERFLOW" => {
+                if i + 1 >= args.len() {
+                    return Err(ProtocolError::WrongArity("BITFIELD".into()));
+                }
+                let mode = extract_string(&args[i + 1])?.to_ascii_uppercase();
+                let overflow = match mode.as_slice() {
+                    b"WRAP" => BitFieldOverflow::Wrap,
+                    b"SAT" => BitFieldOverflow::Sat,
+                    b"FAIL" => BitFieldOverflow::Fail,
+                    _ => {
+                        return Err(ProtocolError::InvalidData(
+                            "ERR syntax error, WRAP|SAT|FAIL expected".into(),
+                        ))
+                    }
+                };
+                operations.push(BitFieldOperation::Overflow(overflow));
+                i += 2;
+            }
+            _ => return Err(ProtocolError::InvalidData("ERR syntax error".into())),
+        }
+    }
+
+    Ok(Command::BitField { key, operations })
+}
+
+fn parse_bitfield_encoding(arg: &RespValue) -> Result<BitFieldEncoding, ProtocolError> {
+    let spec = extract_string(arg)?;
+    if spec.len() < 2 {
+        return Err(ProtocolError::InvalidData(
+            "ERR invalid bitfield type".into(),
+        ));
+    }
+
+    let signed = match spec[0] {
+        b'i' | b'I' => true,
+        b'u' | b'U' => false,
+        _ => {
+            return Err(ProtocolError::InvalidData(
+                "ERR invalid bitfield type".into(),
+            ))
+        }
+    };
+
+    let bits = std::str::from_utf8(&spec[1..])
+        .ok()
+        .and_then(|s| s.parse::<u8>().ok())
+        .ok_or_else(|| ProtocolError::InvalidData("ERR invalid bitfield type".into()))?;
+
+    if bits == 0 || bits > 64 || (!signed && bits > 63) {
+        return Err(ProtocolError::InvalidData(
+            "ERR invalid bitfield type".into(),
+        ));
+    }
+
+    Ok(BitFieldEncoding { signed, bits })
+}
+
+fn parse_bitfield_offset(arg: &RespValue) -> Result<BitFieldOffset, ProtocolError> {
+    let data = extract_string(arg)?;
+    if data.is_empty() {
+        return Err(ProtocolError::InvalidData(
+            "ERR bit offset is not an integer or out of range".into(),
+        ));
+    }
+
+    if data[0] == b'#' {
+        if data.len() == 1 {
+            return Err(ProtocolError::InvalidData(
+                "ERR bit offset is not an integer or out of range".into(),
+            ));
+        }
+        let n = std::str::from_utf8(&data[1..])
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .ok_or_else(|| {
+                ProtocolError::InvalidData(
+                    "ERR bit offset is not an integer or out of range".into(),
+                )
+            })?;
+        if n < 0 {
+            return Err(ProtocolError::InvalidData(
+                "ERR bit offset is not an integer or out of range".into(),
+            ));
+        }
+        Ok(BitFieldOffset::Multiplied(n))
+    } else {
+        let n = std::str::from_utf8(&data)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .ok_or_else(|| {
+                ProtocolError::InvalidData(
+                    "ERR bit offset is not an integer or out of range".into(),
+                )
+            })?;
+        if n < 0 {
+            return Err(ProtocolError::InvalidData(
+                "ERR bit offset is not an integer or out of range".into(),
+            ));
+        }
+        Ok(BitFieldOffset::Absolute(n))
+    }
+}
+
+fn parse_geo_unit(val: &RespValue) -> Result<GeoUnit, ProtocolError> {
+    let unit_str = extract_string(val)?.to_ascii_lowercase();
+    match unit_str.as_slice() {
+        b"m" => Ok(GeoUnit::Meters),
+        b"km" => Ok(GeoUnit::Kilometers),
+        b"ft" => Ok(GeoUnit::Feet),
+        b"mi" => Ok(GeoUnit::Miles),
+        _ => Err(ProtocolError::InvalidData(
+            "ERR unsupported unit, m|km|ft|mi expected".into(),
+        )),
+    }
+}
+
+fn parse_geoadd(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("GEOADD", args, 4)?;
+    let key = extract_bytes(&args[0])?;
+    let mut nx = false;
+    let mut xx = false;
+    let mut ch = false;
+    let mut i = 1;
+
+    while i < args.len() {
+        let flag = extract_string(&args[i])?.to_ascii_uppercase();
+        match flag.as_slice() {
+            b"NX" => {
+                nx = true;
+                i += 1;
+            }
+            b"XX" => {
+                xx = true;
+                i += 1;
+            }
+            b"CH" => {
+                ch = true;
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+
+    let remaining = &args[i..];
+    if remaining.len() < 3 || remaining.len() % 3 != 0 {
+        return Err(ProtocolError::WrongArity("GEOADD".into()));
+    }
+
+    let members = remaining
+        .chunks(3)
+        .map(|chunk| {
+            let lon = parse_f64(&chunk[0])?;
+            let lat = parse_f64(&chunk[1])?;
+            let member = extract_bytes(&chunk[2])?;
+            Ok((lon, lat, member))
+        })
+        .collect::<Result<Vec<_>, ProtocolError>>()?;
+
+    Ok(Command::GeoAdd {
+        key,
+        nx,
+        xx,
+        ch,
+        members,
+    })
+}
+
+fn parse_geodist(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    if args.len() < 3 || args.len() > 4 {
+        return Err(ProtocolError::WrongArity("GEODIST".into()));
+    }
+    let unit = if args.len() == 4 {
+        parse_geo_unit(&args[3])?
+    } else {
+        GeoUnit::Meters
+    };
+    Ok(Command::GeoDist {
+        key: extract_bytes(&args[0])?,
+        member1: extract_bytes(&args[1])?,
+        member2: extract_bytes(&args[2])?,
+        unit,
+    })
+}
+
+fn parse_geosearch(args: &[RespValue]) -> Result<Command, ProtocolError> {
+    check_min_arity("GEOSEARCH", args, 4)?;
+    let key = extract_bytes(&args[0])?;
+
+    let mut from_member = None;
+    let mut from_lonlat = None;
+    let mut radius = None;
+    let mut unit = GeoUnit::Meters;
+    let mut asc = None;
+    let mut count = None;
+    let mut withcoord = false;
+    let mut withdist = false;
+    let mut withhash = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        let flag = extract_string(&args[i])?.to_ascii_uppercase();
+        match flag.as_slice() {
+            b"FROMMEMBER" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtocolError::WrongArity("GEOSEARCH".into()));
+                }
+                from_member = Some(extract_bytes(&args[i])?);
+            }
+            b"FROMLONLAT" => {
+                if i + 2 >= args.len() {
+                    return Err(ProtocolError::WrongArity("GEOSEARCH".into()));
+                }
+                let lon = parse_f64(&args[i + 1])?;
+                let lat = parse_f64(&args[i + 2])?;
+                from_lonlat = Some((lon, lat));
+                i += 2;
+            }
+            b"BYRADIUS" => {
+                if i + 2 >= args.len() {
+                    return Err(ProtocolError::WrongArity("GEOSEARCH".into()));
+                }
+                radius = Some(parse_f64(&args[i + 1])?);
+                unit = parse_geo_unit(&args[i + 2])?;
+                i += 2;
+            }
+            b"ASC" => asc = Some(true),
+            b"DESC" => asc = Some(false),
+            b"COUNT" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(ProtocolError::WrongArity("GEOSEARCH".into()));
+                }
+                count = Some(parse_u64(&args[i])? as usize);
+                if i + 1 < args.len() {
+                    if let Ok(next_flag) = extract_string(&args[i + 1]) {
+                        if next_flag.eq_ignore_ascii_case(b"ANY") {
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            b"WITHCOORD" => withcoord = true,
+            b"WITHDIST" => withdist = true,
+            b"WITHHASH" => withhash = true,
+            _ => {
+                return Err(ProtocolError::InvalidData(format!(
+                    "ERR unsupported GEOSEARCH option: {}",
+                    String::from_utf8_lossy(&flag)
+                )))
+            }
+        }
+        i += 1;
+    }
+
+    if from_member.is_none() && from_lonlat.is_none() {
+        return Err(ProtocolError::InvalidData(
+            "ERR FROMMEMBER or FROMLONLAT required".into(),
+        ));
+    }
+    let radius =
+        radius.ok_or_else(|| ProtocolError::InvalidData("ERR BYRADIUS required".into()))?;
+
+    Ok(Command::GeoSearch {
+        key,
+        from_member,
+        from_lonlat,
+        radius,
+        unit,
+        asc,
+        count,
+        withcoord,
+        withdist,
+        withhash,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1408,7 +3239,30 @@ mod tests {
     #[test]
     fn test_parse_command_info() {
         let cmd = parse_command(make_cmd(&[b"COMMAND"])).unwrap();
-        assert!(matches!(cmd, Command::CommandInfo));
+        assert!(matches!(cmd, Command::CommandInfo { names } if names.is_empty()));
+    }
+
+    #[test]
+    fn test_parse_command_subcommands() {
+        let cmd = parse_command(make_cmd(&[b"COMMAND", b"LIST"])).unwrap();
+        assert!(matches!(cmd, Command::CommandList));
+
+        let cmd = parse_command(make_cmd(&[b"COMMAND", b"INFO", b"GET", b"SET"])).unwrap();
+        assert!(
+            matches!(cmd, Command::CommandInfo { names } if names == vec![b"GET".to_vec(), b"SET".to_vec()])
+        );
+
+        let cmd = parse_command(make_cmd(&[b"COMMAND", b"DOCS", b"GET"])).unwrap();
+        assert!(matches!(cmd, Command::CommandDocs { names } if names == vec![b"GET".to_vec()]));
+
+        let cmd = parse_command(make_cmd(&[b"COMMAND", b"HELP"])).unwrap();
+        assert!(matches!(cmd, Command::CommandHelp));
+    }
+
+    #[test]
+    fn test_parse_command_unknown_subcommand() {
+        let err = parse_command(make_cmd(&[b"COMMAND", b"BOGUS"])).unwrap_err();
+        assert!(matches!(err, ProtocolError::InvalidData(_)));
     }
 
     #[test]
@@ -1430,8 +3284,26 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_object_refcount() {
+        let cmd = parse_command(make_cmd(&[b"OBJECT", b"REFCOUNT", b"mykey"])).unwrap();
+        assert!(matches!(cmd, Command::ObjectRefCount { key } if key == b"mykey"));
+    }
+
+    #[test]
+    fn test_parse_object_idletime() {
+        let cmd = parse_command(make_cmd(&[b"OBJECT", b"IDLETIME", b"mykey"])).unwrap();
+        assert!(matches!(cmd, Command::ObjectIdleTime { key } if key == b"mykey"));
+    }
+
+    #[test]
+    fn test_parse_object_help() {
+        let cmd = parse_command(make_cmd(&[b"OBJECT", b"HELP"])).unwrap();
+        assert!(matches!(cmd, Command::ObjectHelp));
+    }
+
+    #[test]
     fn test_parse_object_unknown_subcmd() {
-        let result = parse_command(make_cmd(&[b"OBJECT", b"HELP", b"mykey"]));
+        let result = parse_command(make_cmd(&[b"OBJECT", b"BADCMD", b"mykey"]));
         assert!(matches!(result, Err(ProtocolError::InvalidData(_))));
     }
 
@@ -1491,6 +3363,88 @@ mod tests {
             }
             other => panic!("Expected ZCount, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_parse_bitfield_get_set_incrby() {
+        let cmd = parse_command(make_cmd(&[
+            b"BITFIELD",
+            b"bits",
+            b"GET",
+            b"u8",
+            b"0",
+            b"SET",
+            b"i5",
+            b"#1",
+            b"3",
+            b"INCRBY",
+            b"u4",
+            b"8",
+            b"2",
+            b"OVERFLOW",
+            b"SAT",
+            b"INCRBY",
+            b"u4",
+            b"8",
+            b"100",
+        ]))
+        .unwrap();
+
+        match cmd {
+            Command::BitField { key, operations } => {
+                assert_eq!(key, b"bits");
+                assert_eq!(operations.len(), 5);
+                assert!(matches!(
+                    operations[0],
+                    BitFieldOperation::Get {
+                        encoding: BitFieldEncoding {
+                            signed: false,
+                            bits: 8
+                        },
+                        offset: BitFieldOffset::Absolute(0)
+                    }
+                ));
+                assert!(matches!(
+                    operations[1],
+                    BitFieldOperation::Set {
+                        encoding: BitFieldEncoding {
+                            signed: true,
+                            bits: 5
+                        },
+                        offset: BitFieldOffset::Multiplied(1),
+                        value: 3
+                    }
+                ));
+                assert!(matches!(
+                    operations[2],
+                    BitFieldOperation::IncrBy {
+                        encoding: BitFieldEncoding {
+                            signed: false,
+                            bits: 4
+                        },
+                        offset: BitFieldOffset::Absolute(8),
+                        increment: 2
+                    }
+                ));
+                assert!(matches!(
+                    operations[3],
+                    BitFieldOperation::Overflow(BitFieldOverflow::Sat)
+                ));
+            }
+            other => panic!("Expected BitField, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_bitfield_invalid_type() {
+        let result = parse_command(make_cmd(&[b"BITFIELD", b"bits", b"GET", b"u0", b"0"]));
+        assert!(matches!(result, Err(ProtocolError::InvalidData(_))));
+    }
+
+    #[test]
+    fn test_parse_bitfield_negative_offset() {
+        let result = parse_command(make_cmd(&[b"BITFIELD", b"bits", b"GET", b"u8", b"-1"]));
+        assert!(matches!(result, Err(ProtocolError::InvalidData(_))));
     }
 
     #[test]

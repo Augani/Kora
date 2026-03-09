@@ -9,7 +9,10 @@ use ahash::AHashSet;
 use bytes::BytesMut;
 use kora_cdc::consumer::ConsumerGroupManager;
 use kora_cdc::ring::CdcRing;
-use kora_core::command::{Command, CommandResponse};
+use kora_core::command::{
+    command_docs_response, command_help_response, command_info_response, command_list_response,
+    supported_command_count, Command, CommandResponse,
+};
 use kora_core::shard::{ShardStore, WalRecord, WalWriter};
 use kora_core::tenant::TenantId;
 use kora_protocol::{parse_command, serialize_response_versioned, HotCommandRef, RespParser};
@@ -45,6 +48,10 @@ struct ConnState {
     pattern_count: usize,
     subscribed_channels: AHashSet<Vec<u8>>,
     subscribed_patterns: AHashSet<Vec<u8>>,
+    in_multi: bool,
+    multi_queue: Vec<Command>,
+    client_name: Option<Vec<u8>>,
+    quit_requested: bool,
 }
 
 type PendingForeignBatch = Vec<(usize, Command)>;
@@ -70,54 +77,68 @@ fn internal_shard_error() -> CommandResponse {
     CommandResponse::Error("ERR internal error".into())
 }
 
-async fn resolve_response_slots(
-    mut responses: Vec<Option<CommandResponse>>,
+async fn handle_wait_command(numreplicas: i64, timeout: i64) -> CommandResponse {
+    if timeout < 0 {
+        return CommandResponse::Error("ERR timeout is negative".into());
+    }
+
+    if numreplicas <= 0 {
+        return CommandResponse::Integer(0);
+    }
+
+    if timeout == 0 {
+        std::future::pending::<()>().await;
+        unreachable!("pending future should never resolve");
+    }
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(timeout as u64)).await;
+    CommandResponse::Integer(0)
+}
+
+async fn resolve_response_slots_in_place(
+    responses: &mut [Option<CommandResponse>],
     batch_receiver: &mut BatchedResponseReceiver,
     metrics: &BatchStageMetrics,
+    track_stages: bool,
     flush_id: u64,
     expected_batches: usize,
-) -> Vec<CommandResponse> {
-    if expected_batches > 0 {
-        let deadline = tokio::time::Instant::now() + CROSS_SHARD_TIMEOUT;
-        let mut received_batches = 0usize;
+) {
+    let deadline = tokio::time::Instant::now() + CROSS_SHARD_TIMEOUT;
+    let mut received_batches = 0usize;
 
-        while received_batches < expected_batches {
-            let now = tokio::time::Instant::now();
-            let Some(remaining) = deadline.checked_duration_since(now) else {
-                break;
-            };
+    while received_batches < expected_batches {
+        let now = tokio::time::Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            break;
+        };
 
-            match tokio::time::timeout(remaining, batch_receiver.recv()).await {
-                Ok(Some((response_flush_id, sent_at, batch))) => {
+        match tokio::time::timeout(remaining, batch_receiver.recv()).await {
+            Ok(Some((response_flush_id, sent_at, batch))) => {
+                if track_stages {
                     metrics.record(
                         BatchStage::RemoteDelivery,
                         sent_at.elapsed().as_nanos() as u64,
                     );
-                    if response_flush_id != flush_id {
-                        continue;
-                    }
-                    for (index, resp) in batch {
-                        responses[index] = Some(resp);
-                    }
-                    received_batches += 1;
                 }
-                Ok(None) | Err(_) => break,
-            }
-        }
-
-        if received_batches != expected_batches {
-            for resp in &mut responses {
-                if resp.is_none() {
-                    *resp = Some(internal_shard_error());
+                if response_flush_id != flush_id {
+                    continue;
                 }
+                for (index, resp) in batch {
+                    responses[index] = Some(resp);
+                }
+                received_batches += 1;
             }
+            Ok(None) | Err(_) => break,
         }
     }
 
-    responses
-        .into_iter()
-        .map(|resp| resp.unwrap_or_else(internal_shard_error))
-        .collect()
+    if received_batches != expected_batches {
+        for resp in responses.iter_mut() {
+            if resp.is_none() {
+                *resp = Some(internal_shard_error());
+            }
+        }
+    }
 }
 
 pub(crate) async fn handle_connection_affinity<S: AsyncReadExt + AsyncWriteExt + Unpin>(
@@ -143,6 +164,10 @@ pub(crate) async fn handle_connection_affinity<S: AsyncReadExt + AsyncWriteExt +
         pattern_count: 0,
         subscribed_channels: AHashSet::new(),
         subscribed_patterns: AHashSet::new(),
+        in_multi: false,
+        multi_queue: Vec::new(),
+        client_name: None,
+        quit_requested: false,
     };
 
     let result = handle_stream_loop(
@@ -179,6 +204,9 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 ) -> std::io::Result<()> {
     let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
     let mut next_flush_id = 1u64;
+    let mut responses: Vec<Option<CommandResponse>> = Vec::with_capacity(16);
+    let mut pending_foreign_batches: Vec<PendingForeignBatch> =
+        vec![Vec::new(); router.shard_count()];
 
     loop {
         let in_pubsub_mode = conn.subscription_count > 0 || conn.pattern_count > 0;
@@ -243,31 +271,31 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                 return Ok(());
             }
             parser.feed(&read_buf[..n]);
-            let batch_start = Instant::now();
+            let track_stages = shared.batch_stage_metrics.is_enabled();
+            let batch_start = maybe_now(track_stages);
 
-            let mut responses: Vec<Option<CommandResponse>> = Vec::with_capacity(16);
-            let mut pending_foreign_batches: Vec<PendingForeignBatch> =
-                vec![Vec::new(); router.shard_count()];
             let mut processed_batch = false;
             let mut stage_durations = BatchLoopDurations::default();
 
             loop {
-                if parser
-                    .try_parse_hot_command_with(|hot_cmd| {
-                        process_hot_command(
-                            hot_cmd,
-                            conn.shard_id,
-                            store,
-                            wal_writer,
-                            router,
-                            shared,
-                            conn,
-                            &mut responses,
-                            &mut pending_foreign_batches,
-                            &mut stage_durations,
-                        );
-                    })
-                    .is_some()
+                if !conn.in_multi
+                    && parser
+                        .try_parse_hot_command_with(|hot_cmd| {
+                            process_hot_command(
+                                hot_cmd,
+                                conn.shard_id,
+                                store,
+                                wal_writer,
+                                router,
+                                shared,
+                                conn,
+                                &mut responses,
+                                &mut pending_foreign_batches,
+                                &mut stage_durations,
+                                track_stages,
+                            );
+                        })
+                        .is_some()
                 {
                     processed_batch = true;
                     continue;
@@ -277,6 +305,35 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                     Ok(Some(frame)) => match parse_command(frame) {
                         Ok(cmd) => {
                             processed_batch = true;
+                            if let Some(resp) = try_handle_connection_command(
+                                &cmd,
+                                conn,
+                                shared,
+                                store,
+                                wal_writer,
+                                router,
+                                &mut responses,
+                                &mut pending_foreign_batches,
+                                &batch_tx,
+                                &mut batch_rx,
+                                &mut next_flush_id,
+                                write_buf,
+                                &mut stage_durations,
+                                track_stages,
+                            )
+                            .await
+                            {
+                                push_ready_response(&mut responses, resp);
+                                continue;
+                            }
+                            if conn.in_multi {
+                                conn.multi_queue.push(cmd);
+                                push_ready_response(
+                                    &mut responses,
+                                    CommandResponse::SimpleString("QUEUED".into()),
+                                );
+                                continue;
+                            }
                             if handle_pubsub_command(&cmd, shared, conn, write_buf) {
                                 continue;
                             }
@@ -284,6 +341,7 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                                 let flush_durations = flush_pending_responses(
                                     router,
                                     &shared.batch_stage_metrics,
+                                    track_stages,
                                     &mut pending_foreign_batches,
                                     &mut responses,
                                     &batch_tx,
@@ -300,7 +358,7 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                                     .serialize_ns
                                     .saturating_add(flush_durations.serialize_ns);
 
-                                let execute_start = Instant::now();
+                                let execute_start = maybe_now(track_stages);
                                 let resp = dispatch::handle_complex_command(
                                     cmd,
                                     conn.shard_id,
@@ -309,9 +367,7 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                                     router,
                                 )
                                 .await;
-                                stage_durations.execute_ns = stage_durations
-                                    .execute_ns
-                                    .saturating_add(execute_start.elapsed().as_nanos() as u64);
+                                maybe_elapsed(execute_start, &mut stage_durations.execute_ns);
                                 push_ready_response(&mut responses, resp);
                             } else {
                                 process_simple_command(
@@ -325,6 +381,7 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                                     &mut responses,
                                     &mut pending_foreign_batches,
                                     &mut stage_durations,
+                                    track_stages,
                                 );
                             }
                         }
@@ -348,6 +405,7 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             let flush_durations = flush_pending_responses(
                 router,
                 &shared.batch_stage_metrics,
+                track_stages,
                 &mut pending_foreign_batches,
                 &mut responses,
                 &batch_tx,
@@ -369,8 +427,9 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             // sockets do not starve forwarded-shard work or accept handling.
             should_yield_after_batch = processed_batch;
 
-            if processed_batch {
-                let batch_total_ns = batch_start.elapsed().as_nanos() as u64;
+            if processed_batch && track_stages {
+                let batch_total_ns =
+                    batch_start.map_or(0, |t: Instant| t.elapsed().as_nanos() as u64);
                 let accounted_ns = stage_durations
                     .route_ns
                     .saturating_add(stage_durations.execute_ns)
@@ -386,18 +445,325 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         }
 
         if !write_buf.is_empty() {
-            let write_start = Instant::now();
+            let write_start = maybe_now(shared.batch_stage_metrics.is_enabled());
             stream.write_all(write_buf).await?;
-            shared.batch_stage_metrics.record(
-                BatchStage::SocketWrite,
-                write_start.elapsed().as_nanos() as u64,
-            );
+            if let Some(t) = write_start {
+                shared
+                    .batch_stage_metrics
+                    .record(BatchStage::SocketWrite, t.elapsed().as_nanos() as u64);
+            }
             write_buf.clear();
+        }
+
+        if conn.quit_requested {
+            return Ok(());
         }
 
         if should_yield_after_batch {
             tokio::task::yield_now().await;
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn try_handle_connection_command(
+    cmd: &Command,
+    conn: &mut ConnState,
+    shared: &Arc<AffinitySharedState>,
+    store: &Rc<RefCell<ShardStore>>,
+    wal_writer: &Rc<RefCell<Option<Box<dyn WalWriter>>>>,
+    router: &ShardRouter,
+    responses: &mut Vec<Option<CommandResponse>>,
+    pending_foreign_batches: &mut [PendingForeignBatch],
+    batch_tx: &BatchedResponseSender,
+    batch_rx: &mut BatchedResponseReceiver,
+    next_flush_id: &mut u64,
+    write_buf: &mut BytesMut,
+    stage_durations: &mut BatchLoopDurations,
+    track_stages: bool,
+) -> Option<CommandResponse> {
+    match cmd {
+        Command::Multi => {
+            if conn.in_multi {
+                return Some(CommandResponse::Error(
+                    "ERR MULTI calls can not be nested".into(),
+                ));
+            }
+            conn.in_multi = true;
+            conn.multi_queue.clear();
+            Some(CommandResponse::Ok)
+        }
+        Command::Exec => {
+            if !conn.in_multi {
+                return Some(CommandResponse::Error("ERR EXEC without MULTI".into()));
+            }
+            conn.in_multi = false;
+            let queued = mem::take(&mut conn.multi_queue);
+            let flush_durations = flush_pending_responses(
+                router,
+                &shared.batch_stage_metrics,
+                track_stages,
+                pending_foreign_batches,
+                responses,
+                batch_tx,
+                batch_rx,
+                next_flush_id,
+                write_buf,
+                conn.resp3,
+            )
+            .await;
+            stage_durations.foreign_wait_ns = stage_durations
+                .foreign_wait_ns
+                .saturating_add(flush_durations.foreign_wait_ns);
+            stage_durations.serialize_ns = stage_durations
+                .serialize_ns
+                .saturating_add(flush_durations.serialize_ns);
+
+            let mut exec_results = Vec::with_capacity(queued.len());
+            for queued_cmd in queued {
+                let resp = execute_single_command(
+                    queued_cmd,
+                    conn.shard_id,
+                    store,
+                    wal_writer,
+                    router,
+                    shared,
+                    conn,
+                )
+                .await;
+                exec_results.push(resp);
+            }
+            Some(CommandResponse::Array(exec_results))
+        }
+        Command::Discard => {
+            if !conn.in_multi {
+                return Some(CommandResponse::Error("ERR DISCARD without MULTI".into()));
+            }
+            conn.in_multi = false;
+            conn.multi_queue.clear();
+            Some(CommandResponse::Ok)
+        }
+        Command::Watch { .. } => {
+            if conn.in_multi {
+                return Some(CommandResponse::Error(
+                    "ERR WATCH inside MULTI is not allowed".into(),
+                ));
+            }
+            Some(CommandResponse::Ok)
+        }
+        Command::Unwatch => Some(CommandResponse::Ok),
+        Command::Quit => {
+            conn.quit_requested = true;
+            Some(CommandResponse::Ok)
+        }
+        Command::ClientId => Some(CommandResponse::Integer(conn.conn_id as i64)),
+        Command::ClientGetName => match &conn.client_name {
+            Some(name) => Some(CommandResponse::BulkString(name.clone())),
+            None => Some(CommandResponse::Nil),
+        },
+        Command::ClientSetName { name } => {
+            conn.client_name = Some(name.clone());
+            Some(CommandResponse::Ok)
+        }
+        Command::ClientList | Command::ClientInfo => {
+            let name_str = conn
+                .client_name
+                .as_ref()
+                .map(|n| String::from_utf8_lossy(n).into_owned())
+                .unwrap_or_default();
+            let info = format!(
+                "id={} fd=0 name={} db=0 flags=N\r\n",
+                conn.conn_id, name_str
+            );
+            Some(CommandResponse::BulkString(info.into_bytes()))
+        }
+        Command::Select { db } => {
+            if *db < 0 {
+                Some(CommandResponse::Error(
+                    "ERR DB index is out of range".into(),
+                ))
+            } else if *db == 0 {
+                Some(CommandResponse::Ok)
+            } else {
+                Some(CommandResponse::Error(
+                    "ERR SELECT is not allowed in cluster mode".into(),
+                ))
+            }
+        }
+        Command::Time => {
+            use std::time::SystemTime;
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
+            let secs = now.as_secs();
+            let micros = now.subsec_micros() as u64;
+            Some(CommandResponse::Array(vec![
+                CommandResponse::BulkString(secs.to_string().into_bytes()),
+                CommandResponse::BulkString(micros.to_string().into_bytes()),
+            ]))
+        }
+        Command::Wait {
+            numreplicas,
+            timeout,
+        } => Some(handle_wait_command(*numreplicas, *timeout).await),
+        Command::CommandInfo { names } => Some(command_info_response(names)),
+        Command::CommandCount => Some(CommandResponse::Integer(supported_command_count())),
+        Command::CommandList => Some(command_list_response()),
+        Command::CommandHelp => Some(command_help_response()),
+        Command::CommandDocs { names } => Some(command_docs_response(names)),
+        Command::ConfigGet { pattern } => Some(handle_config_get(pattern, shared)),
+        Command::ConfigSet { parameter, value } => Some(handle_config_set(parameter, value)),
+        Command::ConfigResetStat => Some(CommandResponse::Ok),
+        cmd if is_blocking_command(cmd) => {
+            let flush_durations = flush_pending_responses(
+                router,
+                &shared.batch_stage_metrics,
+                track_stages,
+                pending_foreign_batches,
+                responses,
+                batch_tx,
+                batch_rx,
+                next_flush_id,
+                write_buf,
+                conn.resp3,
+            )
+            .await;
+            stage_durations.foreign_wait_ns = stage_durations
+                .foreign_wait_ns
+                .saturating_add(flush_durations.foreign_wait_ns);
+            stage_durations.serialize_ns = stage_durations
+                .serialize_ns
+                .saturating_add(flush_durations.serialize_ns);
+
+            let timeout_secs = blocking_timeout(cmd);
+            let resp = if is_complex_command(cmd) {
+                dispatch::handle_complex_command(
+                    cmd.clone(),
+                    conn.shard_id,
+                    store,
+                    wal_writer,
+                    router,
+                )
+                .await
+            } else {
+                execute_with_wal_inline(store, wal_writer, cmd.clone())
+            };
+
+            if !matches!(resp, CommandResponse::Nil) || timeout_secs <= 0.0 {
+                return Some(resp);
+            }
+
+            let deadline =
+                tokio::time::Instant::now() + tokio::time::Duration::from_secs_f64(timeout_secs);
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                if tokio::time::Instant::now() >= deadline {
+                    return Some(CommandResponse::Nil);
+                }
+                let retry_resp = if is_complex_command(cmd) {
+                    dispatch::handle_complex_command(
+                        cmd.clone(),
+                        conn.shard_id,
+                        store,
+                        wal_writer,
+                        router,
+                    )
+                    .await
+                } else {
+                    execute_with_wal_inline(store, wal_writer, cmd.clone())
+                };
+                if !matches!(retry_resp, CommandResponse::Nil) {
+                    return Some(retry_resp);
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+async fn execute_single_command(
+    cmd: Command,
+    shard_id: u16,
+    store: &Rc<RefCell<ShardStore>>,
+    wal_writer: &Rc<RefCell<Option<Box<dyn WalWriter>>>>,
+    router: &ShardRouter,
+    shared: &Arc<AffinitySharedState>,
+    conn: &mut ConnState,
+) -> CommandResponse {
+    if let Command::Wait {
+        numreplicas,
+        timeout,
+    } = &cmd
+    {
+        return handle_wait_command(*numreplicas, *timeout).await;
+    }
+
+    if let Some(resp) = try_handle_local_affinity(&cmd, shared, conn) {
+        return resp;
+    }
+
+    if is_complex_command(&cmd) {
+        return dispatch::handle_complex_command(cmd, shard_id, store, wal_writer, router).await;
+    }
+
+    if let Some(key) = cmd.key() {
+        let target_shard = router.shard_for_key(key);
+        if target_shard == shard_id {
+            execute_with_wal_inline(store, wal_writer, cmd)
+        } else {
+            match router.try_dispatch_foreign(target_shard, cmd) {
+                Ok(rx) => match tokio::time::timeout(CROSS_SHARD_TIMEOUT, rx).await {
+                    Ok(Ok(resp)) => resp,
+                    _ => internal_shard_error(),
+                },
+                Err(resp) => resp,
+            }
+        }
+    } else {
+        store.borrow_mut().execute(cmd)
+    }
+}
+
+fn handle_config_get(pattern: &str, _shared: &Arc<AffinitySharedState>) -> CommandResponse {
+    let pat = pattern.to_ascii_lowercase();
+    let mut result = Vec::new();
+
+    let matches_pattern = |name: &str| -> bool {
+        if pat == "*" {
+            return true;
+        }
+        if pat.contains('*') {
+            let prefix = pat.trim_end_matches('*');
+            return name.starts_with(prefix);
+        }
+        name == pat
+    };
+
+    if matches_pattern("bind") {
+        result.push(CommandResponse::BulkString(b"bind".to_vec()));
+        result.push(CommandResponse::BulkString(b"127.0.0.1".to_vec()));
+    }
+    if matches_pattern("maxmemory") {
+        result.push(CommandResponse::BulkString(b"maxmemory".to_vec()));
+        result.push(CommandResponse::BulkString(b"0".to_vec()));
+    }
+    if matches_pattern("save") {
+        result.push(CommandResponse::BulkString(b"save".to_vec()));
+        result.push(CommandResponse::BulkString(b"".to_vec()));
+    }
+    if matches_pattern("dir") {
+        result.push(CommandResponse::BulkString(b"dir".to_vec()));
+        result.push(CommandResponse::BulkString(b".".to_vec()));
+    }
+
+    CommandResponse::Array(result)
+}
+
+fn handle_config_set(parameter: &str, _value: &str) -> CommandResponse {
+    let param_lower = parameter.to_ascii_lowercase();
+    match param_lower.as_str() {
+        "maxmemory" => CommandResponse::Ok,
+        _ => CommandResponse::Error(format!("ERR Unsupported CONFIG parameter: {}", parameter)),
     }
 }
 
@@ -414,7 +780,36 @@ fn is_complex_command(cmd: &Command) -> bool {
                 | Command::VecQuery { .. }
                 | Command::StatsHotkeys { .. }
                 | Command::StatsMemory { .. }
+                | Command::RandomKey
+                | Command::RPopLPush { .. }
+                | Command::LMove { .. }
+                | Command::SMove { .. }
+                | Command::PfMerge { .. }
+                | Command::BitOp { .. }
+                | Command::BLMove { .. }
         )
+}
+
+fn is_blocking_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::BLPop { .. }
+            | Command::BRPop { .. }
+            | Command::BLMove { .. }
+            | Command::BZPopMin { .. }
+            | Command::BZPopMax { .. }
+    )
+}
+
+fn blocking_timeout(cmd: &Command) -> f64 {
+    match cmd {
+        Command::BLPop { timeout, .. }
+        | Command::BRPop { timeout, .. }
+        | Command::BLMove { timeout, .. }
+        | Command::BZPopMin { timeout, .. }
+        | Command::BZPopMax { timeout, .. } => *timeout,
+        _ => 0.0,
+    }
 }
 
 fn push_ready_response(responses: &mut Vec<Option<CommandResponse>>, resp: CommandResponse) {
@@ -432,10 +827,35 @@ fn queue_foreign_command(
     pending_foreign_batches[target_shard as usize].push((slot_index, cmd));
 }
 
-fn append_wal_record(wal_writer: &Rc<RefCell<Option<Box<dyn WalWriter>>>>, record: WalRecord) {
+fn append_wal_set(
+    wal_writer: &Rc<RefCell<Option<Box<dyn WalWriter>>>>,
+    key: &[u8],
+    value: &[u8],
+    ttl_ms: Option<u64>,
+) {
     let mut wal = wal_writer.borrow_mut();
     if let Some(ref mut writer) = *wal {
-        writer.append(&record);
+        writer.append(&WalRecord::Set {
+            key: key.to_vec(),
+            value: value.to_vec(),
+            ttl_ms,
+        });
+    }
+}
+
+#[inline(always)]
+fn maybe_now(track: bool) -> Option<Instant> {
+    if track {
+        Some(Instant::now())
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+fn maybe_elapsed(start: Option<Instant>, acc: &mut u64) {
+    if let Some(t) = start {
+        *acc = (*acc).saturating_add(t.elapsed().as_nanos() as u64);
     }
 }
 
@@ -473,10 +893,31 @@ fn flush_pending_foreign_batches(
     expected_batches
 }
 
+fn take_single_foreign_command(
+    pending_foreign_batches: &mut [PendingForeignBatch],
+) -> Option<(u16, usize, Command)> {
+    let mut target: Option<usize> = None;
+
+    for (idx, commands) in pending_foreign_batches.iter().enumerate() {
+        if commands.is_empty() {
+            continue;
+        }
+        if commands.len() != 1 || target.is_some() {
+            return None;
+        }
+        target = Some(idx);
+    }
+
+    let target_idx = target?;
+    let (slot_idx, cmd) = pending_foreign_batches[target_idx].pop()?;
+    Some((target_idx as u16, slot_idx, cmd))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn flush_pending_responses(
     router: &ShardRouter,
     metrics: &BatchStageMetrics,
+    track_stages: bool,
     pending_foreign_batches: &mut [PendingForeignBatch],
     responses: &mut Vec<Option<CommandResponse>>,
     batch_tx: &BatchedResponseSender,
@@ -489,6 +930,42 @@ async fn flush_pending_responses(
         return FlushDurations::default();
     }
 
+    // Fast path only for true single-command flushes so pipelined batches
+    // keep using the shard-batched stream path.
+    if responses.len() == 1 && responses[0].is_none() {
+        if let Some((target_shard, slot_idx, cmd)) =
+            take_single_foreign_command(pending_foreign_batches)
+        {
+            let mut durations = FlushDurations::default();
+
+            let foreign_wait_start = maybe_now(track_stages);
+            let resp = match router.try_dispatch_foreign(target_shard, cmd) {
+                Ok(rx) => match tokio::time::timeout(CROSS_SHARD_TIMEOUT, rx).await {
+                    Ok(Ok(resp)) => resp,
+                    _ => internal_shard_error(),
+                },
+                Err(resp) => resp,
+            };
+            responses[slot_idx] = Some(resp);
+            maybe_elapsed(foreign_wait_start, &mut durations.foreign_wait_ns);
+            if track_stages && durations.foreign_wait_ns > 0 {
+                metrics.record(BatchStage::RemoteDelivery, durations.foreign_wait_ns);
+            }
+
+            let serialize_start = maybe_now(track_stages);
+            for resp in responses.drain(..) {
+                serialize_response_versioned(
+                    &resp.unwrap_or_else(internal_shard_error),
+                    write_buf,
+                    resp3,
+                );
+            }
+            maybe_elapsed(serialize_start, &mut durations.serialize_ns);
+
+            return durations;
+        }
+    }
+
     let flush_id = *next_flush_id;
     *next_flush_id = (*next_flush_id).wrapping_add(1);
     let expected_batches = flush_pending_foreign_batches(
@@ -499,27 +976,28 @@ async fn flush_pending_responses(
         responses,
     );
 
-    let foreign_wait_start = Instant::now();
-    let resolved = resolve_response_slots(
-        mem::take(responses),
-        batch_rx,
-        metrics,
-        flush_id,
-        expected_batches,
-    )
-    .await;
-    let foreign_wait_ns = foreign_wait_start.elapsed().as_nanos() as u64;
-
-    let serialize_start = Instant::now();
-    for resp in resolved {
-        serialize_response_versioned(&resp, write_buf, resp3);
+    let foreign_wait_start = maybe_now(track_stages);
+    if expected_batches > 0 {
+        resolve_response_slots_in_place(
+            responses,
+            batch_rx,
+            metrics,
+            track_stages,
+            flush_id,
+            expected_batches,
+        )
+        .await;
     }
-    let serialize_ns = serialize_start.elapsed().as_nanos() as u64;
+    let mut durations = FlushDurations::default();
+    maybe_elapsed(foreign_wait_start, &mut durations.foreign_wait_ns);
 
-    FlushDurations {
-        foreign_wait_ns,
-        serialize_ns,
+    let serialize_start = maybe_now(track_stages);
+    for resp in responses.drain(..) {
+        serialize_response_versioned(&resp.unwrap_or_else(internal_shard_error), write_buf, resp3);
     }
+    maybe_elapsed(serialize_start, &mut durations.serialize_ns);
+
+    durations
 }
 
 fn authorize_hot_dispatch(
@@ -550,6 +1028,7 @@ fn process_simple_command(
     responses: &mut Vec<Option<CommandResponse>>,
     pending_foreign_batches: &mut [PendingForeignBatch],
     stage_durations: &mut BatchLoopDurations,
+    track_stages: bool,
 ) {
     if let Some(resp) = try_handle_local_affinity(&cmd, shared, conn) {
         push_ready_response(responses, resp);
@@ -564,27 +1043,21 @@ fn process_simple_command(
     }
 
     if let Some(key) = cmd.key() {
-        let route_start = Instant::now();
+        let route_start = maybe_now(track_stages);
         let target_shard = router.shard_for_key(key);
-        stage_durations.route_ns = stage_durations
-            .route_ns
-            .saturating_add(route_start.elapsed().as_nanos() as u64);
+        maybe_elapsed(route_start, &mut stage_durations.route_ns);
         if target_shard == shard_id {
-            let execute_start = Instant::now();
+            let execute_start = maybe_now(track_stages);
             let resp = execute_with_wal_inline(store, wal_writer, cmd);
-            stage_durations.execute_ns = stage_durations
-                .execute_ns
-                .saturating_add(execute_start.elapsed().as_nanos() as u64);
+            maybe_elapsed(execute_start, &mut stage_durations.execute_ns);
             push_ready_response(responses, resp);
         } else {
             queue_foreign_command(target_shard, cmd, responses, pending_foreign_batches);
         }
     } else {
-        let execute_start = Instant::now();
+        let execute_start = maybe_now(track_stages);
         let resp = store.borrow_mut().execute(cmd);
-        stage_durations.execute_ns = stage_durations
-            .execute_ns
-            .saturating_add(execute_start.elapsed().as_nanos() as u64);
+        maybe_elapsed(execute_start, &mut stage_durations.execute_ns);
         push_ready_response(responses, resp);
     }
 }
@@ -601,6 +1074,7 @@ fn process_hot_command(
     responses: &mut Vec<Option<CommandResponse>>,
     pending_foreign_batches: &mut [PendingForeignBatch],
     stage_durations: &mut BatchLoopDurations,
+    track_stages: bool,
 ) {
     match hot_cmd {
         HotCommandRef::Publish { channel, message } => {
@@ -614,17 +1088,13 @@ fn process_hot_command(
                     return;
                 }
             }
-            let route_start = Instant::now();
+            let route_start = maybe_now(track_stages);
             let target = router.shard_for_key(key);
-            stage_durations.route_ns = stage_durations
-                .route_ns
-                .saturating_add(route_start.elapsed().as_nanos() as u64);
+            maybe_elapsed(route_start, &mut stage_durations.route_ns);
             if target == shard_id {
-                let execute_start = Instant::now();
+                let execute_start = maybe_now(track_stages);
                 let resp = store.borrow_mut().get_bytes(key);
-                stage_durations.execute_ns = stage_durations
-                    .execute_ns
-                    .saturating_add(execute_start.elapsed().as_nanos() as u64);
+                maybe_elapsed(execute_start, &mut stage_durations.execute_ns);
                 push_ready_response(responses, resp);
             } else {
                 queue_foreign_command(
@@ -642,27 +1112,16 @@ fn process_hot_command(
                     return;
                 }
             }
-            let route_start = Instant::now();
+            let route_start = maybe_now(track_stages);
             let target = router.shard_for_key(key);
-            stage_durations.route_ns = stage_durations
-                .route_ns
-                .saturating_add(route_start.elapsed().as_nanos() as u64);
+            maybe_elapsed(route_start, &mut stage_durations.route_ns);
             if target == shard_id {
-                let execute_start = Instant::now();
-                append_wal_record(
-                    wal_writer,
-                    WalRecord::Set {
-                        key: key.to_vec(),
-                        value: value.to_vec(),
-                        ttl_ms: None,
-                    },
-                );
+                let execute_start = maybe_now(track_stages);
+                append_wal_set(wal_writer, key, value, None);
                 let resp = store
                     .borrow_mut()
                     .set_bytes(key, value, None, None, false, false);
-                stage_durations.execute_ns = stage_durations
-                    .execute_ns
-                    .saturating_add(execute_start.elapsed().as_nanos() as u64);
+                maybe_elapsed(execute_start, &mut stage_durations.execute_ns);
                 push_ready_response(responses, resp);
             } else {
                 queue_foreign_command(
@@ -687,17 +1146,13 @@ fn process_hot_command(
                     return;
                 }
             }
-            let route_start = Instant::now();
+            let route_start = maybe_now(track_stages);
             let target = router.shard_for_key(key);
-            stage_durations.route_ns = stage_durations
-                .route_ns
-                .saturating_add(route_start.elapsed().as_nanos() as u64);
+            maybe_elapsed(route_start, &mut stage_durations.route_ns);
             if target == shard_id {
-                let execute_start = Instant::now();
+                let execute_start = maybe_now(track_stages);
                 let resp = store.borrow_mut().incr_by_bytes(key, 1);
-                stage_durations.execute_ns = stage_durations
-                    .execute_ns
-                    .saturating_add(execute_start.elapsed().as_nanos() as u64);
+                maybe_elapsed(execute_start, &mut stage_durations.execute_ns);
                 push_ready_response(responses, resp);
             } else {
                 queue_foreign_command(
@@ -762,7 +1217,11 @@ fn try_handle_local_affinity(
         Command::BgRewriteAof => Some(CommandResponse::SimpleString(
             "Background AOF rewrite started".into(),
         )),
-        Command::CommandInfo => Some(CommandResponse::Array(vec![])),
+        Command::CommandInfo { names } => Some(command_info_response(names)),
+        Command::CommandCount => Some(CommandResponse::Integer(supported_command_count())),
+        Command::CommandList => Some(command_list_response()),
+        Command::CommandHelp => Some(command_help_response()),
+        Command::CommandDocs { names } => Some(command_docs_response(names)),
         Command::CdcPoll { cursor, count } => {
             Some(handle_cdc_poll(&shared.cdc_rings, *cursor, *count))
         }

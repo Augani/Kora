@@ -334,6 +334,88 @@ impl ShardEngine {
                 }
                 let _ = tx.send(CommandResponse::Integer(total));
             }
+            Command::Unlink { keys } => {
+                let mut shard_keys: Vec<Vec<Vec<u8>>> = vec![vec![]; self.shard_count];
+                for key in keys {
+                    let shard_id = shard_for_key(&key, self.shard_count) as usize;
+                    shard_keys[shard_id].push(key);
+                }
+
+                let mut total = 0i64;
+                let mut receivers = Vec::new();
+                for (shard_id, keys) in shard_keys.into_iter().enumerate() {
+                    if keys.is_empty() {
+                        continue;
+                    }
+                    let (resp_tx, resp_rx) = response_channel();
+                    let _ = self.workers[shard_id].tx.send(ShardMessage::Single {
+                        command: Command::Unlink { keys },
+                        response_tx: resp_tx,
+                    });
+                    receivers.push(resp_rx);
+                }
+                for rx in receivers {
+                    if let Ok(CommandResponse::Integer(n)) = rx.recv() {
+                        total += n;
+                    }
+                }
+                let _ = tx.send(CommandResponse::Integer(total));
+            }
+            Command::Touch { keys } => {
+                let mut shard_keys: Vec<Vec<Vec<u8>>> = vec![vec![]; self.shard_count];
+                for key in keys {
+                    let shard_id = shard_for_key(&key, self.shard_count) as usize;
+                    shard_keys[shard_id].push(key);
+                }
+
+                let mut total = 0i64;
+                let mut receivers = Vec::new();
+                for (shard_id, keys) in shard_keys.into_iter().enumerate() {
+                    if keys.is_empty() {
+                        continue;
+                    }
+                    let (resp_tx, resp_rx) = response_channel();
+                    let _ = self.workers[shard_id].tx.send(ShardMessage::Single {
+                        command: Command::Touch { keys },
+                        response_tx: resp_tx,
+                    });
+                    receivers.push(resp_rx);
+                }
+                for rx in receivers {
+                    if let Ok(CommandResponse::Integer(n)) = rx.recv() {
+                        total += n;
+                    }
+                }
+                let _ = tx.send(CommandResponse::Integer(total));
+            }
+            Command::MSetNx { entries } => {
+                let mut shard_entries: Vec<Vec<(Vec<u8>, Vec<u8>)>> =
+                    vec![vec![]; self.shard_count];
+                for (key, value) in entries {
+                    let shard_id = shard_for_key(&key, self.shard_count) as usize;
+                    shard_entries[shard_id].push((key, value));
+                }
+
+                let mut all_set = true;
+                let mut receivers = Vec::new();
+                for (shard_id, entries) in shard_entries.into_iter().enumerate() {
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    let (resp_tx, resp_rx) = response_channel();
+                    let _ = self.workers[shard_id].tx.send(ShardMessage::Single {
+                        command: Command::MSetNx { entries },
+                        response_tx: resp_tx,
+                    });
+                    receivers.push(resp_rx);
+                }
+                for rx in receivers {
+                    if let Ok(CommandResponse::Integer(0)) = rx.recv() {
+                        all_set = false;
+                    }
+                }
+                let _ = tx.send(CommandResponse::Integer(if all_set { 1 } else { 0 }));
+            }
             _ => {
                 let _ = tx.send(CommandResponse::Error(
                     "ERR unsupported multi-key command".into(),
@@ -596,6 +678,22 @@ impl ShardEngine {
                 }
                 let merged = totals.into_iter().map(CommandResponse::Integer).collect();
                 let _ = tx.send(CommandResponse::Array(merged));
+            }
+            Command::RandomKey => {
+                for worker in &self.workers {
+                    let (resp_tx, resp_rx) = response_channel();
+                    let _ = worker.tx.send(ShardMessage::Single {
+                        command: Command::RandomKey,
+                        response_tx: resp_tx,
+                    });
+                    if let Ok(resp) = resp_rx.recv() {
+                        if !matches!(resp, CommandResponse::Nil) {
+                            let _ = tx.send(resp);
+                            return;
+                        }
+                    }
+                }
+                let _ = tx.send(CommandResponse::Nil);
             }
             _ => {
                 // PING, ECHO, INFO — send to shard 0

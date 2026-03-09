@@ -8,7 +8,7 @@ use crate::command::CommandResponse;
 use crate::types::CompactKey;
 
 /// A stream entry ID consisting of a millisecond timestamp and a sequence number.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId {
     /// Millisecond timestamp portion.
     pub ms: u64,
@@ -62,6 +62,35 @@ pub struct StreamLog {
     pub entries: VecDeque<StreamEntry>,
     /// The last assigned ID.
     pub last_id: StreamId,
+}
+
+/// A pending entry in a consumer group's PEL (Pending Entry List).
+#[derive(Clone, Debug)]
+pub struct PendingEntry {
+    /// The consumer that owns this entry.
+    pub consumer: String,
+    /// Delivery time in milliseconds since epoch.
+    pub delivery_time: u64,
+    /// Number of times this entry has been delivered.
+    pub delivery_count: u32,
+}
+
+/// Per-consumer state within a consumer group.
+#[derive(Clone, Debug, Default)]
+pub struct ConsumerState {
+    /// Set of pending entry IDs owned by this consumer.
+    pub pending: HashSet<StreamId>,
+}
+
+/// A stream consumer group with its own cursor and pending entry list.
+#[derive(Clone, Debug)]
+pub struct StreamConsumerGroup {
+    /// Last delivered ID for this group.
+    pub last_delivered_id: StreamId,
+    /// Pending Entry List: entries delivered but not yet acknowledged.
+    pub pel: HashMap<StreamId, PendingEntry>,
+    /// Per-consumer state.
+    pub consumers: HashMap<String, ConsumerState>,
 }
 
 /// Represents a value stored in the cache.

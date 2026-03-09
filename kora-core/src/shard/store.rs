@@ -5,10 +5,17 @@ use std::time::Duration;
 
 use ahash::AHashMap;
 
-use crate::command::{Command, CommandResponse};
+use crate::command::{
+    command_docs_response, command_help_response, command_info_response, command_list_response,
+    supported_command_count, BitFieldEncoding, BitFieldOffset, BitFieldOperation, BitFieldOverflow,
+    BitOperation, Command, CommandResponse, GeoUnit,
+};
 use crate::shard::allocator::ShardAllocator;
 use crate::tenant::TenantId;
-use crate::types::{CompactKey, KeyEntry, StreamEntry, StreamId, StreamLog, Value};
+use crate::types::{
+    CompactKey, KeyEntry, PendingEntry, StreamConsumerGroup, StreamEntry, StreamId, StreamLog,
+    Value,
+};
 
 #[cfg(feature = "observability")]
 use kora_observability::stats::ShardStats;
@@ -38,6 +45,7 @@ pub struct ShardStore {
     stats_enabled: bool,
     #[cfg(feature = "vector")]
     vector_indexes: AHashMap<CompactKey, HnswIndex>,
+    stream_groups: AHashMap<CompactKey, AHashMap<String, StreamConsumerGroup>>,
 }
 
 impl ShardStore {
@@ -59,6 +67,7 @@ impl ShardStore {
             stats_enabled: false,
             #[cfg(feature = "vector")]
             vector_indexes: AHashMap::new(),
+            stream_groups: AHashMap::new(),
         }
     }
 
@@ -273,6 +282,7 @@ impl ShardStore {
         self.memory_used = 0;
         self.tenant_memory.clear();
         self.expire_scan_cursor = 0;
+        self.stream_groups.clear();
     }
 
     /// Execute a command on this shard and return the response.
@@ -348,6 +358,19 @@ impl ShardStore {
                     other => other,
                 }
             }
+            Command::IncrByFloat { key, delta } => self.cmd_incrbyfloat(&key, delta),
+            Command::GetRange { key, start, end } => self.cmd_getrange(&key, start, end),
+            Command::SetRange { key, offset, value } => self.cmd_setrange(&key, offset, &value),
+            Command::GetDel { key } => self.cmd_getdel(&key),
+            Command::GetEx {
+                key,
+                ex,
+                px,
+                exat,
+                pxat,
+                persist,
+            } => self.cmd_getex(&key, ex, px, exat, pxat, persist),
+            Command::MSetNx { entries } => self.cmd_msetnx(&entries),
 
             // Key commands
             Command::Del { keys } => {
@@ -372,6 +395,54 @@ impl ShardStore {
                 pattern,
                 count,
             } => self.cmd_scan(cursor, pattern.as_deref(), count.unwrap_or(10)),
+            Command::ExpireAt { key, timestamp } => self.cmd_expireat(&key, timestamp, false),
+            Command::PExpireAt { key, timestamp_ms } => self.cmd_expireat(&key, timestamp_ms, true),
+            Command::Rename { key, newkey } => self.cmd_rename(&key, &newkey, false),
+            Command::RenameNx { key, newkey } => self.cmd_rename(&key, &newkey, true),
+            Command::Unlink { keys } => {
+                let count = keys.iter().filter(|k| self.del(k)).count();
+                CommandResponse::Integer(count as i64)
+            }
+            Command::Copy {
+                source,
+                destination,
+                replace,
+            } => self.cmd_copy(&source, &destination, replace),
+            Command::RandomKey => self.cmd_randomkey(),
+            Command::Touch { keys } => {
+                let count = keys.iter().filter(|k| self.exists(k)).count();
+                CommandResponse::Integer(count as i64)
+            }
+            Command::ObjectRefCount { ref key } => {
+                let compact = CompactKey::new(key);
+                match self.entries.get(&compact) {
+                    Some(entry) if !entry.is_expired() => CommandResponse::Integer(1),
+                    _ => CommandResponse::Nil,
+                }
+            }
+            Command::ObjectIdleTime { ref key } => {
+                let compact = CompactKey::new(key);
+                match self.entries.get(&compact) {
+                    Some(entry) if !entry.is_expired() => CommandResponse::Integer(0),
+                    _ => CommandResponse::Nil,
+                }
+            }
+            Command::ObjectHelp => CommandResponse::Array(vec![
+                CommandResponse::BulkString(b"OBJECT subcommand [arguments]".to_vec()),
+                CommandResponse::BulkString(
+                    b"ENCODING <key> - Return the encoding of a key.".to_vec(),
+                ),
+                CommandResponse::BulkString(
+                    b"FREQ <key> - Return the access frequency of a key.".to_vec(),
+                ),
+                CommandResponse::BulkString(b"HELP - Return this help message.".to_vec()),
+                CommandResponse::BulkString(
+                    b"IDLETIME <key> - Return the idle time of a key.".to_vec(),
+                ),
+                CommandResponse::BulkString(
+                    b"REFCOUNT <key> - Return the reference count of a key.".to_vec(),
+                ),
+            ]),
             Command::DbSize => CommandResponse::Integer(self.entries.len() as i64),
             Command::FlushDb | Command::FlushAll => {
                 self.flush();
@@ -386,6 +457,32 @@ impl ShardStore {
             Command::LLen { key } => self.cmd_llen(&key),
             Command::LRange { key, start, stop } => self.cmd_lrange(&key, start, stop),
             Command::LIndex { key, index } => self.cmd_lindex(&key, index),
+            Command::LSet { key, index, value } => self.cmd_lset(&key, index, &value),
+            Command::LInsert {
+                key,
+                before,
+                pivot,
+                value,
+            } => self.cmd_linsert(&key, before, &pivot, &value),
+            Command::LRem { key, count, value } => self.cmd_lrem(&key, count, &value),
+            Command::LTrim { key, start, stop } => self.cmd_ltrim(&key, start, stop),
+            Command::LPos {
+                key,
+                value,
+                rank,
+                count,
+                maxlen,
+            } => self.cmd_lpos(&key, &value, rank, count, maxlen),
+            Command::RPopLPush {
+                source,
+                destination,
+            } => self.cmd_rpoplpush(&source, &destination),
+            Command::LMove {
+                source,
+                destination,
+                from_left,
+                to_left,
+            } => self.cmd_lmove(&source, &destination, from_left, to_left),
 
             // Hash commands
             Command::HSet { key, fields } => self.cmd_hset(&key, &fields),
@@ -395,6 +492,24 @@ impl ShardStore {
             Command::HLen { key } => self.cmd_hlen(&key),
             Command::HExists { key, field } => self.cmd_hexists(&key, &field),
             Command::HIncrBy { key, field, delta } => self.cmd_hincrby(&key, &field, delta),
+            Command::HMGet { key, fields } => self.cmd_hmget(&key, &fields),
+            Command::HKeys { key } => self.cmd_hkeys(&key),
+            Command::HVals { key } => self.cmd_hvals(&key),
+            Command::HSetNx { key, field, value } => self.cmd_hsetnx(&key, &field, &value),
+            Command::HIncrByFloat { key, field, delta } => {
+                self.cmd_hincrbyfloat(&key, &field, delta)
+            }
+            Command::HRandField {
+                key,
+                count,
+                withvalues,
+            } => self.cmd_hrandfield(&key, count, withvalues),
+            Command::HScan {
+                key,
+                cursor,
+                pattern,
+                count,
+            } => self.cmd_hscan(&key, cursor, pattern.as_deref(), count.unwrap_or(10)),
 
             // Set commands
             Command::SAdd { key, members } => self.cmd_sadd(&key, &members),
@@ -402,6 +517,31 @@ impl ShardStore {
             Command::SMembers { key } => self.cmd_smembers(&key),
             Command::SIsMember { key, member } => self.cmd_sismember(&key, &member),
             Command::SCard { key } => self.cmd_scard(&key),
+            Command::SPop { key, count } => self.cmd_spop(&key, count),
+            Command::SRandMember { key, count } => self.cmd_srandmember(&key, count),
+            Command::SUnion { keys } => self.cmd_sunion(&keys),
+            Command::SUnionStore { destination, keys } => self.cmd_sunionstore(&destination, &keys),
+            Command::SInter { keys } => self.cmd_sinter(&keys),
+            Command::SInterStore { destination, keys } => self.cmd_sinterstore(&destination, &keys),
+            Command::SDiff { keys } => self.cmd_sdiff(&keys),
+            Command::SDiffStore { destination, keys } => self.cmd_sdiffstore(&destination, &keys),
+            Command::SInterCard {
+                numkeys: _,
+                keys,
+                limit,
+            } => self.cmd_sintercard(&keys, limit),
+            Command::SMove {
+                source,
+                destination,
+                member,
+            } => self.cmd_smove(&source, &destination, &member),
+            Command::SMisMember { key, members } => self.cmd_smismember(&key, &members),
+            Command::SScan {
+                key,
+                cursor,
+                pattern,
+                count,
+            } => self.cmd_sscan(&key, cursor, pattern.as_deref(), count.unwrap_or(10)),
 
             // Sorted set commands
             Command::ZAdd { key, members } => self.cmd_zadd(&key, &members),
@@ -432,6 +572,43 @@ impl ShardStore {
             } => self.cmd_zrangebyscore(&key, min, max, withscores, offset, count),
             Command::ZIncrBy { key, delta, member } => self.cmd_zincrby(&key, delta, &member),
             Command::ZCount { key, min, max } => self.cmd_zcount(&key, min, max),
+            Command::ZRevRangeByScore {
+                key,
+                max,
+                min,
+                withscores,
+                offset,
+                count,
+            } => self.cmd_zrevrangebyscore(&key, max, min, withscores, offset, count),
+            Command::ZPopMin { key, count } => self.cmd_zpopmin(&key, count),
+            Command::ZPopMax { key, count } => self.cmd_zpopmax(&key, count),
+            Command::ZRangeByLex {
+                key,
+                min,
+                max,
+                offset,
+                count,
+            } => self.cmd_zrangebylex(&key, &min, &max, offset, count, false),
+            Command::ZRevRangeByLex {
+                key,
+                max,
+                min,
+                offset,
+                count,
+            } => self.cmd_zrangebylex(&key, &min, &max, offset, count, true),
+            Command::ZLexCount { key, min, max } => self.cmd_zlexcount(&key, &min, &max),
+            Command::ZMScore { key, members } => self.cmd_zmscore(&key, &members),
+            Command::ZRandMember {
+                key,
+                count,
+                withscores,
+            } => self.cmd_zrandmember(&key, count, withscores),
+            Command::ZScan {
+                key,
+                cursor,
+                pattern,
+                count,
+            } => self.cmd_zscan(&key, cursor, pattern.as_deref(), count.unwrap_or(10)),
 
             Command::XAdd {
                 key,
@@ -454,6 +631,112 @@ impl ShardStore {
             } => self.cmd_xrevrange(&key, &start, &end, count),
             Command::XRead { keys, ids, count } => self.cmd_xread(&keys, &ids, count),
             Command::XTrim { key, maxlen } => self.cmd_xtrim(&key, maxlen),
+            Command::XDel { key, ids } => self.cmd_xdel(&key, &ids),
+            Command::XGroupCreate {
+                key,
+                group,
+                id,
+                mkstream,
+            } => self.cmd_xgroup_create(&key, &group, &id, mkstream),
+            Command::XGroupDestroy { key, group } => self.cmd_xgroup_destroy(&key, &group),
+            Command::XGroupDelConsumer {
+                key,
+                group,
+                consumer,
+            } => self.cmd_xgroup_delconsumer(&key, &group, &consumer),
+            Command::XReadGroup {
+                group,
+                consumer,
+                count,
+                keys,
+                ids,
+            } => self.cmd_xreadgroup(&group, &consumer, count, &keys, &ids),
+            Command::XAck { key, group, ids } => self.cmd_xack(&key, &group, &ids),
+            Command::XPending {
+                key,
+                group,
+                start,
+                end,
+                count,
+            } => self.cmd_xpending(&key, &group, start.as_deref(), end.as_deref(), count),
+            Command::XClaim {
+                key,
+                group,
+                consumer,
+                min_idle_time,
+                ids,
+            } => self.cmd_xclaim(&key, &group, &consumer, min_idle_time, &ids),
+            Command::XAutoClaim {
+                key,
+                group,
+                consumer,
+                min_idle_time,
+                start,
+                count,
+            } => self.cmd_xautoclaim(&key, &group, &consumer, min_idle_time, &start, count),
+            Command::XInfoStream { key } => self.cmd_xinfo_stream(&key),
+            Command::XInfoGroups { key } => self.cmd_xinfo_groups(&key),
+
+            // Blocking commands: execute non-blocking variant (retry handled at connection layer)
+            Command::BLPop { keys, .. } => {
+                for key in &keys {
+                    let resp = self.cmd_lpop(key);
+                    if !matches!(resp, CommandResponse::Nil) {
+                        return CommandResponse::Array(vec![
+                            CommandResponse::BulkString(key.clone()),
+                            resp,
+                        ]);
+                    }
+                }
+                CommandResponse::Nil
+            }
+            Command::BRPop { keys, .. } => {
+                for key in &keys {
+                    let resp = self.cmd_rpop(key);
+                    if !matches!(resp, CommandResponse::Nil) {
+                        return CommandResponse::Array(vec![
+                            CommandResponse::BulkString(key.clone()),
+                            resp,
+                        ]);
+                    }
+                }
+                CommandResponse::Nil
+            }
+            Command::BLMove {
+                source,
+                destination,
+                from_left,
+                to_left,
+                ..
+            } => self.cmd_lmove(&source, &destination, from_left, to_left),
+            Command::BZPopMin { keys, .. } => {
+                for key in &keys {
+                    let resp = self.cmd_zpopmin(key, Some(1));
+                    if let CommandResponse::Array(ref items) = resp {
+                        if !items.is_empty() {
+                            return CommandResponse::Array(vec![
+                                CommandResponse::BulkString(key.clone()),
+                                resp,
+                            ]);
+                        }
+                    }
+                }
+                CommandResponse::Nil
+            }
+            Command::BZPopMax { keys, .. } => {
+                for key in &keys {
+                    let resp = self.cmd_zpopmax(key, Some(1));
+                    if let CommandResponse::Array(ref items) = resp {
+                        if !items.is_empty() {
+                            return CommandResponse::Array(vec![
+                                CommandResponse::BulkString(key.clone()),
+                                resp,
+                            ]);
+                        }
+                    }
+                }
+                CommandResponse::Nil
+            }
 
             // Server commands
             Command::Ping { message } => match message {
@@ -468,7 +751,7 @@ impl ShardStore {
                 )
                 .into_bytes(),
             ),
-            Command::CommandInfo => CommandResponse::Array(vec![]),
+            Command::CommandInfo { names } => command_info_response(&names),
 
             // Dump: return all entries for RDB snapshot
             Command::Dump => {
@@ -540,6 +823,141 @@ impl ShardStore {
             }
             Command::StatsHotkeys { count } => self.cmd_stats_hotkeys(count),
             Command::StatsMemory { prefixes } => self.cmd_stats_memory(&prefixes),
+
+            // HyperLogLog commands
+            Command::PfAdd { key, elements } => self.cmd_pfadd(&key, &elements),
+            Command::PfCount { keys } => {
+                if keys.len() == 1 {
+                    self.cmd_pfcount_single(&keys[0])
+                } else {
+                    self.cmd_pfcount_multi(&keys)
+                }
+            }
+            Command::PfMerge {
+                destkey,
+                sourcekeys,
+            } => self.cmd_pfmerge(&destkey, &sourcekeys),
+
+            // Bitmap commands
+            Command::SetBit { key, offset, value } => self.cmd_setbit(&key, offset, value),
+            Command::GetBit { key, offset } => self.cmd_getbit(&key, offset),
+            Command::BitCount {
+                key,
+                start,
+                end,
+                use_bit,
+            } => self.cmd_bitcount(&key, start, end, use_bit),
+            Command::BitOp {
+                operation,
+                destkey,
+                keys,
+            } => self.cmd_bitop(operation, &destkey, &keys),
+            Command::BitPos {
+                key,
+                bit,
+                start,
+                end,
+                use_bit,
+            } => self.cmd_bitpos(&key, bit, start, end, use_bit),
+            Command::BitField { key, operations } => self.cmd_bitfield(&key, &operations),
+
+            // Geo commands
+            Command::GeoAdd {
+                key,
+                nx,
+                xx,
+                ch,
+                members,
+            } => self.cmd_geoadd(&key, nx, xx, ch, &members),
+            Command::GeoDist {
+                key,
+                member1,
+                member2,
+                unit,
+            } => self.cmd_geodist(&key, &member1, &member2, unit),
+            Command::GeoHash { key, members } => self.cmd_geohash(&key, &members),
+            Command::GeoPos { key, members } => self.cmd_geopos(&key, &members),
+            Command::GeoSearch {
+                key,
+                from_member,
+                from_lonlat,
+                radius,
+                unit,
+                asc,
+                count,
+                withcoord,
+                withdist,
+                withhash,
+            } => self.cmd_geosearch(
+                &key,
+                from_member.as_deref(),
+                from_lonlat,
+                radius,
+                unit,
+                asc,
+                count,
+                withcoord,
+                withdist,
+                withhash,
+            ),
+
+            // Transaction commands — handled at connection level
+            Command::Multi
+            | Command::Exec
+            | Command::Discard
+            | Command::Watch { .. }
+            | Command::Unwatch => {
+                CommandResponse::Error("ERR command handled at connection level".into())
+            }
+
+            // Client commands — handled at connection level
+            Command::ClientId
+            | Command::ClientGetName
+            | Command::ClientSetName { .. }
+            | Command::ClientList
+            | Command::ClientInfo => {
+                CommandResponse::Error("ERR command handled at connection level".into())
+            }
+
+            Command::ConfigGet { .. } => CommandResponse::Array(vec![]),
+            Command::ConfigSet { .. } => {
+                CommandResponse::Error("ERR unsupported CONFIG SET parameter".into())
+            }
+            Command::ConfigResetStat => CommandResponse::Ok,
+
+            Command::Time => {
+                use std::time::SystemTime;
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let secs = now.as_secs();
+                let micros = now.subsec_micros() as u64;
+                CommandResponse::Array(vec![
+                    CommandResponse::BulkString(secs.to_string().into_bytes()),
+                    CommandResponse::BulkString(micros.to_string().into_bytes()),
+                ])
+            }
+            Command::Select { db } => {
+                if db < 0 {
+                    CommandResponse::Error("ERR DB index is out of range".into())
+                } else if db == 0 {
+                    CommandResponse::Ok
+                } else {
+                    CommandResponse::Error("ERR SELECT is not allowed in cluster mode".into())
+                }
+            }
+            Command::Quit => CommandResponse::Ok,
+            Command::Wait { timeout, .. } => {
+                if timeout < 0 {
+                    CommandResponse::Error("ERR timeout is negative".into())
+                } else {
+                    CommandResponse::Integer(0)
+                }
+            }
+            Command::CommandCount => CommandResponse::Integer(supported_command_count()),
+            Command::CommandList => command_list_response(),
+            Command::CommandHelp => command_help_response(),
+            Command::CommandDocs { names } => command_docs_response(&names),
 
             // Commands handled at server/engine level — should not reach here
             Command::BgSave
@@ -622,23 +1040,44 @@ impl ShardStore {
                         return CommandResponse::Nil;
                     }
 
-                    let old_size = Self::estimate_key_entry_size(
-                        occupied.key().as_bytes(),
-                        &occupied.get().value,
-                    );
-                    self.memory_used = self.memory_used.saturating_sub(old_size);
-                    let tm = self
-                        .tenant_memory
-                        .entry(occupied.get().tenant_id)
-                        .or_insert(0);
-                    *tm = tm.saturating_sub(old_size);
+                    let new_value = Value::from_raw_bytes(value);
+                    let old_value_size = occupied.get().value.estimated_size();
+                    let new_value_size = new_value.estimated_size();
+                    let size_delta = new_value_size as isize - old_value_size as isize;
 
-                    let replacement_key = occupied.key().clone();
-                    let (entry, entry_size) =
-                        Self::build_string_entry(&replacement_key, value, ttl, tenant_id);
-                    self.memory_used += entry_size;
-                    *self.tenant_memory.entry(tenant_id).or_insert(0) += entry_size;
-                    occupied.insert(entry);
+                    if size_delta >= 0 {
+                        self.memory_used += size_delta as usize;
+                    } else {
+                        self.memory_used = self.memory_used.saturating_sub((-size_delta) as usize);
+                    }
+
+                    let old_tenant = occupied.get().tenant_id;
+                    if old_tenant == tenant_id {
+                        let tm = self.tenant_memory.entry(tenant_id).or_insert(0);
+                        if size_delta >= 0 {
+                            *tm += size_delta as usize;
+                        } else {
+                            *tm = tm.saturating_sub((-size_delta) as usize);
+                        }
+                    } else {
+                        let old_size = Self::estimate_key_entry_size(
+                            occupied.key().as_bytes(),
+                            &occupied.get().value,
+                        );
+                        let tm = self.tenant_memory.entry(old_tenant).or_insert(0);
+                        *tm = tm.saturating_sub(old_size);
+                        let new_size = old_size.wrapping_add_signed(size_delta);
+                        *self.tenant_memory.entry(tenant_id).or_insert(0) += new_size;
+                    }
+
+                    let entry = occupied.get_mut();
+                    entry.value = new_value;
+                    entry.tenant_id = tenant_id;
+                    entry.client_flags = 0;
+                    match ttl {
+                        Some(dur) => entry.set_ttl(dur),
+                        None => entry.ttl = None,
+                    }
                     CommandResponse::Ok
                 }
             }
@@ -647,9 +1086,13 @@ impl ShardStore {
                     return CommandResponse::Nil;
                 }
 
-                let entry_key = vacant.key().clone();
-                let (entry, entry_size) =
-                    Self::build_string_entry(&entry_key, value, ttl, tenant_id);
+                let new_value = Value::from_raw_bytes(value);
+                let entry_size = Self::estimate_key_entry_size(vacant.key().as_bytes(), &new_value);
+                let mut entry =
+                    KeyEntry::new_with_tenant(vacant.key().clone(), new_value, tenant_id);
+                if let Some(dur) = ttl {
+                    entry.set_ttl(dur);
+                }
                 self.memory_used += entry_size;
                 *self.tenant_memory.entry(tenant_id).or_insert(0) += entry_size;
                 vacant.insert(entry);
@@ -773,6 +1216,252 @@ impl ShardStore {
         }
     }
 
+    fn cmd_incrbyfloat(&mut self, key: &[u8], delta: f64) -> CommandResponse {
+        self.lazy_expire(key);
+        match self.entries.get_mut(key) {
+            Some(entry) => {
+                let current = match &entry.value {
+                    Value::Int(i) => *i as f64,
+                    Value::InlineStr { data, len } => {
+                        match std::str::from_utf8(&data[..*len as usize])
+                            .ok()
+                            .and_then(|s| s.parse::<f64>().ok())
+                        {
+                            Some(f) => f,
+                            None => {
+                                return CommandResponse::Error(
+                                    "ERR value is not a valid float".into(),
+                                )
+                            }
+                        }
+                    }
+                    Value::HeapStr(arc) => {
+                        match std::str::from_utf8(arc)
+                            .ok()
+                            .and_then(|s| s.parse::<f64>().ok())
+                        {
+                            Some(f) => f,
+                            None => {
+                                return CommandResponse::Error(
+                                    "ERR value is not a valid float".into(),
+                                )
+                            }
+                        }
+                    }
+                    _ => {
+                        return CommandResponse::Error(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value"
+                                .into(),
+                        )
+                    }
+                };
+                let result = current + delta;
+                if result.is_infinite() || result.is_nan() {
+                    return CommandResponse::Error(
+                        "ERR increment would produce NaN or Infinity".into(),
+                    );
+                }
+                let result_str = format_float(result);
+                entry.value = Value::from_raw_bytes(result_str.as_bytes());
+                CommandResponse::BulkString(result_str.into_bytes())
+            }
+            None => {
+                if delta.is_infinite() || delta.is_nan() {
+                    return CommandResponse::Error(
+                        "ERR increment would produce NaN or Infinity".into(),
+                    );
+                }
+                let result_str = format_float(delta);
+                let compact = CompactKey::new(key);
+                let entry = KeyEntry::new(
+                    compact.clone(),
+                    Value::from_raw_bytes(result_str.as_bytes()),
+                );
+                self.entries.insert(compact, entry);
+                CommandResponse::BulkString(result_str.into_bytes())
+            }
+        }
+    }
+
+    fn cmd_getrange(&mut self, key: &[u8], start: i64, end: i64) -> CommandResponse {
+        self.lazy_expire(key);
+        match self.entries.get(key) {
+            Some(entry) => {
+                let bytes = match entry.value.as_bytes() {
+                    Some(b) => b,
+                    None => {
+                        return CommandResponse::Error(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value"
+                                .into(),
+                        )
+                    }
+                };
+                let len = bytes.len() as i64;
+                if len == 0 {
+                    return CommandResponse::BulkString(vec![]);
+                }
+                let s = if start < 0 {
+                    (len + start).max(0) as usize
+                } else {
+                    start.min(len) as usize
+                };
+                let e = if end < 0 {
+                    (len + end).max(0) as usize
+                } else {
+                    end.min(len - 1) as usize
+                };
+                if s > e || s >= bytes.len() {
+                    CommandResponse::BulkString(vec![])
+                } else {
+                    CommandResponse::BulkString(bytes[s..=e].to_vec())
+                }
+            }
+            None => CommandResponse::BulkString(vec![]),
+        }
+    }
+
+    fn cmd_setrange(&mut self, key: &[u8], offset: usize, value: &[u8]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        let mut current = match self.entries.get(key) {
+            Some(entry) => match entry.value.as_bytes() {
+                Some(b) => b,
+                None => {
+                    return CommandResponse::Error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                    )
+                }
+            },
+            None => vec![],
+        };
+        let needed = offset + value.len();
+        if current.len() < needed {
+            current.resize(needed, 0u8);
+        }
+        current[offset..offset + value.len()].copy_from_slice(value);
+        let new_len = current.len() as i64;
+        let old_size = self
+            .entries
+            .get(key)
+            .map(|e| Self::estimate_key_entry_size(key, &e.value))
+            .unwrap_or(0);
+        let new_value = Value::from_raw_bytes(&current);
+        let new_size = Self::estimate_key_entry_size(key, &new_value);
+        let tenant_id = self.current_tenant;
+        match self.entries.get_mut(key) {
+            Some(entry) => {
+                entry.value = new_value;
+                if new_size > old_size {
+                    self.memory_used += new_size - old_size;
+                    *self.tenant_memory.entry(entry.tenant_id).or_insert(0) += new_size - old_size;
+                } else {
+                    self.memory_used = self.memory_used.saturating_sub(old_size - new_size);
+                    let tm = self.tenant_memory.entry(entry.tenant_id).or_insert(0);
+                    *tm = tm.saturating_sub(old_size - new_size);
+                }
+            }
+            None => {
+                let entry = KeyEntry::new_with_tenant(compact.clone(), new_value, tenant_id);
+                self.memory_used += new_size;
+                *self.tenant_memory.entry(tenant_id).or_insert(0) += new_size;
+                self.entries.insert(compact, entry);
+            }
+        }
+        CommandResponse::Integer(new_len)
+    }
+
+    fn cmd_getdel(&mut self, key: &[u8]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) if !entry.is_expired() => {
+                let resp = match entry.value.bulk_response() {
+                    Some(r) => r,
+                    None => {
+                        return CommandResponse::Error(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value"
+                                .into(),
+                        )
+                    }
+                };
+                let _ = self.remove_compact_entry(&compact);
+                resp
+            }
+            _ => CommandResponse::Nil,
+        }
+    }
+
+    fn cmd_getex(
+        &mut self,
+        key: &[u8],
+        ex: Option<u64>,
+        px: Option<u64>,
+        exat: Option<u64>,
+        pxat: Option<u64>,
+        persist: bool,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        match self.entries.get_mut(key) {
+            Some(entry) if !entry.is_expired() => {
+                let resp = match entry.value.bulk_response() {
+                    Some(r) => r,
+                    None => {
+                        return CommandResponse::Error(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value"
+                                .into(),
+                        )
+                    }
+                };
+                if let Some(s) = ex {
+                    entry.set_ttl(Duration::from_secs(s));
+                } else if let Some(ms) = px {
+                    entry.set_ttl(Duration::from_millis(ms));
+                } else if let Some(ts) = exat {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    let target = Duration::from_secs(ts);
+                    if target > now {
+                        entry.set_ttl(target - now);
+                    } else {
+                        let compact = CompactKey::new(key);
+                        let _ = self.remove_compact_entry(&compact);
+                        return resp;
+                    }
+                } else if let Some(ts_ms) = pxat {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    let target = Duration::from_millis(ts_ms);
+                    if target > now {
+                        entry.set_ttl(target - now);
+                    } else {
+                        let compact = CompactKey::new(key);
+                        let _ = self.remove_compact_entry(&compact);
+                        return resp;
+                    }
+                } else if persist {
+                    entry.clear_ttl();
+                }
+                resp
+            }
+            _ => CommandResponse::Nil,
+        }
+    }
+
+    fn cmd_msetnx(&mut self, entries: &[(Vec<u8>, Vec<u8>)]) -> CommandResponse {
+        for (k, _) in entries {
+            self.lazy_expire(k);
+            if self.entries.contains_key(k.as_slice()) {
+                return CommandResponse::Integer(0);
+            }
+        }
+        for (k, v) in entries {
+            self.cmd_set(k, v, None, None, false, false);
+        }
+        CommandResponse::Integer(1)
+    }
+
     // ─── Key operations ──────────────────────────────────────────────
 
     fn del(&mut self, key: &[u8]) -> bool {
@@ -828,6 +1517,103 @@ impl ShardStore {
             Some(entry) => CommandResponse::SimpleString(entry.value.type_name().to_string()),
             None => CommandResponse::SimpleString("none".to_string()),
         }
+    }
+
+    fn cmd_expireat(&mut self, key: &[u8], timestamp: u64, millis: bool) -> CommandResponse {
+        match self.entries.get_mut(key) {
+            Some(entry) if !entry.is_expired() => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let target = if millis {
+                    Duration::from_millis(timestamp)
+                } else {
+                    Duration::from_secs(timestamp)
+                };
+                if target > now {
+                    entry.set_ttl(target - now);
+                    CommandResponse::Integer(1)
+                } else {
+                    let compact = CompactKey::new(key);
+                    let _ = self.remove_compact_entry(&compact);
+                    CommandResponse::Integer(1)
+                }
+            }
+            _ => CommandResponse::Integer(0),
+        }
+    }
+
+    fn cmd_rename(&mut self, key: &[u8], newkey: &[u8], nx: bool) -> CommandResponse {
+        self.lazy_expire(key);
+        let source_compact = CompactKey::new(key);
+        let source_entry = match self.remove_compact_entry(&source_compact) {
+            Some(e) => e,
+            None => {
+                return CommandResponse::Error("ERR no such key".into());
+            }
+        };
+        self.lazy_expire(newkey);
+        let dest_compact = CompactKey::new(newkey);
+        if nx && self.entries.contains_key(&dest_compact) {
+            let size = Self::estimate_key_entry_size(key, &source_entry.value);
+            self.memory_used += size;
+            *self
+                .tenant_memory
+                .entry(source_entry.tenant_id)
+                .or_insert(0) += size;
+            self.entries.insert(source_compact, source_entry);
+            return CommandResponse::Integer(0);
+        }
+        if let Some(_old) = self.remove_compact_entry(&dest_compact) {}
+        let mut new_entry = KeyEntry::new_with_tenant(
+            dest_compact.clone(),
+            source_entry.value.clone(),
+            source_entry.tenant_id,
+        );
+        new_entry.ttl = source_entry.ttl;
+        new_entry.lfu_counter = source_entry.lfu_counter;
+        let size = Self::estimate_key_entry_size(newkey, &new_entry.value);
+        self.memory_used += size;
+        *self.tenant_memory.entry(new_entry.tenant_id).or_insert(0) += size;
+        self.entries.insert(dest_compact, new_entry);
+        if nx {
+            CommandResponse::Integer(1)
+        } else {
+            CommandResponse::Ok
+        }
+    }
+
+    fn cmd_copy(&mut self, source: &[u8], destination: &[u8], replace: bool) -> CommandResponse {
+        self.lazy_expire(source);
+        let src_compact = CompactKey::new(source);
+        let (value, ttl, tenant_id) = match self.entries.get(&src_compact) {
+            Some(entry) if !entry.is_expired() => (entry.value.clone(), entry.ttl, entry.tenant_id),
+            _ => return CommandResponse::Integer(0),
+        };
+        self.lazy_expire(destination);
+        let dest_compact = CompactKey::new(destination);
+        if self.entries.contains_key(&dest_compact) && !replace {
+            return CommandResponse::Integer(0);
+        }
+        if replace {
+            let _ = self.remove_compact_entry(&dest_compact);
+        }
+        let mut new_entry = KeyEntry::new_with_tenant(dest_compact.clone(), value, tenant_id);
+        new_entry.ttl = ttl;
+        let size = Self::estimate_key_entry_size(destination, &new_entry.value);
+        self.memory_used += size;
+        *self.tenant_memory.entry(new_entry.tenant_id).or_insert(0) += size;
+        self.entries.insert(dest_compact, new_entry);
+        CommandResponse::Integer(1)
+    }
+
+    fn cmd_randomkey(&mut self) -> CommandResponse {
+        for (key, entry) in &self.entries {
+            if !entry.is_expired() {
+                return CommandResponse::BulkString(key.as_bytes().to_vec());
+            }
+        }
+        CommandResponse::Nil
     }
 
     fn cmd_keys(&self, pattern: &str) -> CommandResponse {
@@ -1117,6 +1903,291 @@ impl ShardStore {
         }
     }
 
+    fn cmd_lset(&mut self, key: &[u8], index: i64, value: &[u8]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get_mut(&compact) {
+            Some(entry) => match &mut entry.value {
+                Value::List(deque) => {
+                    let len = deque.len() as i64;
+                    let idx = if index < 0 { len + index } else { index };
+                    if idx < 0 || idx >= len {
+                        return CommandResponse::Error("ERR index out of range".into());
+                    }
+                    deque[idx as usize] = Value::from_raw_bytes(value);
+                    CommandResponse::Ok
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Error("ERR no such key".into()),
+        }
+    }
+
+    fn cmd_linsert(
+        &mut self,
+        key: &[u8],
+        before: bool,
+        pivot: &[u8],
+        value: &[u8],
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get_mut(&compact) {
+            Some(entry) => match &mut entry.value {
+                Value::List(deque) => {
+                    let pos = deque
+                        .iter()
+                        .position(|v| v.as_bytes().is_some_and(|b| b == pivot));
+                    match pos {
+                        Some(idx) => {
+                            let insert_idx = if before { idx } else { idx + 1 };
+                            let new_val = Value::from_raw_bytes(value);
+                            self.memory_used += new_val.estimated_size();
+                            *self.tenant_memory.entry(self.current_tenant).or_insert(0) +=
+                                new_val.estimated_size();
+                            deque.insert(insert_idx, new_val);
+                            CommandResponse::Integer(deque.len() as i64)
+                        }
+                        None => CommandResponse::Integer(-1),
+                    }
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Integer(0),
+        }
+    }
+
+    fn cmd_lrem(&mut self, key: &[u8], count: i64, value: &[u8]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        let (removed, is_empty) = match self.entries.get_mut(&compact) {
+            Some(entry) => match &mut entry.value {
+                Value::List(deque) => {
+                    let mut removed = 0i64;
+                    let abs_count = count.unsigned_abs() as usize;
+                    let max_removals = if count == 0 { usize::MAX } else { abs_count };
+
+                    if count >= 0 {
+                        let mut i = 0;
+                        while i < deque.len() && (removed as usize) < max_removals {
+                            if deque[i].as_bytes().is_some_and(|b| b == value) {
+                                deque.remove(i);
+                                removed += 1;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                    } else {
+                        let mut i = deque.len();
+                        while i > 0 && (removed as usize) < max_removals {
+                            i -= 1;
+                            if deque[i].as_bytes().is_some_and(|b| b == value) {
+                                deque.remove(i);
+                                removed += 1;
+                            }
+                        }
+                    }
+                    (removed, deque.is_empty())
+                }
+                _ => {
+                    return CommandResponse::Error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                    )
+                }
+            },
+            None => return CommandResponse::Integer(0),
+        };
+        if is_empty {
+            self.entries.remove(&CompactKey::new(key));
+        }
+        CommandResponse::Integer(removed)
+    }
+
+    fn cmd_ltrim(&mut self, key: &[u8], start: i64, stop: i64) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        let is_empty = match self.entries.get_mut(&compact) {
+            Some(entry) => match &mut entry.value {
+                Value::List(deque) => {
+                    let len = deque.len() as i64;
+                    let s = normalize_index(start, len);
+                    let e = normalize_index(stop, len);
+                    if s > e || s >= deque.len() {
+                        deque.clear();
+                    } else {
+                        let e = e.min(deque.len() - 1);
+                        deque.truncate(e + 1);
+                        deque.drain(..s);
+                    }
+                    deque.is_empty()
+                }
+                _ => {
+                    return CommandResponse::Error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                    )
+                }
+            },
+            None => return CommandResponse::Ok,
+        };
+        if is_empty {
+            self.entries.remove(&CompactKey::new(key));
+        }
+        CommandResponse::Ok
+    }
+
+    fn cmd_lpos(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        rank: Option<i64>,
+        count: Option<i64>,
+        maxlen: Option<i64>,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::List(deque) => {
+                    let rank_val = rank.unwrap_or(1);
+                    if rank_val == 0 {
+                        return CommandResponse::Error("ERR RANK can't be zero".into());
+                    }
+                    let reverse = rank_val < 0;
+                    let skip = (rank_val.unsigned_abs() - 1) as usize;
+                    let return_array = count.is_some();
+                    let max_count = match count {
+                        Some(0) => usize::MAX,
+                        Some(c) => c.unsigned_abs() as usize,
+                        None => 1,
+                    };
+                    let max_scan = maxlen
+                        .map(|m| m.unsigned_abs() as usize)
+                        .unwrap_or(deque.len());
+
+                    let mut matches = Vec::new();
+                    let mut skipped = 0usize;
+
+                    if reverse {
+                        for (i, elem) in deque.iter().enumerate().rev().take(max_scan) {
+                            if elem.as_bytes().is_some_and(|b| b == value) {
+                                if skipped < skip {
+                                    skipped += 1;
+                                } else {
+                                    matches.push(i as i64);
+                                    if matches.len() >= max_count {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        for (i, elem) in deque.iter().enumerate().take(max_scan) {
+                            if elem.as_bytes().is_some_and(|b| b == value) {
+                                if skipped < skip {
+                                    skipped += 1;
+                                } else {
+                                    matches.push(i as i64);
+                                    if matches.len() >= max_count {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if return_array {
+                        CommandResponse::Array(
+                            matches.into_iter().map(CommandResponse::Integer).collect(),
+                        )
+                    } else {
+                        matches
+                            .first()
+                            .map_or(CommandResponse::Nil, |&pos| CommandResponse::Integer(pos))
+                    }
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => {
+                if count.is_some() {
+                    CommandResponse::Array(vec![])
+                } else {
+                    CommandResponse::Nil
+                }
+            }
+        }
+    }
+
+    fn cmd_rpoplpush(&mut self, source: &[u8], destination: &[u8]) -> CommandResponse {
+        self.cmd_lmove(source, destination, false, true)
+    }
+
+    fn cmd_lmove(
+        &mut self,
+        source: &[u8],
+        destination: &[u8],
+        from_left: bool,
+        to_left: bool,
+    ) -> CommandResponse {
+        self.lazy_expire(source);
+        let src_compact = CompactKey::new(source);
+
+        let (popped, src_empty) = match self.entries.get_mut(&src_compact) {
+            Some(entry) => match &mut entry.value {
+                Value::List(deque) => {
+                    let val = if from_left {
+                        deque.pop_front()
+                    } else {
+                        deque.pop_back()
+                    };
+                    let empty = deque.is_empty();
+                    match val {
+                        Some(v) => (Some(v), empty),
+                        None => (None, false),
+                    }
+                }
+                _ => {
+                    return CommandResponse::Error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                    )
+                }
+            },
+            None => return CommandResponse::Nil,
+        };
+
+        if src_empty {
+            self.entries.remove(&src_compact);
+        }
+
+        let popped = match popped {
+            Some(v) => v,
+            None => return CommandResponse::Nil,
+        };
+
+        let response = popped.bulk_response().unwrap_or(CommandResponse::Nil);
+
+        self.lazy_expire(destination);
+        let dest_compact = CompactKey::new(destination);
+        let dest_list = self.get_or_create_list(&dest_compact);
+        match dest_list {
+            Ok(deque) => {
+                if to_left {
+                    deque.push_front(popped);
+                } else {
+                    deque.push_back(popped);
+                }
+            }
+            Err(e) => return e,
+        }
+
+        response
+    }
+
     // ─── Hash operations ─────────────────────────────────────────────
 
     fn cmd_hset(&mut self, key: &[u8], fields: &[(Vec<u8>, Vec<u8>)]) -> CommandResponse {
@@ -1299,6 +2370,267 @@ impl ShardStore {
         }
     }
 
+    fn cmd_hmget(&mut self, key: &[u8], fields: &[Vec<u8>]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::Hash(map) => {
+                    let results: Vec<CommandResponse> = fields
+                        .iter()
+                        .map(|f| {
+                            let fk = CompactKey::new(f);
+                            match map.get(&fk) {
+                                Some(val) => val.bulk_response().unwrap_or(CommandResponse::Nil),
+                                None => CommandResponse::Nil,
+                            }
+                        })
+                        .collect();
+                    CommandResponse::Array(results)
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Array(fields.iter().map(|_| CommandResponse::Nil).collect()),
+        }
+    }
+
+    fn cmd_hkeys(&mut self, key: &[u8]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::Hash(map) => CommandResponse::Array(
+                    map.keys()
+                        .map(|k| CommandResponse::BulkString(k.as_bytes().to_vec()))
+                        .collect(),
+                ),
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Array(vec![]),
+        }
+    }
+
+    fn cmd_hvals(&mut self, key: &[u8]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::Hash(map) => CommandResponse::Array(
+                    map.values()
+                        .map(|v| v.bulk_response().unwrap_or(CommandResponse::Nil))
+                        .collect(),
+                ),
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Array(vec![]),
+        }
+    }
+
+    fn cmd_hsetnx(&mut self, key: &[u8], field: &[u8], value: &[u8]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        let is_new = !self.entries.contains_key(&compact);
+        let hash = self.get_or_create_hash(&compact);
+        match hash {
+            Ok(map) => {
+                let fk = CompactKey::new(field);
+                if map.contains_key(&fk) {
+                    return CommandResponse::Integer(0);
+                }
+                let new_val = Value::from_raw_bytes(value);
+                let mut mem_delta = fk.as_bytes().len() + new_val.estimated_size();
+                if is_new {
+                    mem_delta += key.len()
+                        + std::mem::size_of::<CompactKey>()
+                        + std::mem::size_of::<KeyEntry>();
+                }
+                map.insert(fk, new_val);
+                self.memory_used += mem_delta;
+                *self.tenant_memory.entry(self.current_tenant).or_insert(0) += mem_delta;
+                CommandResponse::Integer(1)
+            }
+            Err(e) => e,
+        }
+    }
+
+    fn cmd_hincrbyfloat(&mut self, key: &[u8], field: &[u8], delta: f64) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        let hash = self.get_or_create_hash(&compact);
+        match hash {
+            Ok(map) => {
+                let fk = CompactKey::new(field);
+                let current = match map.get(&fk) {
+                    Some(val) => {
+                        match val.as_bytes().and_then(|b| {
+                            std::str::from_utf8(&b)
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                        }) {
+                            Some(f) => f,
+                            None => {
+                                return CommandResponse::Error(
+                                    "ERR hash value is not a valid float".into(),
+                                )
+                            }
+                        }
+                    }
+                    None => 0.0,
+                };
+                let result = current + delta;
+                if result.is_infinite() || result.is_nan() {
+                    return CommandResponse::Error(
+                        "ERR increment would produce NaN or Infinity".into(),
+                    );
+                }
+                let formatted = format_float(result);
+                map.insert(fk, Value::from_raw_bytes(formatted.as_bytes()));
+                CommandResponse::BulkString(formatted.into_bytes())
+            }
+            Err(e) => e,
+        }
+    }
+
+    fn cmd_hrandfield(
+        &mut self,
+        key: &[u8],
+        count: Option<i64>,
+        withvalues: bool,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::Hash(map) => {
+                    if map.is_empty() {
+                        return if count.is_some() {
+                            CommandResponse::Array(vec![])
+                        } else {
+                            CommandResponse::Nil
+                        };
+                    }
+                    let keys: Vec<&CompactKey> = map.keys().collect();
+                    match count {
+                        None => {
+                            let idx = (self.eviction_counter as usize) % keys.len();
+                            self.eviction_counter = self.eviction_counter.wrapping_add(1);
+                            CommandResponse::BulkString(keys[idx].as_bytes().to_vec())
+                        }
+                        Some(c) if c >= 0 => {
+                            let take = (c as usize).min(keys.len());
+                            let mut result =
+                                Vec::with_capacity(if withvalues { take * 2 } else { take });
+                            let start = (self.eviction_counter as usize) % keys.len();
+                            self.eviction_counter = self.eviction_counter.wrapping_add(take as u64);
+                            for i in 0..take {
+                                let idx = (start + i) % keys.len();
+                                result.push(CommandResponse::BulkString(
+                                    keys[idx].as_bytes().to_vec(),
+                                ));
+                                if withvalues {
+                                    let val = map.get(keys[idx]).unwrap();
+                                    result
+                                        .push(val.bulk_response().unwrap_or(CommandResponse::Nil));
+                                }
+                            }
+                            CommandResponse::Array(result)
+                        }
+                        Some(c) => {
+                            let abs_count = c.unsigned_abs() as usize;
+                            let mut result = Vec::with_capacity(if withvalues {
+                                abs_count * 2
+                            } else {
+                                abs_count
+                            });
+                            for i in 0..abs_count {
+                                let idx = ((self.eviction_counter as usize) + i) % keys.len();
+                                result.push(CommandResponse::BulkString(
+                                    keys[idx].as_bytes().to_vec(),
+                                ));
+                                if withvalues {
+                                    let val = map.get(keys[idx]).unwrap();
+                                    result
+                                        .push(val.bulk_response().unwrap_or(CommandResponse::Nil));
+                                }
+                            }
+                            self.eviction_counter =
+                                self.eviction_counter.wrapping_add(abs_count as u64);
+                            CommandResponse::Array(result)
+                        }
+                    }
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => {
+                if count.is_some() {
+                    CommandResponse::Array(vec![])
+                } else {
+                    CommandResponse::Nil
+                }
+            }
+        }
+    }
+
+    fn cmd_hscan(
+        &mut self,
+        key: &[u8],
+        cursor: u64,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::Hash(map) => {
+                    let mut fields: Vec<(&CompactKey, &Value)> = map
+                        .iter()
+                        .filter(|(k, _)| pattern.map_or(true, |p| glob_match(p, k.as_bytes())))
+                        .collect();
+                    fields.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+
+                    let start = cursor as usize;
+                    let end = (start + count).min(fields.len());
+
+                    if start >= fields.len() {
+                        return CommandResponse::Array(vec![
+                            CommandResponse::BulkString(b"0".to_vec()),
+                            CommandResponse::Array(vec![]),
+                        ]);
+                    }
+
+                    let mut results = Vec::with_capacity((end - start) * 2);
+                    for (k, v) in &fields[start..end] {
+                        results.push(CommandResponse::BulkString(k.as_bytes().to_vec()));
+                        results.push(v.bulk_response().unwrap_or(CommandResponse::Nil));
+                    }
+
+                    let next_cursor = if end >= fields.len() { 0 } else { end as u64 };
+
+                    CommandResponse::Array(vec![
+                        CommandResponse::BulkString(next_cursor.to_string().into_bytes()),
+                        CommandResponse::Array(results),
+                    ])
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Array(vec![
+                CommandResponse::BulkString(b"0".to_vec()),
+                CommandResponse::Array(vec![]),
+            ]),
+        }
+    }
+
     // ─── Set operations ──────────────────────────────────────────────
 
     fn cmd_sadd(&mut self, key: &[u8], members: &[Vec<u8>]) -> CommandResponse {
@@ -1408,6 +2740,468 @@ impl ShardStore {
                 ),
             },
             None => CommandResponse::Integer(0),
+        }
+    }
+
+    fn cmd_spop(&mut self, key: &[u8], count: Option<usize>) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        let result = match self.entries.get_mut(&compact) {
+            Some(entry) => match &mut entry.value {
+                Value::Set(set) => {
+                    if set.is_empty() {
+                        return if count.is_some() {
+                            CommandResponse::Array(vec![])
+                        } else {
+                            CommandResponse::Nil
+                        };
+                    }
+                    let n = count.unwrap_or(1);
+                    let mut popped = Vec::with_capacity(n.min(set.len()));
+                    for _ in 0..n {
+                        if set.is_empty() {
+                            break;
+                        }
+                        let idx = (self.eviction_counter as usize) % set.len();
+                        self.eviction_counter = self.eviction_counter.wrapping_add(1);
+                        let val = set.iter().nth(idx).cloned();
+                        if let Some(v) = val {
+                            set.remove(&v);
+                            popped.push(v);
+                        }
+                    }
+                    let is_empty = set.is_empty();
+                    let resp = if count.is_some() {
+                        CommandResponse::Array(
+                            popped
+                                .iter()
+                                .map(|v| v.bulk_response().unwrap_or(CommandResponse::Nil))
+                                .collect(),
+                        )
+                    } else {
+                        popped
+                            .first()
+                            .and_then(|v| v.bulk_response())
+                            .unwrap_or(CommandResponse::Nil)
+                    };
+                    (resp, is_empty)
+                }
+                _ => {
+                    return CommandResponse::Error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                    )
+                }
+            },
+            None => {
+                return if count.is_some() {
+                    CommandResponse::Array(vec![])
+                } else {
+                    CommandResponse::Nil
+                }
+            }
+        };
+        if result.1 {
+            self.entries.remove(&compact);
+        }
+        result.0
+    }
+
+    fn cmd_srandmember(&mut self, key: &[u8], count: Option<i64>) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::Set(set) => {
+                    if set.is_empty() {
+                        return if count.is_some() {
+                            CommandResponse::Array(vec![])
+                        } else {
+                            CommandResponse::Nil
+                        };
+                    }
+                    let members: Vec<&Value> = set.iter().collect();
+                    match count {
+                        None => {
+                            let idx = (self.eviction_counter as usize) % members.len();
+                            self.eviction_counter = self.eviction_counter.wrapping_add(1);
+                            members[idx].bulk_response().unwrap_or(CommandResponse::Nil)
+                        }
+                        Some(c) if c >= 0 => {
+                            let take = (c as usize).min(members.len());
+                            let start = (self.eviction_counter as usize) % members.len();
+                            self.eviction_counter = self.eviction_counter.wrapping_add(take as u64);
+                            let mut result = Vec::with_capacity(take);
+                            for i in 0..take {
+                                let idx = (start + i) % members.len();
+                                result.push(
+                                    members[idx].bulk_response().unwrap_or(CommandResponse::Nil),
+                                );
+                            }
+                            CommandResponse::Array(result)
+                        }
+                        Some(c) => {
+                            let abs_count = c.unsigned_abs() as usize;
+                            let mut result = Vec::with_capacity(abs_count);
+                            for i in 0..abs_count {
+                                let idx = ((self.eviction_counter as usize) + i) % members.len();
+                                result.push(
+                                    members[idx].bulk_response().unwrap_or(CommandResponse::Nil),
+                                );
+                            }
+                            self.eviction_counter =
+                                self.eviction_counter.wrapping_add(abs_count as u64);
+                            CommandResponse::Array(result)
+                        }
+                    }
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => {
+                if count.is_some() {
+                    CommandResponse::Array(vec![])
+                } else {
+                    CommandResponse::Nil
+                }
+            }
+        }
+    }
+
+    fn collect_set_members(&mut self, key: &[u8]) -> Result<HashSet<Value>, CommandResponse> {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::Set(set) => Ok(set.clone()),
+                _ => Err(CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                )),
+            },
+            None => Ok(HashSet::new()),
+        }
+    }
+
+    fn cmd_sunion(&mut self, keys: &[Vec<u8>]) -> CommandResponse {
+        let mut result: HashSet<Value> = HashSet::new();
+        for key in keys {
+            match self.collect_set_members(key) {
+                Ok(set) => {
+                    for v in set {
+                        result.insert(v);
+                    }
+                }
+                Err(e) => return e,
+            }
+        }
+        CommandResponse::Array(
+            result
+                .iter()
+                .map(|v| v.bulk_response().unwrap_or(CommandResponse::Nil))
+                .collect(),
+        )
+    }
+
+    fn cmd_sunionstore(&mut self, destination: &[u8], keys: &[Vec<u8>]) -> CommandResponse {
+        let mut result: HashSet<Value> = HashSet::new();
+        for key in keys {
+            match self.collect_set_members(key) {
+                Ok(set) => {
+                    for v in set {
+                        result.insert(v);
+                    }
+                }
+                Err(e) => return e,
+            }
+        }
+        let count = result.len() as i64;
+        self.del(destination);
+        if !result.is_empty() {
+            let compact = CompactKey::new(destination);
+            let mut memory_delta = destination.len()
+                + std::mem::size_of::<CompactKey>()
+                + std::mem::size_of::<KeyEntry>();
+            for v in &result {
+                memory_delta += v.estimated_size();
+            }
+            let entry =
+                KeyEntry::new_with_tenant(compact.clone(), Value::Set(result), self.current_tenant);
+            self.entries.insert(compact, entry);
+            self.memory_used += memory_delta;
+            *self.tenant_memory.entry(self.current_tenant).or_insert(0) += memory_delta;
+        }
+        CommandResponse::Integer(count)
+    }
+
+    fn cmd_sinter(&mut self, keys: &[Vec<u8>]) -> CommandResponse {
+        if keys.is_empty() {
+            return CommandResponse::Array(vec![]);
+        }
+        let first = match self.collect_set_members(&keys[0]) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let mut result = first;
+        for key in &keys[1..] {
+            match self.collect_set_members(key) {
+                Ok(set) => {
+                    result = result.intersection(&set).cloned().collect();
+                }
+                Err(e) => return e,
+            }
+        }
+        CommandResponse::Array(
+            result
+                .iter()
+                .map(|v| v.bulk_response().unwrap_or(CommandResponse::Nil))
+                .collect(),
+        )
+    }
+
+    fn cmd_sinterstore(&mut self, destination: &[u8], keys: &[Vec<u8>]) -> CommandResponse {
+        if keys.is_empty() {
+            self.del(destination);
+            return CommandResponse::Integer(0);
+        }
+        let first = match self.collect_set_members(&keys[0]) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let mut result = first;
+        for key in &keys[1..] {
+            match self.collect_set_members(key) {
+                Ok(set) => {
+                    result = result.intersection(&set).cloned().collect();
+                }
+                Err(e) => return e,
+            }
+        }
+        let count = result.len() as i64;
+        self.del(destination);
+        if !result.is_empty() {
+            let compact = CompactKey::new(destination);
+            let mut memory_delta = destination.len()
+                + std::mem::size_of::<CompactKey>()
+                + std::mem::size_of::<KeyEntry>();
+            for v in &result {
+                memory_delta += v.estimated_size();
+            }
+            let entry =
+                KeyEntry::new_with_tenant(compact.clone(), Value::Set(result), self.current_tenant);
+            self.entries.insert(compact, entry);
+            self.memory_used += memory_delta;
+            *self.tenant_memory.entry(self.current_tenant).or_insert(0) += memory_delta;
+        }
+        CommandResponse::Integer(count)
+    }
+
+    fn cmd_sdiff(&mut self, keys: &[Vec<u8>]) -> CommandResponse {
+        if keys.is_empty() {
+            return CommandResponse::Array(vec![]);
+        }
+        let first = match self.collect_set_members(&keys[0]) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let mut result = first;
+        for key in &keys[1..] {
+            match self.collect_set_members(key) {
+                Ok(set) => {
+                    result = result.difference(&set).cloned().collect();
+                }
+                Err(e) => return e,
+            }
+        }
+        CommandResponse::Array(
+            result
+                .iter()
+                .map(|v| v.bulk_response().unwrap_or(CommandResponse::Nil))
+                .collect(),
+        )
+    }
+
+    fn cmd_sdiffstore(&mut self, destination: &[u8], keys: &[Vec<u8>]) -> CommandResponse {
+        if keys.is_empty() {
+            self.del(destination);
+            return CommandResponse::Integer(0);
+        }
+        let first = match self.collect_set_members(&keys[0]) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let mut result = first;
+        for key in &keys[1..] {
+            match self.collect_set_members(key) {
+                Ok(set) => {
+                    result = result.difference(&set).cloned().collect();
+                }
+                Err(e) => return e,
+            }
+        }
+        let count = result.len() as i64;
+        self.del(destination);
+        if !result.is_empty() {
+            let compact = CompactKey::new(destination);
+            let mut memory_delta = destination.len()
+                + std::mem::size_of::<CompactKey>()
+                + std::mem::size_of::<KeyEntry>();
+            for v in &result {
+                memory_delta += v.estimated_size();
+            }
+            let entry =
+                KeyEntry::new_with_tenant(compact.clone(), Value::Set(result), self.current_tenant);
+            self.entries.insert(compact, entry);
+            self.memory_used += memory_delta;
+            *self.tenant_memory.entry(self.current_tenant).or_insert(0) += memory_delta;
+        }
+        CommandResponse::Integer(count)
+    }
+
+    fn cmd_sintercard(&mut self, keys: &[Vec<u8>], limit: Option<usize>) -> CommandResponse {
+        if keys.is_empty() {
+            return CommandResponse::Integer(0);
+        }
+        let first = match self.collect_set_members(&keys[0]) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let mut result = first;
+        for key in &keys[1..] {
+            match self.collect_set_members(key) {
+                Ok(set) => {
+                    result = result.intersection(&set).cloned().collect();
+                }
+                Err(e) => return e,
+            }
+        }
+        let count = match limit {
+            Some(lim) if lim > 0 => result.len().min(lim),
+            _ => result.len(),
+        };
+        CommandResponse::Integer(count as i64)
+    }
+
+    fn cmd_smove(&mut self, source: &[u8], destination: &[u8], member: &[u8]) -> CommandResponse {
+        self.lazy_expire(source);
+        self.lazy_expire(destination);
+        let val = Value::from_raw_bytes(member);
+        let src_compact = CompactKey::new(source);
+        let removed = match self.entries.get_mut(&src_compact) {
+            Some(entry) => match &mut entry.value {
+                Value::Set(set) => set.remove(&val),
+                _ => {
+                    return CommandResponse::Error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                    )
+                }
+            },
+            None => return CommandResponse::Integer(0),
+        };
+        if !removed {
+            return CommandResponse::Integer(0);
+        }
+        let src_empty = self
+            .entries
+            .get(&src_compact)
+            .map(|e| matches!(&e.value, Value::Set(s) if s.is_empty()))
+            .unwrap_or(false);
+        if src_empty {
+            self.entries.remove(&src_compact);
+        }
+        let dst_compact = CompactKey::new(destination);
+        let dst_set = self.get_or_create_set(&dst_compact);
+        match dst_set {
+            Ok(set) => {
+                set.insert(val);
+            }
+            Err(e) => return e,
+        }
+        CommandResponse::Integer(1)
+    }
+
+    fn cmd_smismember(&mut self, key: &[u8], members: &[Vec<u8>]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::Set(set) => {
+                    let results: Vec<CommandResponse> = members
+                        .iter()
+                        .map(|m| {
+                            let val = Value::from_raw_bytes(m);
+                            CommandResponse::Integer(if set.contains(&val) { 1 } else { 0 })
+                        })
+                        .collect();
+                    CommandResponse::Array(results)
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Array(vec![CommandResponse::Integer(0); members.len()]),
+        }
+    }
+
+    fn cmd_sscan(
+        &mut self,
+        key: &[u8],
+        cursor: u64,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::Set(set) => {
+                    let mut members: Vec<&Value> = set
+                        .iter()
+                        .filter(|v| {
+                            pattern.map_or(true, |p| {
+                                if let Some(CommandResponse::BulkString(b)) = v.bulk_response() {
+                                    glob_match(p, &b)
+                                } else {
+                                    false
+                                }
+                            })
+                        })
+                        .collect();
+                    members.sort_by(|a, b| {
+                        let ab = a.to_bytes();
+                        let bb = b.to_bytes();
+                        ab.cmp(&bb)
+                    });
+
+                    let start = cursor as usize;
+                    let end = (start + count).min(members.len());
+
+                    if start >= members.len() {
+                        return CommandResponse::Array(vec![
+                            CommandResponse::BulkString(b"0".to_vec()),
+                            CommandResponse::Array(vec![]),
+                        ]);
+                    }
+
+                    let mut results = Vec::with_capacity(end - start);
+                    for v in &members[start..end] {
+                        results.push(v.bulk_response().unwrap_or(CommandResponse::Nil));
+                    }
+
+                    let next_cursor = if end >= members.len() { 0 } else { end as u64 };
+
+                    CommandResponse::Array(vec![
+                        CommandResponse::BulkString(next_cursor.to_string().into_bytes()),
+                        CommandResponse::Array(results),
+                    ])
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Array(vec![
+                CommandResponse::BulkString(b"0".to_vec()),
+                CommandResponse::Array(vec![]),
+            ]),
         }
     }
 
@@ -1652,6 +3446,1209 @@ impl ShardStore {
             },
             None => CommandResponse::Integer(0),
         }
+    }
+
+    fn cmd_zrevrangebyscore(
+        &mut self,
+        key: &[u8],
+        max: f64,
+        min: f64,
+        withscores: bool,
+        offset: Option<usize>,
+        count: Option<usize>,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::SortedSet(map) => {
+                    let mut sorted: Vec<(&Vec<u8>, &f64)> = map
+                        .iter()
+                        .filter(|(_, s)| **s >= min && **s <= max)
+                        .collect();
+                    sorted.sort_by(|a, b| {
+                        b.1.partial_cmp(a.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| b.0.cmp(a.0))
+                    });
+                    let off = offset.unwrap_or(0);
+                    let iter: Box<dyn Iterator<Item = &(&Vec<u8>, &f64)>> = if let Some(c) = count {
+                        Box::new(sorted.iter().skip(off).take(c))
+                    } else {
+                        Box::new(sorted.iter().skip(off))
+                    };
+                    let mut results = Vec::new();
+                    for (member, score) in iter {
+                        results.push(CommandResponse::BulkString(member.to_vec()));
+                        if withscores {
+                            results.push(CommandResponse::BulkString(
+                                format!("{}", score).into_bytes(),
+                            ));
+                        }
+                    }
+                    CommandResponse::Array(results)
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Array(vec![]),
+        }
+    }
+
+    fn cmd_zpopmin(&mut self, key: &[u8], count: Option<usize>) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        let result = match self.entries.get_mut(&compact) {
+            Some(entry) => match &mut entry.value {
+                Value::SortedSet(map) => {
+                    if map.is_empty() {
+                        return CommandResponse::Array(vec![]);
+                    }
+                    let n = count.unwrap_or(1);
+                    let mut sorted: Vec<(Vec<u8>, f64)> =
+                        map.iter().map(|(m, s)| (m.clone(), *s)).collect();
+                    sorted.sort_by(|a, b| {
+                        a.1.partial_cmp(&b.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.0.cmp(&b.0))
+                    });
+                    let take = n.min(sorted.len());
+                    let mut results = Vec::with_capacity(take * 2);
+                    for (member, score) in sorted.iter().take(take) {
+                        map.remove(member);
+                        results.push(CommandResponse::BulkString(member.clone()));
+                        results.push(CommandResponse::BulkString(
+                            format!("{}", score).into_bytes(),
+                        ));
+                    }
+                    let is_empty = map.is_empty();
+                    (CommandResponse::Array(results), is_empty)
+                }
+                _ => {
+                    return CommandResponse::Error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                    )
+                }
+            },
+            None => return CommandResponse::Array(vec![]),
+        };
+        if result.1 {
+            self.entries.remove(&compact);
+        }
+        result.0
+    }
+
+    fn cmd_zpopmax(&mut self, key: &[u8], count: Option<usize>) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        let result = match self.entries.get_mut(&compact) {
+            Some(entry) => match &mut entry.value {
+                Value::SortedSet(map) => {
+                    if map.is_empty() {
+                        return CommandResponse::Array(vec![]);
+                    }
+                    let n = count.unwrap_or(1);
+                    let mut sorted: Vec<(Vec<u8>, f64)> =
+                        map.iter().map(|(m, s)| (m.clone(), *s)).collect();
+                    sorted.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| b.0.cmp(&a.0))
+                    });
+                    let take = n.min(sorted.len());
+                    let mut results = Vec::with_capacity(take * 2);
+                    for (member, score) in sorted.iter().take(take) {
+                        map.remove(member);
+                        results.push(CommandResponse::BulkString(member.clone()));
+                        results.push(CommandResponse::BulkString(
+                            format!("{}", score).into_bytes(),
+                        ));
+                    }
+                    let is_empty = map.is_empty();
+                    (CommandResponse::Array(results), is_empty)
+                }
+                _ => {
+                    return CommandResponse::Error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                    )
+                }
+            },
+            None => return CommandResponse::Array(vec![]),
+        };
+        if result.1 {
+            self.entries.remove(&compact);
+        }
+        result.0
+    }
+
+    fn cmd_zrangebylex(
+        &mut self,
+        key: &[u8],
+        min: &[u8],
+        max: &[u8],
+        offset: Option<usize>,
+        count: Option<usize>,
+        reverse: bool,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::SortedSet(map) => {
+                    let mut sorted: Vec<(&Vec<u8>, &f64)> = map.iter().collect();
+                    sorted.sort_by(|a, b| {
+                        a.1.partial_cmp(b.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.0.cmp(b.0))
+                    });
+                    if reverse {
+                        sorted.reverse();
+                    }
+                    let filtered: Vec<&Vec<u8>> = sorted
+                        .iter()
+                        .map(|(m, _)| *m)
+                        .filter(|m| lex_in_range(m, min, max))
+                        .collect();
+                    let off = offset.unwrap_or(0);
+                    let iter: Box<dyn Iterator<Item = &&Vec<u8>>> = if let Some(c) = count {
+                        Box::new(filtered.iter().skip(off).take(c))
+                    } else {
+                        Box::new(filtered.iter().skip(off))
+                    };
+                    let results: Vec<CommandResponse> = iter
+                        .map(|m| CommandResponse::BulkString((*m).clone()))
+                        .collect();
+                    CommandResponse::Array(results)
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Array(vec![]),
+        }
+    }
+
+    fn cmd_zlexcount(&mut self, key: &[u8], min: &[u8], max: &[u8]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::SortedSet(map) => {
+                    let count = map.keys().filter(|m| lex_in_range(m, min, max)).count();
+                    CommandResponse::Integer(count as i64)
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Integer(0),
+        }
+    }
+
+    fn cmd_zmscore(&mut self, key: &[u8], members: &[Vec<u8>]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::SortedSet(map) => {
+                    let results: Vec<CommandResponse> = members
+                        .iter()
+                        .map(|m| match map.get(m.as_slice()) {
+                            Some(score) => {
+                                CommandResponse::BulkString(format!("{}", score).into_bytes())
+                            }
+                            None => CommandResponse::Nil,
+                        })
+                        .collect();
+                    CommandResponse::Array(results)
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Array(vec![CommandResponse::Nil; members.len()]),
+        }
+    }
+
+    fn cmd_zrandmember(
+        &mut self,
+        key: &[u8],
+        count: Option<i64>,
+        withscores: bool,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::SortedSet(map) => {
+                    if map.is_empty() {
+                        return if count.is_some() {
+                            CommandResponse::Array(vec![])
+                        } else {
+                            CommandResponse::Nil
+                        };
+                    }
+                    let members: Vec<(&Vec<u8>, &f64)> = map.iter().collect();
+                    match count {
+                        None => {
+                            let idx = (self.eviction_counter as usize) % members.len();
+                            self.eviction_counter = self.eviction_counter.wrapping_add(1);
+                            CommandResponse::BulkString(members[idx].0.clone())
+                        }
+                        Some(c) if c >= 0 => {
+                            let take = (c as usize).min(members.len());
+                            let start = (self.eviction_counter as usize) % members.len();
+                            self.eviction_counter = self.eviction_counter.wrapping_add(take as u64);
+                            let mut result =
+                                Vec::with_capacity(if withscores { take * 2 } else { take });
+                            for i in 0..take {
+                                let idx = (start + i) % members.len();
+                                result.push(CommandResponse::BulkString(members[idx].0.clone()));
+                                if withscores {
+                                    result.push(CommandResponse::BulkString(
+                                        format!("{}", members[idx].1).into_bytes(),
+                                    ));
+                                }
+                            }
+                            CommandResponse::Array(result)
+                        }
+                        Some(c) => {
+                            let abs_count = c.unsigned_abs() as usize;
+                            let mut result = Vec::with_capacity(if withscores {
+                                abs_count * 2
+                            } else {
+                                abs_count
+                            });
+                            for i in 0..abs_count {
+                                let idx = ((self.eviction_counter as usize) + i) % members.len();
+                                result.push(CommandResponse::BulkString(members[idx].0.clone()));
+                                if withscores {
+                                    result.push(CommandResponse::BulkString(
+                                        format!("{}", members[idx].1).into_bytes(),
+                                    ));
+                                }
+                            }
+                            self.eviction_counter =
+                                self.eviction_counter.wrapping_add(abs_count as u64);
+                            CommandResponse::Array(result)
+                        }
+                    }
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => {
+                if count.is_some() {
+                    CommandResponse::Array(vec![])
+                } else {
+                    CommandResponse::Nil
+                }
+            }
+        }
+    }
+
+    fn cmd_zscan(
+        &mut self,
+        key: &[u8],
+        cursor: u64,
+        pattern: Option<&str>,
+        count: usize,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::SortedSet(map) => {
+                    let mut members: Vec<(&Vec<u8>, &f64)> = map
+                        .iter()
+                        .filter(|(m, _)| pattern.map_or(true, |p| glob_match(p, m)))
+                        .collect();
+                    members.sort_by(|a, b| a.0.cmp(b.0));
+
+                    let start = cursor as usize;
+                    let end = (start + count).min(members.len());
+
+                    if start >= members.len() {
+                        return CommandResponse::Array(vec![
+                            CommandResponse::BulkString(b"0".to_vec()),
+                            CommandResponse::Array(vec![]),
+                        ]);
+                    }
+
+                    let mut results = Vec::with_capacity((end - start) * 2);
+                    for (m, s) in &members[start..end] {
+                        results.push(CommandResponse::BulkString((*m).clone()));
+                        results.push(CommandResponse::BulkString(format!("{}", s).into_bytes()));
+                    }
+
+                    let next_cursor = if end >= members.len() { 0 } else { end as u64 };
+
+                    CommandResponse::Array(vec![
+                        CommandResponse::BulkString(next_cursor.to_string().into_bytes()),
+                        CommandResponse::Array(results),
+                    ])
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Array(vec![
+                CommandResponse::BulkString(b"0".to_vec()),
+                CommandResponse::Array(vec![]),
+            ]),
+        }
+    }
+
+    // ─── HyperLogLog operations ─────────────────────────────────────────
+
+    fn cmd_pfadd(&mut self, key: &[u8], elements: &[Vec<u8>]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        let is_new = !self.entries.contains_key(&compact);
+        let mut registers = if is_new {
+            vec![0u8; HLL_REGISTER_BYTES]
+        } else {
+            match self.entries.get(&compact) {
+                Some(entry) => match entry.value.as_bytes() {
+                    Some(bytes) if bytes.len() == HLL_REGISTER_BYTES => bytes,
+                    Some(_) | None => {
+                        return CommandResponse::Error(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value"
+                                .into(),
+                        )
+                    }
+                },
+                None => vec![0u8; HLL_REGISTER_BYTES],
+            }
+        };
+
+        let mut changed = false;
+        for elem in elements {
+            if hll_add(&mut registers, elem) {
+                changed = true;
+            }
+        }
+
+        if changed || is_new {
+            let mut memory_delta = 0usize;
+            if is_new {
+                memory_delta += key.len()
+                    + std::mem::size_of::<CompactKey>()
+                    + std::mem::size_of::<KeyEntry>()
+                    + HLL_REGISTER_BYTES;
+            }
+            let entry = KeyEntry::new_with_tenant(
+                compact.clone(),
+                Value::from_raw_bytes(&registers),
+                self.current_tenant,
+            );
+            self.entries.insert(compact, entry);
+            self.memory_used += memory_delta;
+            *self.tenant_memory.entry(self.current_tenant).or_insert(0) += memory_delta;
+        }
+
+        CommandResponse::Integer(if changed { 1 } else { 0 })
+    }
+
+    fn cmd_pfcount_single(&mut self, key: &[u8]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match entry.value.as_bytes() {
+                Some(bytes) if bytes.len() == HLL_REGISTER_BYTES => {
+                    CommandResponse::Integer(hll_count(&bytes) as i64)
+                }
+                Some(_) => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+                None => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Integer(0),
+        }
+    }
+
+    fn cmd_pfcount_multi(&mut self, keys: &[Vec<u8>]) -> CommandResponse {
+        let mut merged = vec![0u8; HLL_REGISTER_BYTES];
+        for key in keys {
+            self.lazy_expire(key);
+            let compact = CompactKey::new(key);
+            if let Some(entry) = self.entries.get(&compact) {
+                match entry.value.as_bytes() {
+                    Some(bytes) if bytes.len() == HLL_REGISTER_BYTES => {
+                        hll_merge(&mut merged, &bytes);
+                    }
+                    Some(_) => {
+                        return CommandResponse::Error(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value"
+                                .into(),
+                        )
+                    }
+                    None => {
+                        return CommandResponse::Error(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value"
+                                .into(),
+                        )
+                    }
+                }
+            }
+        }
+        CommandResponse::Integer(hll_count(&merged) as i64)
+    }
+
+    fn cmd_pfmerge(&mut self, destkey: &[u8], sourcekeys: &[Vec<u8>]) -> CommandResponse {
+        let mut merged = vec![0u8; HLL_REGISTER_BYTES];
+
+        let dest_compact = CompactKey::new(destkey);
+        self.lazy_expire(destkey);
+        if let Some(entry) = self.entries.get(&dest_compact) {
+            match entry.value.as_bytes() {
+                Some(bytes) if bytes.len() == HLL_REGISTER_BYTES => {
+                    hll_merge(&mut merged, &bytes);
+                }
+                Some(_) => {
+                    return CommandResponse::Error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                    )
+                }
+                None => {
+                    return CommandResponse::Error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                    )
+                }
+            }
+        }
+
+        for key in sourcekeys {
+            self.lazy_expire(key);
+            let compact = CompactKey::new(key);
+            if let Some(entry) = self.entries.get(&compact) {
+                match entry.value.as_bytes() {
+                    Some(bytes) if bytes.len() == HLL_REGISTER_BYTES => {
+                        hll_merge(&mut merged, &bytes);
+                    }
+                    Some(_) => {
+                        return CommandResponse::Error(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value"
+                                .into(),
+                        )
+                    }
+                    None => {
+                        return CommandResponse::Error(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value"
+                                .into(),
+                        )
+                    }
+                }
+            }
+        }
+
+        let is_new = !self.entries.contains_key(&dest_compact);
+        let mut memory_delta = 0usize;
+        if is_new {
+            memory_delta += destkey.len()
+                + std::mem::size_of::<CompactKey>()
+                + std::mem::size_of::<KeyEntry>()
+                + HLL_REGISTER_BYTES;
+        }
+        let entry = KeyEntry::new_with_tenant(
+            dest_compact.clone(),
+            Value::from_raw_bytes(&merged),
+            self.current_tenant,
+        );
+        self.entries.insert(dest_compact, entry);
+        self.memory_used += memory_delta;
+        *self.tenant_memory.entry(self.current_tenant).or_insert(0) += memory_delta;
+
+        CommandResponse::Ok
+    }
+
+    // ─── Bitmap operations ──────────────────────────────────────────
+
+    fn get_string_bytes(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+        let compact = CompactKey::new(key);
+        self.entries.get(&compact).and_then(|e| e.value.as_bytes())
+    }
+
+    fn set_string_value(&mut self, key: &[u8], data: Vec<u8>) {
+        let compact = CompactKey::new(key);
+        let is_new = !self.entries.contains_key(&compact);
+        let new_value = Value::from_raw_bytes(&data);
+        if is_new {
+            let size = Self::estimate_key_entry_size(key, &new_value);
+            let entry = KeyEntry::new_with_tenant(compact.clone(), new_value, self.current_tenant);
+            self.entries.insert(compact, entry);
+            self.memory_used += size;
+            *self.tenant_memory.entry(self.current_tenant).or_insert(0) += size;
+        } else {
+            let entry = self
+                .entries
+                .get_mut(&compact)
+                .expect("checked contains_key");
+            let old_size = entry.value.estimated_size();
+            entry.value = new_value;
+            let new_size = entry.value.estimated_size();
+            if new_size > old_size {
+                self.memory_used += new_size - old_size;
+                *self.tenant_memory.entry(self.current_tenant).or_insert(0) += new_size - old_size;
+            } else {
+                self.memory_used = self.memory_used.saturating_sub(old_size - new_size);
+                let tm = self.tenant_memory.entry(self.current_tenant).or_insert(0);
+                *tm = tm.saturating_sub(old_size - new_size);
+            }
+        }
+    }
+
+    fn cmd_setbit(&mut self, key: &[u8], offset: u64, value: u8) -> CommandResponse {
+        self.lazy_expire(key);
+        let byte_idx = (offset / 8) as usize;
+        let bit_idx = 7 - (offset % 8) as usize;
+
+        let mut data = self.get_string_bytes(key).unwrap_or_default();
+
+        if byte_idx >= data.len() {
+            data.resize(byte_idx + 1, 0);
+        }
+
+        let old_bit = (data[byte_idx] >> bit_idx) & 1;
+
+        if value == 1 {
+            data[byte_idx] |= 1 << bit_idx;
+        } else {
+            data[byte_idx] &= !(1 << bit_idx);
+        }
+
+        self.set_string_value(key, data);
+        CommandResponse::Integer(old_bit as i64)
+    }
+
+    fn cmd_getbit(&mut self, key: &[u8], offset: u64) -> CommandResponse {
+        self.lazy_expire(key);
+        let byte_idx = (offset / 8) as usize;
+        let bit_idx = 7 - (offset % 8) as usize;
+
+        match self.get_string_bytes(key) {
+            Some(data) => {
+                if byte_idx >= data.len() {
+                    CommandResponse::Integer(0)
+                } else {
+                    CommandResponse::Integer(((data[byte_idx] >> bit_idx) & 1) as i64)
+                }
+            }
+            None => CommandResponse::Integer(0),
+        }
+    }
+
+    fn cmd_bitcount(
+        &mut self,
+        key: &[u8],
+        start: Option<i64>,
+        end: Option<i64>,
+        use_bit: bool,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let data = match self.get_string_bytes(key) {
+            Some(d) => d,
+            None => return CommandResponse::Integer(0),
+        };
+
+        if data.is_empty() {
+            return CommandResponse::Integer(0);
+        }
+
+        if use_bit {
+            let total_bits = (data.len() * 8) as i64;
+            let s = normalize_index(start.unwrap_or(0), total_bits);
+            let e = normalize_index(end.unwrap_or(total_bits - 1), total_bits);
+            if s > e {
+                return CommandResponse::Integer(0);
+            }
+            let mut count = 0i64;
+            for bit_pos in s..=e {
+                let byte_idx = bit_pos / 8;
+                let bit_idx = 7 - (bit_pos % 8);
+                if byte_idx < data.len() && (data[byte_idx] >> bit_idx) & 1 == 1 {
+                    count += 1;
+                }
+            }
+            CommandResponse::Integer(count)
+        } else {
+            let len = data.len() as i64;
+            let s = normalize_index(start.unwrap_or(0), len);
+            let e = normalize_index(end.unwrap_or(len - 1), len);
+            if s > e || s >= data.len() {
+                return CommandResponse::Integer(0);
+            }
+            let e = e.min(data.len() - 1);
+            let count: u32 = data[s..=e].iter().map(|b| b.count_ones()).sum();
+            CommandResponse::Integer(count as i64)
+        }
+    }
+
+    fn cmd_bitop(
+        &mut self,
+        operation: BitOperation,
+        destkey: &[u8],
+        keys: &[Vec<u8>],
+    ) -> CommandResponse {
+        let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
+        let mut max_len = 0usize;
+
+        for key in keys {
+            self.lazy_expire(key);
+            let data = self.get_string_bytes(key).unwrap_or_default();
+            max_len = max_len.max(data.len());
+            buffers.push(data);
+        }
+
+        if buffers.is_empty() {
+            self.set_string_value(destkey, Vec::new());
+            return CommandResponse::Integer(0);
+        }
+
+        let mut result = vec![0u8; max_len];
+
+        match operation {
+            BitOperation::And => {
+                result = vec![0xFF; max_len];
+                for buf in &buffers {
+                    for (i, byte) in result.iter_mut().enumerate() {
+                        let src = if i < buf.len() { buf[i] } else { 0 };
+                        *byte &= src;
+                    }
+                }
+            }
+            BitOperation::Or => {
+                for buf in &buffers {
+                    for (i, &src) in buf.iter().enumerate() {
+                        result[i] |= src;
+                    }
+                }
+            }
+            BitOperation::Xor => {
+                for buf in &buffers {
+                    for (i, &src) in buf.iter().enumerate() {
+                        result[i] ^= src;
+                    }
+                }
+            }
+            BitOperation::Not => {
+                let buf = &buffers[0];
+                result = vec![0u8; buf.len()];
+                for (i, &src) in buf.iter().enumerate() {
+                    result[i] = !src;
+                }
+            }
+        }
+
+        let len = result.len() as i64;
+        self.set_string_value(destkey, result);
+        CommandResponse::Integer(len)
+    }
+
+    fn cmd_bitpos(
+        &mut self,
+        key: &[u8],
+        bit: u8,
+        start: Option<i64>,
+        end: Option<i64>,
+        use_bit: bool,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let data = match self.get_string_bytes(key) {
+            Some(d) if !d.is_empty() => d,
+            _ => {
+                return if bit == 0 {
+                    CommandResponse::Integer(0)
+                } else {
+                    CommandResponse::Integer(-1)
+                };
+            }
+        };
+
+        let has_explicit_end = end.is_some();
+
+        if use_bit {
+            let total_bits = (data.len() * 8) as i64;
+            let s = normalize_index(start.unwrap_or(0), total_bits);
+            let e = normalize_index(end.unwrap_or(total_bits - 1), total_bits);
+            if s > e {
+                return CommandResponse::Integer(-1);
+            }
+            for bit_pos in s..=e.min(data.len() * 8 - 1) {
+                let byte_idx = bit_pos / 8;
+                let bit_idx = 7 - (bit_pos % 8);
+                let current = (data[byte_idx] >> bit_idx) & 1;
+                if current == bit {
+                    return CommandResponse::Integer(bit_pos as i64);
+                }
+            }
+            CommandResponse::Integer(-1)
+        } else {
+            let len = data.len() as i64;
+            let s = normalize_index(start.unwrap_or(0), len);
+            let e = normalize_index(end.unwrap_or(len - 1), len);
+            if s > e || s >= data.len() {
+                return CommandResponse::Integer(-1);
+            }
+            let e = e.min(data.len() - 1);
+            for (byte_idx, &byte_val) in data.iter().enumerate().take(e + 1).skip(s) {
+                for bit_idx in (0..8).rev() {
+                    let current = (byte_val >> bit_idx) & 1;
+                    if current == bit {
+                        return CommandResponse::Integer((byte_idx * 8 + (7 - bit_idx)) as i64);
+                    }
+                }
+            }
+            if bit == 0 && !has_explicit_end {
+                CommandResponse::Integer((data.len() * 8) as i64)
+            } else {
+                CommandResponse::Integer(-1)
+            }
+        }
+    }
+
+    fn cmd_bitfield(&mut self, key: &[u8], operations: &[BitFieldOperation]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+
+        let mut data = match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::InlineStr { .. } | Value::HeapStr(_) | Value::Int(_) => {
+                    entry.value.as_bytes().unwrap_or_default()
+                }
+                _ => {
+                    return CommandResponse::Error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                    )
+                }
+            },
+            None => Vec::new(),
+        };
+
+        let mut overflow = BitFieldOverflow::Wrap;
+        let mut responses = Vec::new();
+        let mut dirty = false;
+
+        for op in operations {
+            match *op {
+                BitFieldOperation::Overflow(mode) => overflow = mode,
+                BitFieldOperation::Get { encoding, offset } => {
+                    let Some(bit_offset) = Self::resolve_bitfield_offset(encoding, offset) else {
+                        return CommandResponse::Error(
+                            "ERR bit offset is not an integer or out of range".into(),
+                        );
+                    };
+                    let value = Self::bitfield_read(&data, bit_offset, encoding);
+                    responses.push(CommandResponse::Integer(value));
+                }
+                BitFieldOperation::Set {
+                    encoding,
+                    offset,
+                    value,
+                } => {
+                    let Some(bit_offset) = Self::resolve_bitfield_offset(encoding, offset) else {
+                        return CommandResponse::Error(
+                            "ERR bit offset is not an integer or out of range".into(),
+                        );
+                    };
+                    let old_value = Self::bitfield_read(&data, bit_offset, encoding);
+                    let Some(applied) =
+                        Self::apply_bitfield_overflow(value as i128, encoding, overflow)
+                    else {
+                        responses.push(CommandResponse::Nil);
+                        continue;
+                    };
+                    Self::bitfield_write(&mut data, bit_offset, encoding, applied);
+                    responses.push(CommandResponse::Integer(old_value));
+                    dirty = true;
+                }
+                BitFieldOperation::IncrBy {
+                    encoding,
+                    offset,
+                    increment,
+                } => {
+                    let Some(bit_offset) = Self::resolve_bitfield_offset(encoding, offset) else {
+                        return CommandResponse::Error(
+                            "ERR bit offset is not an integer or out of range".into(),
+                        );
+                    };
+                    let current = Self::bitfield_read(&data, bit_offset, encoding) as i128;
+                    let target = current + increment as i128;
+                    let Some(applied) = Self::apply_bitfield_overflow(target, encoding, overflow)
+                    else {
+                        responses.push(CommandResponse::Nil);
+                        continue;
+                    };
+                    Self::bitfield_write(&mut data, bit_offset, encoding, applied);
+                    responses.push(CommandResponse::Integer(applied as i64));
+                    dirty = true;
+                }
+            }
+        }
+
+        if dirty {
+            self.set_string_value(key, data);
+        }
+
+        CommandResponse::Array(responses)
+    }
+
+    fn resolve_bitfield_offset(encoding: BitFieldEncoding, offset: BitFieldOffset) -> Option<u64> {
+        let base = match offset {
+            BitFieldOffset::Absolute(v) => v,
+            BitFieldOffset::Multiplied(v) => v.checked_mul(encoding.bits as i64)?,
+        };
+        if base < 0 {
+            return None;
+        }
+        let start = base as u64;
+        start.checked_add(encoding.bits as u64)?;
+        Some(start)
+    }
+
+    fn bitfield_read(data: &[u8], bit_offset: u64, encoding: BitFieldEncoding) -> i64 {
+        let width = encoding.bits as u32;
+        let mut raw: u128 = 0;
+        for i in 0..width {
+            let pos = bit_offset + i as u64;
+            let byte_idx = (pos / 8) as usize;
+            let bit_idx = 7 - (pos % 8) as usize;
+            let bit = if byte_idx < data.len() {
+                (data[byte_idx] >> bit_idx) & 1
+            } else {
+                0
+            };
+            raw = (raw << 1) | bit as u128;
+        }
+
+        if encoding.signed {
+            let shift = 128 - width;
+            (((raw << shift) as i128) >> shift) as i64
+        } else {
+            raw as i64
+        }
+    }
+
+    fn bitfield_write(
+        data: &mut Vec<u8>,
+        bit_offset: u64,
+        encoding: BitFieldEncoding,
+        value: i128,
+    ) {
+        let width = encoding.bits as u32;
+        let encoded = Self::encode_bitfield_value(value, encoding);
+        let end_bit = bit_offset + width as u64;
+        let needed_bytes = end_bit.div_ceil(8) as usize;
+        if needed_bytes > data.len() {
+            data.resize(needed_bytes, 0);
+        }
+
+        for i in 0..width {
+            let src_shift = width - 1 - i;
+            let bit = ((encoded >> src_shift) & 1) as u8;
+            let pos = bit_offset + i as u64;
+            let byte_idx = (pos / 8) as usize;
+            let bit_idx = 7 - (pos % 8) as usize;
+            if bit == 1 {
+                data[byte_idx] |= 1 << bit_idx;
+            } else {
+                data[byte_idx] &= !(1 << bit_idx);
+            }
+        }
+    }
+
+    fn bitfield_bounds(encoding: BitFieldEncoding) -> (i128, i128) {
+        if encoding.signed {
+            let min = -(1i128 << (encoding.bits as u32 - 1));
+            let max = (1i128 << (encoding.bits as u32 - 1)) - 1;
+            (min, max)
+        } else {
+            (0, (1i128 << encoding.bits as u32) - 1)
+        }
+    }
+
+    fn apply_bitfield_overflow(
+        value: i128,
+        encoding: BitFieldEncoding,
+        mode: BitFieldOverflow,
+    ) -> Option<i128> {
+        let (min, max) = Self::bitfield_bounds(encoding);
+        if (min..=max).contains(&value) {
+            return Some(value);
+        }
+
+        match mode {
+            BitFieldOverflow::Fail => None,
+            BitFieldOverflow::Sat => Some(value.clamp(min, max)),
+            BitFieldOverflow::Wrap => {
+                let modulo = 1i128 << encoding.bits as u32;
+                let wrapped = ((value % modulo) + modulo) % modulo;
+                if encoding.signed {
+                    let sign_boundary = 1i128 << (encoding.bits as u32 - 1);
+                    if wrapped >= sign_boundary {
+                        Some(wrapped - modulo)
+                    } else {
+                        Some(wrapped)
+                    }
+                } else {
+                    Some(wrapped)
+                }
+            }
+        }
+    }
+
+    fn encode_bitfield_value(value: i128, encoding: BitFieldEncoding) -> u128 {
+        if encoding.signed && value < 0 {
+            (value + (1i128 << encoding.bits as u32)) as u128
+        } else {
+            value as u128
+        }
+    }
+
+    // ─── Geo operations ─────────────────────────────────────────────
+
+    fn cmd_geoadd(
+        &mut self,
+        key: &[u8],
+        nx: bool,
+        xx: bool,
+        ch: bool,
+        members: &[(f64, f64, Vec<u8>)],
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        let is_new = !self.entries.contains_key(&compact);
+        let zset = self.get_or_create_sorted_set(&compact);
+        match zset {
+            Ok(map) => {
+                let mut memory_delta: usize = 0;
+                if is_new {
+                    memory_delta += key.len()
+                        + std::mem::size_of::<CompactKey>()
+                        + std::mem::size_of::<KeyEntry>();
+                }
+                let mut count = 0i64;
+                let member_overhead = std::mem::size_of::<f64>();
+                for (lon, lat, member) in members {
+                    let score = geo_encode(*lon, *lat);
+                    let existing = map.get(member).copied();
+                    match existing {
+                        Some(old_score) => {
+                            if nx {
+                                continue;
+                            }
+                            if (old_score - score).abs() > f64::EPSILON {
+                                map.insert(member.clone(), score);
+                                if ch {
+                                    count += 1;
+                                }
+                            }
+                        }
+                        None => {
+                            if xx {
+                                continue;
+                            }
+                            map.insert(member.clone(), score);
+                            memory_delta += member.len() + member_overhead;
+                            count += 1;
+                        }
+                    }
+                }
+                self.memory_used += memory_delta;
+                *self.tenant_memory.entry(self.current_tenant).or_insert(0) += memory_delta;
+                CommandResponse::Integer(count)
+            }
+            Err(e) => e,
+        }
+    }
+
+    fn cmd_geodist(
+        &mut self,
+        key: &[u8],
+        member1: &[u8],
+        member2: &[u8],
+        unit: GeoUnit,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::SortedSet(map) => {
+                    let s1 = match map.get(member1) {
+                        Some(s) => *s,
+                        None => return CommandResponse::Nil,
+                    };
+                    let s2 = match map.get(member2) {
+                        Some(s) => *s,
+                        None => return CommandResponse::Nil,
+                    };
+                    let (lon1, lat1) = geo_decode(s1);
+                    let (lon2, lat2) = geo_decode(s2);
+                    let dist = haversine_distance(lat1, lon1, lat2, lon2);
+                    let converted = geo_convert_distance(dist, unit);
+                    CommandResponse::BulkString(format!("{:.4}", converted).into_bytes())
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Nil,
+        }
+    }
+
+    fn cmd_geohash(&mut self, key: &[u8], members: &[Vec<u8>]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::SortedSet(map) => {
+                    let results: Vec<CommandResponse> = members
+                        .iter()
+                        .map(|member| match map.get(member.as_slice()) {
+                            Some(&score) => {
+                                let (lon, lat) = geo_decode(score);
+                                let hash = geo_encode_base32(lon, lat);
+                                CommandResponse::BulkString(hash.into_bytes())
+                            }
+                            None => CommandResponse::Nil,
+                        })
+                        .collect();
+                    CommandResponse::Array(results)
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => {
+                let results = vec![CommandResponse::Nil; members.len()];
+                CommandResponse::Array(results)
+            }
+        }
+    }
+
+    fn cmd_geopos(&mut self, key: &[u8], members: &[Vec<u8>]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::SortedSet(map) => {
+                    let results: Vec<CommandResponse> = members
+                        .iter()
+                        .map(|member| match map.get(member.as_slice()) {
+                            Some(&score) => {
+                                let (lon, lat) = geo_decode(score);
+                                CommandResponse::Array(vec![
+                                    CommandResponse::BulkString(format!("{:.6}", lon).into_bytes()),
+                                    CommandResponse::BulkString(format!("{:.6}", lat).into_bytes()),
+                                ])
+                            }
+                            None => CommandResponse::Nil,
+                        })
+                        .collect();
+                    CommandResponse::Array(results)
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => {
+                let results = vec![CommandResponse::Nil; members.len()];
+                CommandResponse::Array(results)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cmd_geosearch(
+        &mut self,
+        key: &[u8],
+        from_member: Option<&[u8]>,
+        from_lonlat: Option<(f64, f64)>,
+        radius: f64,
+        unit: GeoUnit,
+        asc: Option<bool>,
+        count: Option<usize>,
+        withcoord: bool,
+        withdist: bool,
+        withhash: bool,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        let map = match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::SortedSet(map) => map,
+                _ => {
+                    return CommandResponse::Error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                    )
+                }
+            },
+            None => return CommandResponse::Array(vec![]),
+        };
+
+        let (center_lon, center_lat) = if let Some(member) = from_member {
+            match map.get(member) {
+                Some(&score) => geo_decode(score),
+                None => return CommandResponse::Array(vec![]),
+            }
+        } else if let Some((lon, lat)) = from_lonlat {
+            (lon, lat)
+        } else {
+            return CommandResponse::Error("ERR FROMMEMBER or FROMLONLAT required".into());
+        };
+
+        let radius_meters = geo_to_meters(radius, unit);
+
+        let mut results: Vec<(Vec<u8>, f64, f64, f64, f64)> = Vec::new();
+        for (member, &score) in map.iter() {
+            let (lon, lat) = geo_decode(score);
+            let dist = haversine_distance(center_lat, center_lon, lat, lon);
+            if dist <= radius_meters {
+                results.push((member.clone(), dist, lon, lat, score));
+            }
+        }
+
+        if let Some(true) = asc {
+            results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        } else if let Some(false) = asc {
+            results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        if let Some(c) = count {
+            results.truncate(c);
+        }
+
+        let items: Vec<CommandResponse> = results
+            .into_iter()
+            .map(|(member, dist, lon, lat, score)| {
+                if !withcoord && !withdist && !withhash {
+                    return CommandResponse::BulkString(member);
+                }
+                let mut arr = vec![CommandResponse::BulkString(member)];
+                if withdist {
+                    let converted = geo_convert_distance(dist, unit);
+                    arr.push(CommandResponse::BulkString(
+                        format!("{:.4}", converted).into_bytes(),
+                    ));
+                }
+                if withhash {
+                    arr.push(CommandResponse::Integer(score.to_bits() as i64));
+                }
+                if withcoord {
+                    arr.push(CommandResponse::Array(vec![
+                        CommandResponse::BulkString(format!("{:.6}", lon).into_bytes()),
+                        CommandResponse::BulkString(format!("{:.6}", lat).into_bytes()),
+                    ]));
+                }
+                CommandResponse::Array(arr)
+            })
+            .collect();
+
+        CommandResponse::Array(items)
     }
 
     // ─── Vector operations ────────────────────────────────────────────
@@ -2204,9 +5201,649 @@ impl ShardStore {
             None => CommandResponse::Integer(0),
         }
     }
+
+    fn cmd_xdel(&mut self, key: &[u8], ids: &[Vec<u8>]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get_mut(&compact) {
+            Some(entry) => match &mut entry.value {
+                Value::Stream(log) => {
+                    let mut deleted = 0i64;
+                    for id_bytes in ids {
+                        if let Some(sid) = StreamId::parse(id_bytes) {
+                            let before = log.entries.len();
+                            log.entries.retain(|e| e.id != sid);
+                            if log.entries.len() < before {
+                                deleted += 1;
+                            }
+                        }
+                    }
+                    CommandResponse::Integer(deleted)
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Integer(0),
+        }
+    }
+
+    fn cmd_xgroup_create(
+        &mut self,
+        key: &[u8],
+        group: &str,
+        id: &str,
+        mkstream: bool,
+    ) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+
+        if !self.entries.contains_key(&compact) {
+            if !mkstream {
+                return CommandResponse::Error(
+                    "ERR The XGROUP subcommand requires the key to exist".into(),
+                );
+            }
+            let log = StreamLog {
+                entries: VecDeque::new(),
+                last_id: StreamId { ms: 0, seq: 0 },
+            };
+            let entry = KeyEntry::new_with_tenant(
+                compact.clone(),
+                Value::Stream(Box::new(log)),
+                self.current_tenant,
+            );
+            self.entries.insert(compact.clone(), entry);
+        }
+
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::Stream(log) => {
+                    let last_delivered_id = if id == "$" {
+                        log.last_id.clone()
+                    } else if id == "0" || id == "0-0" {
+                        StreamId::min_id()
+                    } else {
+                        StreamId::parse(id.as_bytes()).unwrap_or(StreamId::min_id())
+                    };
+                    let groups = self.stream_groups.entry(compact).or_default();
+                    if groups.contains_key(group) {
+                        return CommandResponse::Error(
+                            "BUSYGROUP Consumer Group name already exists".into(),
+                        );
+                    }
+                    groups.insert(
+                        group.to_string(),
+                        StreamConsumerGroup {
+                            last_delivered_id,
+                            pel: HashMap::new(),
+                            consumers: HashMap::new(),
+                        },
+                    );
+                    CommandResponse::Ok
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Error("ERR internal error".into()),
+        }
+    }
+
+    fn cmd_xgroup_destroy(&mut self, key: &[u8], group: &str) -> CommandResponse {
+        let compact = CompactKey::new(key);
+        if let Some(groups) = self.stream_groups.get_mut(&compact) {
+            if groups.remove(group).is_some() {
+                return CommandResponse::Integer(1);
+            }
+        }
+        CommandResponse::Integer(0)
+    }
+
+    fn cmd_xgroup_delconsumer(
+        &mut self,
+        key: &[u8],
+        group: &str,
+        consumer: &str,
+    ) -> CommandResponse {
+        let compact = CompactKey::new(key);
+        if let Some(groups) = self.stream_groups.get_mut(&compact) {
+            if let Some(grp) = groups.get_mut(group) {
+                if let Some(state) = grp.consumers.remove(consumer) {
+                    let pending_count = state.pending.len() as i64;
+                    for sid in &state.pending {
+                        grp.pel.remove(sid);
+                    }
+                    return CommandResponse::Integer(pending_count);
+                }
+            }
+        }
+        CommandResponse::Integer(0)
+    }
+
+    fn cmd_xreadgroup(
+        &mut self,
+        group: &str,
+        consumer: &str,
+        count: Option<usize>,
+        keys: &[Vec<u8>],
+        ids: &[Vec<u8>],
+    ) -> CommandResponse {
+        if keys.len() != ids.len() {
+            return CommandResponse::Error(
+                "ERR Unbalanced XREADGROUP list of streams: for each stream key an ID must be specified"
+                    .into(),
+            );
+        }
+
+        let limit = count.unwrap_or(usize::MAX);
+        let mut results: Vec<CommandResponse> = Vec::new();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        for (key, id_bytes) in keys.iter().zip(ids.iter()) {
+            self.lazy_expire(key);
+            let compact = CompactKey::new(key);
+
+            let is_new_msgs = id_bytes == b">";
+
+            let stream_entries: Vec<StreamEntry> = if let Some(entry) = self.entries.get(&compact) {
+                if let Value::Stream(log) = &entry.value {
+                    if is_new_msgs {
+                        let last_delivered = self
+                            .stream_groups
+                            .get(&compact)
+                            .and_then(|gs| gs.get(group))
+                            .map(|g| g.last_delivered_id.clone())
+                            .unwrap_or(StreamId::min_id());
+                        log.entries
+                            .iter()
+                            .filter(|e| e.id > last_delivered)
+                            .take(limit)
+                            .cloned()
+                            .collect()
+                    } else {
+                        let groups = self.stream_groups.get(&compact);
+                        let grp = groups.and_then(|gs| gs.get(group));
+                        if let Some(grp) = grp {
+                            let consumer_state = grp.consumers.get(consumer);
+                            let pending_ids: Vec<StreamId> = consumer_state
+                                .map(|cs| {
+                                    let mut ids: Vec<StreamId> =
+                                        cs.pending.iter().cloned().collect();
+                                    ids.sort();
+                                    ids
+                                })
+                                .unwrap_or_default();
+                            pending_ids
+                                .into_iter()
+                                .take(limit)
+                                .filter_map(|sid| log.entries.iter().find(|e| e.id == sid).cloned())
+                                .collect()
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
+
+            if is_new_msgs && !stream_entries.is_empty() {
+                let groups = self.stream_groups.entry(compact.clone()).or_default();
+                let grp = groups
+                    .entry(group.to_string())
+                    .or_insert_with(|| StreamConsumerGroup {
+                        last_delivered_id: StreamId::min_id(),
+                        pel: HashMap::new(),
+                        consumers: HashMap::new(),
+                    });
+                let cs = grp.consumers.entry(consumer.to_string()).or_default();
+                for se in &stream_entries {
+                    if se.id > grp.last_delivered_id {
+                        grp.last_delivered_id = se.id.clone();
+                    }
+                    grp.pel.insert(
+                        se.id.clone(),
+                        PendingEntry {
+                            consumer: consumer.to_string(),
+                            delivery_time: now_ms,
+                            delivery_count: 1,
+                        },
+                    );
+                    cs.pending.insert(se.id.clone());
+                }
+            }
+
+            if !stream_entries.is_empty() {
+                let entries_resp: Vec<CommandResponse> = stream_entries
+                    .iter()
+                    .map(Self::format_stream_entry)
+                    .collect();
+                results.push(CommandResponse::Array(vec![
+                    CommandResponse::BulkString(key.clone()),
+                    CommandResponse::Array(entries_resp),
+                ]));
+            }
+        }
+
+        if results.is_empty() {
+            CommandResponse::Nil
+        } else {
+            CommandResponse::Array(results)
+        }
+    }
+
+    fn cmd_xack(&mut self, key: &[u8], group: &str, ids: &[Vec<u8>]) -> CommandResponse {
+        let compact = CompactKey::new(key);
+        let mut acked = 0i64;
+        if let Some(groups) = self.stream_groups.get_mut(&compact) {
+            if let Some(grp) = groups.get_mut(group) {
+                for id_bytes in ids {
+                    if let Some(sid) = StreamId::parse(id_bytes) {
+                        if let Some(pe) = grp.pel.remove(&sid) {
+                            if let Some(cs) = grp.consumers.get_mut(&pe.consumer) {
+                                cs.pending.remove(&sid);
+                            }
+                            acked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        CommandResponse::Integer(acked)
+    }
+
+    fn cmd_xpending(
+        &mut self,
+        key: &[u8],
+        group: &str,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        count: Option<usize>,
+    ) -> CommandResponse {
+        let compact = CompactKey::new(key);
+        let groups = self.stream_groups.get(&compact);
+        let grp = match groups.and_then(|gs| gs.get(group)) {
+            Some(g) => g,
+            None => {
+                return CommandResponse::Error("NOGROUP No such consumer group for key".into());
+            }
+        };
+
+        if let (Some(s), Some(e), Some(c)) = (start, end, count) {
+            let start_id = Self::parse_range_id(s, true);
+            let end_id = Self::parse_range_id(e, false);
+            let limit = c;
+
+            let mut entries: Vec<(&StreamId, &PendingEntry)> = grp
+                .pel
+                .iter()
+                .filter(|(sid, _)| **sid >= start_id && **sid <= end_id)
+                .collect();
+            entries.sort_by_key(|(sid, _)| (*sid).clone());
+            entries.truncate(limit);
+
+            let results: Vec<CommandResponse> = entries
+                .into_iter()
+                .map(|(sid, pe)| {
+                    CommandResponse::Array(vec![
+                        CommandResponse::BulkString(format!("{}", sid).into_bytes()),
+                        CommandResponse::BulkString(pe.consumer.as_bytes().to_vec()),
+                        CommandResponse::Integer(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0)
+                                .saturating_sub(pe.delivery_time)
+                                as i64,
+                        ),
+                        CommandResponse::Integer(pe.delivery_count as i64),
+                    ])
+                })
+                .collect();
+
+            return CommandResponse::Array(results);
+        }
+
+        let total_pending = grp.pel.len() as i64;
+        let min_id = grp
+            .pel
+            .keys()
+            .min()
+            .map(|id| format!("{}", id))
+            .unwrap_or_default();
+        let max_id = grp
+            .pel
+            .keys()
+            .max()
+            .map(|id| format!("{}", id))
+            .unwrap_or_default();
+
+        let mut consumer_counts: HashMap<&str, i64> = HashMap::new();
+        for pe in grp.pel.values() {
+            *consumer_counts.entry(&pe.consumer).or_insert(0) += 1;
+        }
+        let consumers_resp: Vec<CommandResponse> = consumer_counts
+            .into_iter()
+            .map(|(name, count)| {
+                CommandResponse::Array(vec![
+                    CommandResponse::BulkString(name.as_bytes().to_vec()),
+                    CommandResponse::BulkString(count.to_string().into_bytes()),
+                ])
+            })
+            .collect();
+
+        CommandResponse::Array(vec![
+            CommandResponse::Integer(total_pending),
+            CommandResponse::BulkString(min_id.into_bytes()),
+            CommandResponse::BulkString(max_id.into_bytes()),
+            CommandResponse::Array(consumers_resp),
+        ])
+    }
+
+    fn cmd_xclaim(
+        &mut self,
+        key: &[u8],
+        group: &str,
+        consumer: &str,
+        min_idle_time: u64,
+        ids: &[Vec<u8>],
+    ) -> CommandResponse {
+        let compact = CompactKey::new(key);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let stream_ok = self
+            .entries
+            .get(&compact)
+            .map(|e| matches!(&e.value, Value::Stream(_)))
+            .unwrap_or(false);
+
+        if !stream_ok {
+            return CommandResponse::Array(vec![]);
+        }
+
+        let groups = match self.stream_groups.get_mut(&compact) {
+            Some(g) => g,
+            None => return CommandResponse::Array(vec![]),
+        };
+        let grp = match groups.get_mut(group) {
+            Some(g) => g,
+            None => return CommandResponse::Array(vec![]),
+        };
+
+        let mut claimed_ids: Vec<StreamId> = Vec::new();
+
+        for id_bytes in ids {
+            if let Some(sid) = StreamId::parse(id_bytes) {
+                if let Some(pe) = grp.pel.get_mut(&sid) {
+                    let idle = now_ms.saturating_sub(pe.delivery_time);
+                    if idle >= min_idle_time {
+                        let old_consumer = pe.consumer.clone();
+                        pe.consumer = consumer.to_string();
+                        pe.delivery_time = now_ms;
+                        pe.delivery_count += 1;
+
+                        if old_consumer != consumer {
+                            if let Some(cs) = grp.consumers.get_mut(&old_consumer) {
+                                cs.pending.remove(&sid);
+                            }
+                        }
+                        grp.consumers
+                            .entry(consumer.to_string())
+                            .or_default()
+                            .pending
+                            .insert(sid.clone());
+                        claimed_ids.push(sid);
+                    }
+                }
+            }
+        }
+
+        let entry_map = self.entries.get(&compact);
+        let results: Vec<CommandResponse> = if let Some(entry) = entry_map {
+            if let Value::Stream(log) = &entry.value {
+                claimed_ids
+                    .iter()
+                    .filter_map(|sid| {
+                        log.entries
+                            .iter()
+                            .find(|e| e.id == *sid)
+                            .map(Self::format_stream_entry)
+                    })
+                    .collect()
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+
+        CommandResponse::Array(results)
+    }
+
+    fn cmd_xautoclaim(
+        &mut self,
+        key: &[u8],
+        group: &str,
+        consumer: &str,
+        min_idle_time: u64,
+        start: &[u8],
+        count: Option<usize>,
+    ) -> CommandResponse {
+        let compact = CompactKey::new(key);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let start_id = Self::parse_range_id(start, true);
+        let limit = count.unwrap_or(100);
+
+        let stream_ok = self
+            .entries
+            .get(&compact)
+            .map(|e| matches!(&e.value, Value::Stream(_)))
+            .unwrap_or(false);
+
+        if !stream_ok {
+            return CommandResponse::Array(vec![
+                CommandResponse::BulkString(b"0-0".to_vec()),
+                CommandResponse::Array(vec![]),
+                CommandResponse::Array(vec![]),
+            ]);
+        }
+
+        let groups = match self.stream_groups.get_mut(&compact) {
+            Some(g) => g,
+            None => {
+                return CommandResponse::Array(vec![
+                    CommandResponse::BulkString(b"0-0".to_vec()),
+                    CommandResponse::Array(vec![]),
+                    CommandResponse::Array(vec![]),
+                ])
+            }
+        };
+        let grp = match groups.get_mut(group) {
+            Some(g) => g,
+            None => {
+                return CommandResponse::Array(vec![
+                    CommandResponse::BulkString(b"0-0".to_vec()),
+                    CommandResponse::Array(vec![]),
+                    CommandResponse::Array(vec![]),
+                ])
+            }
+        };
+
+        let mut eligible: Vec<StreamId> = grp
+            .pel
+            .iter()
+            .filter(|(sid, pe)| {
+                **sid >= start_id && now_ms.saturating_sub(pe.delivery_time) >= min_idle_time
+            })
+            .map(|(sid, _)| sid.clone())
+            .collect();
+        eligible.sort();
+        eligible.truncate(limit);
+
+        let next_start = eligible
+            .last()
+            .map(|sid| StreamId {
+                ms: sid.ms,
+                seq: sid.seq + 1,
+            })
+            .unwrap_or(StreamId::min_id());
+
+        let mut claimed_ids: Vec<StreamId> = Vec::new();
+        for sid in &eligible {
+            if let Some(pe) = grp.pel.get_mut(sid) {
+                let old_consumer = pe.consumer.clone();
+                pe.consumer = consumer.to_string();
+                pe.delivery_time = now_ms;
+                pe.delivery_count += 1;
+                if old_consumer != consumer {
+                    if let Some(cs) = grp.consumers.get_mut(&old_consumer) {
+                        cs.pending.remove(sid);
+                    }
+                }
+                grp.consumers
+                    .entry(consumer.to_string())
+                    .or_default()
+                    .pending
+                    .insert(sid.clone());
+                claimed_ids.push(sid.clone());
+            }
+        }
+
+        let entry_map = self.entries.get(&compact);
+        let entries_resp: Vec<CommandResponse> = if let Some(entry) = entry_map {
+            if let Value::Stream(log) = &entry.value {
+                claimed_ids
+                    .iter()
+                    .filter_map(|sid| {
+                        log.entries
+                            .iter()
+                            .find(|e| e.id == *sid)
+                            .map(Self::format_stream_entry)
+                    })
+                    .collect()
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+
+        CommandResponse::Array(vec![
+            CommandResponse::BulkString(format!("{}", next_start).into_bytes()),
+            CommandResponse::Array(entries_resp),
+            CommandResponse::Array(vec![]),
+        ])
+    }
+
+    fn cmd_xinfo_stream(&mut self, key: &[u8]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::Stream(log) => {
+                    let length = log.entries.len() as i64;
+                    let groups_count = self
+                        .stream_groups
+                        .get(&compact)
+                        .map(|gs| gs.len() as i64)
+                        .unwrap_or(0);
+
+                    CommandResponse::Array(vec![
+                        CommandResponse::BulkString(b"length".to_vec()),
+                        CommandResponse::Integer(length),
+                        CommandResponse::BulkString(b"first-entry".to_vec()),
+                        if let Some(first) = log.entries.front() {
+                            Self::format_stream_entry(first)
+                        } else {
+                            CommandResponse::Nil
+                        },
+                        CommandResponse::BulkString(b"last-entry".to_vec()),
+                        if let Some(last) = log.entries.back() {
+                            Self::format_stream_entry(last)
+                        } else {
+                            CommandResponse::Nil
+                        },
+                        CommandResponse::BulkString(b"last-generated-id".to_vec()),
+                        CommandResponse::BulkString(format!("{}", log.last_id).into_bytes()),
+                        CommandResponse::BulkString(b"groups".to_vec()),
+                        CommandResponse::Integer(groups_count),
+                    ])
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Error("ERR no such key".into()),
+        }
+    }
+
+    fn cmd_xinfo_groups(&mut self, key: &[u8]) -> CommandResponse {
+        self.lazy_expire(key);
+        let compact = CompactKey::new(key);
+        match self.entries.get(&compact) {
+            Some(entry) => match &entry.value {
+                Value::Stream(_) => {
+                    let groups = self.stream_groups.get(&compact);
+                    let results: Vec<CommandResponse> = groups
+                        .map(|gs| {
+                            gs.iter()
+                                .map(|(name, grp)| {
+                                    CommandResponse::Array(vec![
+                                        CommandResponse::BulkString(b"name".to_vec()),
+                                        CommandResponse::BulkString(name.as_bytes().to_vec()),
+                                        CommandResponse::BulkString(b"consumers".to_vec()),
+                                        CommandResponse::Integer(grp.consumers.len() as i64),
+                                        CommandResponse::BulkString(b"pending".to_vec()),
+                                        CommandResponse::Integer(grp.pel.len() as i64),
+                                        CommandResponse::BulkString(b"last-delivered-id".to_vec()),
+                                        CommandResponse::BulkString(
+                                            format!("{}", grp.last_delivered_id).into_bytes(),
+                                        ),
+                                    ])
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    CommandResponse::Array(results)
+                }
+                _ => CommandResponse::Error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".into(),
+                ),
+            },
+            None => CommandResponse::Error("ERR no such key".into()),
+        }
+    }
 }
 
 /// Normalize a Redis-style index (supports negative indexing).
+fn format_float(f: f64) -> String {
+    if f.fract() == 0.0 && f.abs() < 1e17 {
+        let i = f as i64;
+        if (i as f64) == f {
+            return format!("{i}");
+        }
+    }
+    for precision in 0..=17 {
+        let s = format!("{f:.precision$}");
+        if s.parse::<f64>().ok() == Some(f) {
+            return s;
+        }
+    }
+    format!("{f:.17}")
+}
+
 fn normalize_index(index: i64, len: i64) -> usize {
     if index < 0 {
         let normalized = len + index;
@@ -2263,6 +5900,290 @@ fn glob_match_iterative(pattern: &[u8], text: &[u8]) -> bool {
     }
 
     pi == pattern.len()
+}
+
+fn lex_gte_min(member: &[u8], min: &[u8]) -> bool {
+    if min.is_empty() {
+        return true;
+    }
+    match min[0] {
+        b'-' => true,
+        b'+' => false,
+        b'[' => member >= &min[1..],
+        b'(' => member > &min[1..],
+        _ => true,
+    }
+}
+
+fn lex_lte_max(member: &[u8], max: &[u8]) -> bool {
+    if max.is_empty() {
+        return true;
+    }
+    match max[0] {
+        b'+' => true,
+        b'-' => false,
+        b'[' => member <= &max[1..],
+        b'(' => member < &max[1..],
+        _ => true,
+    }
+}
+
+fn lex_in_range(member: &[u8], min: &[u8], max: &[u8]) -> bool {
+    lex_gte_min(member, min) && lex_lte_max(member, max)
+}
+
+// ─── HyperLogLog algorithm ──────────────────────────────────────────
+
+const HLL_P: usize = 14;
+const HLL_REGISTERS: usize = 1 << HLL_P;
+const HLL_REGISTER_BYTES: usize = HLL_REGISTERS * 6 / 8;
+
+fn hll_hash(element: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = ahash::AHasher::default();
+    element.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hll_register_get(registers: &[u8], index: usize) -> u8 {
+    let bit_offset = index * 6;
+    let byte_offset = bit_offset / 8;
+    let bit_shift = bit_offset % 8;
+
+    if bit_shift <= 2 {
+        (registers[byte_offset] >> bit_shift) & 0x3F
+    } else {
+        let lo = registers[byte_offset] >> bit_shift;
+        let hi = if byte_offset + 1 < registers.len() {
+            registers[byte_offset + 1] << (8 - bit_shift)
+        } else {
+            0
+        };
+        (lo | hi) & 0x3F
+    }
+}
+
+fn hll_register_set(registers: &mut [u8], index: usize, value: u8) {
+    let bit_offset = index * 6;
+    let byte_offset = bit_offset / 8;
+    let bit_shift = bit_offset % 8;
+
+    let mask_lo = !(0x3F_u8 << bit_shift);
+    registers[byte_offset] = (registers[byte_offset] & mask_lo) | ((value & 0x3F) << bit_shift);
+
+    if bit_shift > 2 && byte_offset + 1 < registers.len() {
+        let bits_in_first = 8 - bit_shift;
+        let mask_hi = !((0x3F >> bits_in_first) as u8);
+        registers[byte_offset + 1] =
+            (registers[byte_offset + 1] & mask_hi) | ((value & 0x3F) >> bits_in_first);
+    }
+}
+
+fn hll_add(registers: &mut [u8], element: &[u8]) -> bool {
+    let hash = hll_hash(element);
+    let index = (hash & ((1 << HLL_P) - 1)) as usize;
+    let remaining = hash >> HLL_P;
+    let rank = if remaining == 0 {
+        (64 - HLL_P) as u8 + 1
+    } else {
+        (remaining.trailing_zeros() + 1) as u8
+    };
+
+    let current = hll_register_get(registers, index);
+    if rank > current {
+        hll_register_set(registers, index, rank);
+        true
+    } else {
+        false
+    }
+}
+
+fn hll_count(registers: &[u8]) -> u64 {
+    let m = HLL_REGISTERS as f64;
+    let alpha = match HLL_REGISTERS {
+        16 => 0.673,
+        32 => 0.697,
+        64 => 0.709,
+        _ => 0.7213 / (1.0 + 1.079 / m),
+    };
+
+    let mut sum = 0.0f64;
+    let mut zeros = 0u32;
+
+    for i in 0..HLL_REGISTERS {
+        let val = hll_register_get(registers, i);
+        sum += 1.0 / (1u64 << val) as f64;
+        if val == 0 {
+            zeros += 1;
+        }
+    }
+
+    let mut estimate = alpha * m * m / sum;
+
+    if estimate <= 2.5 * m && zeros > 0 {
+        estimate = m * (m / zeros as f64).ln();
+    }
+
+    estimate.round() as u64
+}
+
+fn hll_merge(dest: &mut [u8], src: &[u8]) {
+    for i in 0..HLL_REGISTERS {
+        let src_val = hll_register_get(src, i);
+        let dst_val = hll_register_get(dest, i);
+        if src_val > dst_val {
+            hll_register_set(dest, i, src_val);
+        }
+    }
+}
+
+// ─── Geospatial helpers ──────────────────────────────────────────────
+
+const GEO_HASH_BITS: u32 = 52;
+
+fn geo_encode(lon: f64, lat: f64) -> f64 {
+    let lon_norm = (lon + 180.0) / 360.0;
+    let lat_norm = (lat + 90.0) / 180.0;
+
+    let mut hash: u64 = 0;
+    let mut lon_min = 0.0f64;
+    let mut lon_max = 1.0f64;
+    let mut lat_min = 0.0f64;
+    let mut lat_max = 1.0f64;
+
+    for i in 0..GEO_HASH_BITS {
+        if i % 2 == 0 {
+            let mid = (lon_min + lon_max) / 2.0;
+            if lon_norm >= mid {
+                hash |= 1 << (GEO_HASH_BITS - 1 - i);
+                lon_min = mid;
+            } else {
+                lon_max = mid;
+            }
+        } else {
+            let mid = (lat_min + lat_max) / 2.0;
+            if lat_norm >= mid {
+                hash |= 1 << (GEO_HASH_BITS - 1 - i);
+                lat_min = mid;
+            } else {
+                lat_max = mid;
+            }
+        }
+    }
+
+    f64::from_bits(hash)
+}
+
+fn geo_decode(score: f64) -> (f64, f64) {
+    let hash = score.to_bits();
+
+    let mut lon_min = 0.0f64;
+    let mut lon_max = 1.0f64;
+    let mut lat_min = 0.0f64;
+    let mut lat_max = 1.0f64;
+
+    for i in 0..GEO_HASH_BITS {
+        let bit = (hash >> (GEO_HASH_BITS - 1 - i)) & 1;
+        if i % 2 == 0 {
+            let mid = (lon_min + lon_max) / 2.0;
+            if bit == 1 {
+                lon_min = mid;
+            } else {
+                lon_max = mid;
+            }
+        } else {
+            let mid = (lat_min + lat_max) / 2.0;
+            if bit == 1 {
+                lat_min = mid;
+            } else {
+                lat_max = mid;
+            }
+        }
+    }
+
+    let lon = (lon_min + lon_max) / 2.0 * 360.0 - 180.0;
+    let lat = (lat_min + lat_max) / 2.0 * 180.0 - 90.0;
+    (lon, lat)
+}
+
+const BASE32_CHARS: &[u8] = b"0123456789bcdefghjkmnpqrstuvwxyz";
+
+fn geo_encode_base32(lon: f64, lat: f64) -> String {
+    let lon_norm = (lon + 180.0) / 360.0;
+    let lat_norm = (lat + 90.0) / 180.0;
+
+    let mut bits: Vec<bool> = Vec::with_capacity(55);
+    let mut lon_min = 0.0f64;
+    let mut lon_max = 1.0f64;
+    let mut lat_min = 0.0f64;
+    let mut lat_max = 1.0f64;
+
+    for i in 0..55 {
+        if i % 2 == 0 {
+            let mid = (lon_min + lon_max) / 2.0;
+            if lon_norm >= mid {
+                bits.push(true);
+                lon_min = mid;
+            } else {
+                bits.push(false);
+                lon_max = mid;
+            }
+        } else {
+            let mid = (lat_min + lat_max) / 2.0;
+            if lat_norm >= mid {
+                bits.push(true);
+                lat_min = mid;
+            } else {
+                bits.push(false);
+                lat_max = mid;
+            }
+        }
+    }
+
+    let mut result = String::with_capacity(11);
+    for chunk in bits.chunks(5) {
+        let mut idx = 0u8;
+        for (j, &bit) in chunk.iter().enumerate() {
+            if bit {
+                idx |= 1 << (4 - j);
+            }
+        }
+        result.push(BASE32_CHARS[idx as usize] as char);
+    }
+    result
+}
+
+fn haversine_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_RADIUS: f64 = 6372797.560856;
+
+    let lat1_rad = lat1.to_radians();
+    let lat2_rad = lat2.to_radians();
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+
+    let a =
+        (dlat / 2.0).sin().powi(2) + lat1_rad.cos() * lat2_rad.cos() * (dlon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().asin();
+
+    EARTH_RADIUS * c
+}
+
+fn geo_convert_distance(meters: f64, unit: GeoUnit) -> f64 {
+    match unit {
+        GeoUnit::Meters => meters,
+        GeoUnit::Kilometers => meters / 1000.0,
+        GeoUnit::Feet => meters * 3.28084,
+        GeoUnit::Miles => meters / 1609.344,
+    }
+}
+
+fn geo_to_meters(value: f64, unit: GeoUnit) -> f64 {
+    match unit {
+        GeoUnit::Meters => value,
+        GeoUnit::Kilometers => value * 1000.0,
+        GeoUnit::Feet => value / 3.28084,
+        GeoUnit::Miles => value * 1609.344,
+    }
 }
 
 #[cfg(test)]

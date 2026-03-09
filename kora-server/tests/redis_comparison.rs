@@ -1,6 +1,7 @@
 //! Side-by-side comparison tests: run identical commands against Redis and Kōra,
 //! verify byte-identical RESP responses.
 
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -67,6 +68,13 @@ fn resp_to_string(resp: &[u8]) -> String {
 }
 
 const REDIS_PORT: u16 = 6399;
+static REDIS_TEST_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+
+fn redis_test_lock() -> Arc<tokio::sync::Mutex<()>> {
+    REDIS_TEST_LOCK
+        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
 
 fn is_redis_available() -> bool {
     std::net::TcpStream::connect(format!("127.0.0.1:{}", REDIS_PORT)).is_ok()
@@ -141,6 +149,7 @@ macro_rules! dual_test {
     ($name:ident, |$t:ident : &mut DualTarget| async move $body:block) => {
         #[tokio::test]
         async fn $name() {
+            let _guard = redis_test_lock().lock_owned().await;
             let Some(mut target) = DualTarget::new().await else {
                 eprintln!(
                     "Skipping {} — Redis not available on port {}",

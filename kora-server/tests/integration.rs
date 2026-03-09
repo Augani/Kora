@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use kora_core::hash::shard_for_key;
 use kora_server::{KoraServer, ServerConfig};
 use kora_storage::manager::StorageConfig;
 use kora_storage::wal::SyncPolicy;
@@ -113,6 +114,29 @@ fn assert_resp_prefix(resp: &[u8], prefix: &[u8]) {
         "\nExpected prefix: {:?}\n           Got: {:?}",
         String::from_utf8_lossy(prefix),
         String::from_utf8_lossy(resp),
+    );
+}
+
+fn keys_on_different_shards(shard_count: usize, prefix: &str) -> (String, String) {
+    let mut shard0 = None;
+    let mut shard1 = None;
+
+    for i in 0..10_000 {
+        let candidate = format!("{}{}", prefix, i);
+        match shard_for_key(candidate.as_bytes(), shard_count) {
+            0 if shard0.is_none() => shard0 = Some(candidate),
+            1 if shard1.is_none() => shard1 = Some(candidate),
+            _ => {}
+        }
+
+        if let (Some(a), Some(b)) = (shard0.as_ref(), shard1.as_ref()) {
+            return (a.clone(), b.clone());
+        }
+    }
+
+    panic!(
+        "failed to find keys on shards 0 and 1 for prefix {}",
+        prefix
     );
 }
 
@@ -967,6 +991,2580 @@ async fn test_periodic_snapshots_create_backups_and_prune_retention() {
         snapshot_count > 0,
         "expected at least one timestamped snapshot backup"
     );
+
+    let _ = shutdown.send(true);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: String & Key commands
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_setex_psetex() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["SETEX", "sk", "100", "val"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "sk"]).await;
+    assert_resp(&resp, b"$3\r\nval\r\n");
+
+    let resp = cmd(&mut stream, &["TTL", "sk"]).await;
+    assert!(resp.starts_with(b":"));
+
+    let resp = cmd(&mut stream, &["PSETEX", "pk", "100000", "pval"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "pk"]).await;
+    assert_resp(&resp, b"$4\r\npval\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_incrbyfloat() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["SET", "fkey", "10.5"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["INCRBYFLOAT", "fkey", "0.1"]).await;
+    assert_resp(&resp, b"$4\r\n10.6\r\n");
+
+    let resp = cmd(&mut stream, &["INCRBYFLOAT", "fkey", "-5"]).await;
+    assert_resp(&resp, b"$3\r\n5.6\r\n");
+
+    let resp = cmd(&mut stream, &["INCRBYFLOAT", "newf", "3.14"]).await;
+    assert_resp(&resp, b"$4\r\n3.14\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_getrange() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "grk", "Hello, World!"]).await;
+
+    let resp = cmd(&mut stream, &["GETRANGE", "grk", "0", "4"]).await;
+    assert_resp(&resp, b"$5\r\nHello\r\n");
+
+    let resp = cmd(&mut stream, &["GETRANGE", "grk", "-6", "-1"]).await;
+    assert_resp(&resp, b"$6\r\nWorld!\r\n");
+
+    let resp = cmd(&mut stream, &["GETRANGE", "grk", "100", "200"]).await;
+    assert_resp(&resp, b"$0\r\n\r\n");
+
+    let resp = cmd(&mut stream, &["GETRANGE", "nokey", "0", "10"]).await;
+    assert_resp(&resp, b"$0\r\n\r\n");
+
+    let resp = cmd(&mut stream, &["SUBSTR", "grk", "0", "4"]).await;
+    assert_resp(&resp, b"$5\r\nHello\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_setrange() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "srk", "Hello World"]).await;
+
+    let resp = cmd(&mut stream, &["SETRANGE", "srk", "6", "Redis"]).await;
+    assert_resp(&resp, b":11\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "srk"]).await;
+    assert_resp(&resp, b"$11\r\nHello Redis\r\n");
+
+    let resp = cmd(&mut stream, &["SETRANGE", "newsr", "5", "hi"]).await;
+    assert_resp(&resp, b":7\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_getdel() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "gdk", "val"]).await;
+
+    let resp = cmd(&mut stream, &["GETDEL", "gdk"]).await;
+    assert_resp(&resp, b"$3\r\nval\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "gdk"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let resp = cmd(&mut stream, &["GETDEL", "noexist"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_getex() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "gek", "val"]).await;
+
+    let resp = cmd(&mut stream, &["GETEX", "gek", "EX", "100"]).await;
+    assert_resp(&resp, b"$3\r\nval\r\n");
+
+    let resp = cmd(&mut stream, &["TTL", "gek"]).await;
+    assert!(resp.starts_with(b":"));
+    let ttl_str = String::from_utf8_lossy(&resp);
+    let ttl: i64 = ttl_str
+        .trim()
+        .trim_start_matches(':')
+        .trim()
+        .parse()
+        .unwrap_or(-1);
+    assert!(ttl > 0 && ttl <= 100);
+
+    let resp = cmd(&mut stream, &["GETEX", "gek", "PERSIST"]).await;
+    assert_resp(&resp, b"$3\r\nval\r\n");
+
+    let resp = cmd(&mut stream, &["TTL", "gek"]).await;
+    assert_resp(&resp, b":-1\r\n");
+
+    let resp = cmd(&mut stream, &["GETEX", "noexist"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_msetnx() {
+    let port = free_port().await;
+    let shutdown = start_server_with_workers(port, 1).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["MSETNX", "mn1", "v1", "mn2", "v2"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "mn1"]).await;
+    assert_resp(&resp, b"$2\r\nv1\r\n");
+
+    let resp = cmd(&mut stream, &["MSETNX", "mn1", "new", "mn3", "v3"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "mn1"]).await;
+    assert_resp(&resp, b"$2\r\nv1\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "mn3"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_msetnx_cross_shard_no_partial_write() {
+    let port = free_port().await;
+    let shutdown = start_server_with_workers(port, 2).await;
+    let mut stream = connect(port).await;
+    let (existing_key, other_key) = keys_on_different_shards(2, "msetnx-x:");
+
+    let resp = cmd(&mut stream, &["SET", existing_key.as_str(), "base"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "MSETNX",
+            existing_key.as_str(),
+            "new",
+            other_key.as_str(),
+            "other",
+        ],
+    )
+    .await;
+    assert_resp(&resp, b":0\r\n");
+
+    let resp = cmd(&mut stream, &["GET", existing_key.as_str()]).await;
+    assert_resp(&resp, b"$4\r\nbase\r\n");
+
+    let resp = cmd(&mut stream, &["GET", other_key.as_str()]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_expireat_pexpireat() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "eak", "val"]).await;
+
+    let future_ts = (std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 1000)
+        .to_string();
+
+    let resp = cmd(&mut stream, &["EXPIREAT", "eak", &future_ts]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["TTL", "eak"]).await;
+    let ttl_str = String::from_utf8_lossy(&resp);
+    let ttl: i64 = ttl_str
+        .trim()
+        .trim_start_matches(':')
+        .trim()
+        .parse()
+        .unwrap_or(-1);
+    assert!(ttl > 0);
+
+    let resp = cmd(&mut stream, &["EXPIREAT", "noexist", &future_ts]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    cmd(&mut stream, &["SET", "peak", "val"]).await;
+    let future_ms = (std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 1_000_000)
+        .to_string();
+    let resp = cmd(&mut stream, &["PEXPIREAT", "peak", &future_ms]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_rename() {
+    let port = free_port().await;
+    let shutdown = start_server_with_workers(port, 1).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "rk1", "val"]).await;
+
+    let resp = cmd(&mut stream, &["RENAME", "rk1", "rk2"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "rk1"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "rk2"]).await;
+    assert_resp(&resp, b"$3\r\nval\r\n");
+
+    let resp = cmd(&mut stream, &["RENAME", "noexist", "rk3"]).await;
+    assert_resp_prefix(&resp, b"-ERR no such key");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_renamenx() {
+    let port = free_port().await;
+    let shutdown = start_server_with_workers(port, 1).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "rnx1", "v1"]).await;
+    cmd(&mut stream, &["SET", "rnx2", "v2"]).await;
+
+    let resp = cmd(&mut stream, &["RENAMENX", "rnx1", "rnx2"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "rnx1"]).await;
+    assert_resp(&resp, b"$2\r\nv1\r\n");
+
+    let resp = cmd(&mut stream, &["RENAMENX", "rnx1", "rnx3"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "rnx3"]).await;
+    assert_resp(&resp, b"$2\r\nv1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_unlink() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "uk1", "v1"]).await;
+    cmd(&mut stream, &["SET", "uk2", "v2"]).await;
+
+    let resp = cmd(&mut stream, &["UNLINK", "uk1", "uk2", "uk3"]).await;
+    assert_resp(&resp, b":2\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "uk1"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_copy() {
+    let port = free_port().await;
+    let shutdown = start_server_with_workers(port, 1).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "csrc", "val"]).await;
+
+    let resp = cmd(&mut stream, &["COPY", "csrc", "cdst"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "cdst"]).await;
+    assert_resp(&resp, b"$3\r\nval\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "csrc"]).await;
+    assert_resp(&resp, b"$3\r\nval\r\n");
+
+    cmd(&mut stream, &["SET", "cdst", "existing"]).await;
+    let resp = cmd(&mut stream, &["COPY", "csrc", "cdst"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let resp = cmd(&mut stream, &["COPY", "csrc", "cdst", "REPLACE"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "cdst"]).await;
+    assert_resp(&resp, b"$3\r\nval\r\n");
+
+    let resp = cmd(&mut stream, &["COPY", "noexist", "cdst2"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_randomkey() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["RANDOMKEY"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    cmd(&mut stream, &["SET", "rk", "val"]).await;
+    let resp = cmd(&mut stream, &["RANDOMKEY"]).await;
+    assert!(resp.starts_with(b"$"));
+    assert!(!resp.starts_with(b"$-1"));
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_touch() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "tk1", "v1"]).await;
+    cmd(&mut stream, &["SET", "tk2", "v2"]).await;
+
+    let resp = cmd(&mut stream, &["TOUCH", "tk1", "tk2", "noexist"]).await;
+    assert_resp(&resp, b":2\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_object_refcount_idletime_help() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "ok", "val"]).await;
+
+    let resp = cmd(&mut stream, &["OBJECT", "REFCOUNT", "ok"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["OBJECT", "IDLETIME", "ok"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let resp = cmd(&mut stream, &["OBJECT", "REFCOUNT", "noexist"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let resp = cmd(&mut stream, &["OBJECT", "HELP"]).await;
+    assert!(resp.starts_with(b"*"));
+
+    let _ = shutdown.send(true);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: List commands
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_lset() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    cmd(&mut stream, &["RPUSH", "mylist", "a", "b", "c"]).await;
+
+    let resp = cmd(&mut stream, &["LSET", "mylist", "1", "B"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["LINDEX", "mylist", "1"]).await;
+    assert_resp(&resp, b"$1\r\nB\r\n");
+
+    let resp = cmd(&mut stream, &["LSET", "mylist", "-1", "C"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["LINDEX", "mylist", "2"]).await;
+    assert_resp(&resp, b"$1\r\nC\r\n");
+
+    let resp = cmd(&mut stream, &["LSET", "mylist", "10", "x"]).await;
+    assert_resp_prefix(&resp, b"-ERR index out of range");
+
+    let resp = cmd(&mut stream, &["LSET", "noexist", "0", "x"]).await;
+    assert_resp_prefix(&resp, b"-ERR no such key");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_linsert() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    cmd(&mut stream, &["RPUSH", "mylist", "a", "c"]).await;
+
+    let resp = cmd(&mut stream, &["LINSERT", "mylist", "BEFORE", "c", "b"]).await;
+    assert_resp(&resp, b":3\r\n");
+
+    let resp = cmd(&mut stream, &["LRANGE", "mylist", "0", "-1"]).await;
+    assert_resp(&resp, b"*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
+
+    let resp = cmd(&mut stream, &["LINSERT", "mylist", "AFTER", "c", "d"]).await;
+    assert_resp(&resp, b":4\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &["LINSERT", "mylist", "BEFORE", "notfound", "x"],
+    )
+    .await;
+    assert_resp(&resp, b":-1\r\n");
+
+    let resp = cmd(&mut stream, &["LINSERT", "noexist", "BEFORE", "a", "x"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_lrem() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    cmd(&mut stream, &["RPUSH", "mylist", "a", "b", "a", "c", "a"]).await;
+
+    let resp = cmd(&mut stream, &["LREM", "mylist", "2", "a"]).await;
+    assert_resp(&resp, b":2\r\n");
+
+    let resp = cmd(&mut stream, &["LRANGE", "mylist", "0", "-1"]).await;
+    assert_resp(&resp, b"*3\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\na\r\n");
+
+    cmd(&mut stream, &["DEL", "mylist"]).await;
+    cmd(&mut stream, &["RPUSH", "mylist", "a", "b", "a", "c", "a"]).await;
+
+    let resp = cmd(&mut stream, &["LREM", "mylist", "-2", "a"]).await;
+    assert_resp(&resp, b":2\r\n");
+
+    let resp = cmd(&mut stream, &["LRANGE", "mylist", "0", "-1"]).await;
+    assert_resp(&resp, b"*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_ltrim() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    cmd(&mut stream, &["RPUSH", "mylist", "a", "b", "c", "d", "e"]).await;
+
+    let resp = cmd(&mut stream, &["LTRIM", "mylist", "1", "3"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["LRANGE", "mylist", "0", "-1"]).await;
+    assert_resp(&resp, b"*3\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\nd\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_lpos() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    cmd(
+        &mut stream,
+        &["RPUSH", "mylist", "a", "b", "c", "a", "b", "a"],
+    )
+    .await;
+
+    let resp = cmd(&mut stream, &["LPOS", "mylist", "a"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let resp = cmd(&mut stream, &["LPOS", "mylist", "a", "RANK", "2"]).await;
+    assert_resp(&resp, b":3\r\n");
+
+    let resp = cmd(&mut stream, &["LPOS", "mylist", "a", "COUNT", "0"]).await;
+    assert_resp(&resp, b"*3\r\n:0\r\n:3\r\n:5\r\n");
+
+    let resp = cmd(&mut stream, &["LPOS", "mylist", "a", "COUNT", "2"]).await;
+    assert_resp(&resp, b"*2\r\n:0\r\n:3\r\n");
+
+    let resp = cmd(&mut stream, &["LPOS", "mylist", "z"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_rpoplpush() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    cmd(&mut stream, &["RPUSH", "src", "a", "b", "c"]).await;
+
+    let resp = cmd(&mut stream, &["RPOPLPUSH", "src", "dst"]).await;
+    assert_resp(&resp, b"$1\r\nc\r\n");
+
+    let resp = cmd(&mut stream, &["LRANGE", "src", "0", "-1"]).await;
+    assert_resp(&resp, b"*2\r\n$1\r\na\r\n$1\r\nb\r\n");
+
+    let resp = cmd(&mut stream, &["LRANGE", "dst", "0", "-1"]).await;
+    assert_resp(&resp, b"*1\r\n$1\r\nc\r\n");
+
+    let resp = cmd(&mut stream, &["RPOPLPUSH", "noexist", "dst"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_lmove() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    cmd(&mut stream, &["RPUSH", "src", "a", "b", "c"]).await;
+
+    let resp = cmd(&mut stream, &["LMOVE", "src", "dst", "LEFT", "RIGHT"]).await;
+    assert_resp(&resp, b"$1\r\na\r\n");
+
+    let resp = cmd(&mut stream, &["LMOVE", "src", "dst", "RIGHT", "LEFT"]).await;
+    assert_resp(&resp, b"$1\r\nc\r\n");
+
+    let resp = cmd(&mut stream, &["LRANGE", "src", "0", "-1"]).await;
+    assert_resp(&resp, b"*1\r\n$1\r\nb\r\n");
+
+    let resp = cmd(&mut stream, &["LRANGE", "dst", "0", "-1"]).await;
+    assert_resp(&resp, b"*2\r\n$1\r\nc\r\n$1\r\na\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_lmove_cross_shard_wrongtype_preserves_source() {
+    let port = free_port().await;
+    let shutdown = start_server_with_workers(port, 2).await;
+    let mut stream = connect(port).await;
+    let (source, destination) = keys_on_different_shards(2, "lmove-x:");
+
+    cmd(&mut stream, &["RPUSH", source.as_str(), "a"]).await;
+    cmd(&mut stream, &["SET", destination.as_str(), "notlist"]).await;
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "LMOVE",
+            source.as_str(),
+            destination.as_str(),
+            "RIGHT",
+            "LEFT",
+        ],
+    )
+    .await;
+    assert_resp_prefix(&resp, b"-WRONGTYPE");
+
+    let resp = cmd(&mut stream, &["LLEN", source.as_str()]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["GET", destination.as_str()]).await;
+    assert_resp(&resp, b"$7\r\nnotlist\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: Hash commands
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_hmget() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    cmd(
+        &mut stream,
+        &["HSET", "myhash", "f1", "v1", "f2", "v2", "f3", "v3"],
+    )
+    .await;
+
+    let resp = cmd(&mut stream, &["HMGET", "myhash", "f1", "f3", "nofield"]).await;
+    assert_resp(&resp, b"*3\r\n$2\r\nv1\r\n$2\r\nv3\r\n$-1\r\n");
+
+    let resp = cmd(&mut stream, &["HMGET", "noexist", "f1", "f2"]).await;
+    assert_resp(&resp, b"*2\r\n$-1\r\n$-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_hmset() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    let resp = cmd(&mut stream, &["HMSET", "myhash", "f1", "v1", "f2", "v2"]).await;
+    assert_resp(&resp, b":2\r\n");
+
+    let resp = cmd(&mut stream, &["HGET", "myhash", "f1"]).await;
+    assert_resp(&resp, b"$2\r\nv1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_hkeys_hvals() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    cmd(&mut stream, &["HSET", "myhash", "f1", "v1", "f2", "v2"]).await;
+
+    let resp = cmd(&mut stream, &["HKEYS", "myhash"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.starts_with("*2\r\n"));
+    assert!(resp_str.contains("f1"));
+    assert!(resp_str.contains("f2"));
+
+    let resp = cmd(&mut stream, &["HVALS", "myhash"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.starts_with("*2\r\n"));
+    assert!(resp_str.contains("v1"));
+    assert!(resp_str.contains("v2"));
+
+    let resp = cmd(&mut stream, &["HKEYS", "noexist"]).await;
+    assert_resp(&resp, b"*0\r\n");
+
+    let resp = cmd(&mut stream, &["HVALS", "noexist"]).await;
+    assert_resp(&resp, b"*0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_hsetnx() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    let resp = cmd(&mut stream, &["HSETNX", "myhash", "f1", "v1"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["HSETNX", "myhash", "f1", "v2"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let resp = cmd(&mut stream, &["HGET", "myhash", "f1"]).await;
+    assert_resp(&resp, b"$2\r\nv1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_hincrbyfloat() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    let resp = cmd(&mut stream, &["HINCRBYFLOAT", "myhash", "f1", "10.5"]).await;
+    assert_resp(&resp, b"$4\r\n10.5\r\n");
+
+    let resp = cmd(&mut stream, &["HINCRBYFLOAT", "myhash", "f1", "0.1"]).await;
+    assert_resp(&resp, b"$4\r\n10.6\r\n");
+
+    let resp = cmd(&mut stream, &["HINCRBYFLOAT", "myhash", "f1", "-5"]).await;
+    assert_resp(&resp, b"$3\r\n5.6\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_hrandfield() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    cmd(
+        &mut stream,
+        &["HSET", "myhash", "f1", "v1", "f2", "v2", "f3", "v3"],
+    )
+    .await;
+
+    let resp = cmd(&mut stream, &["HRANDFIELD", "myhash"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.contains("f1") || resp_str.contains("f2") || resp_str.contains("f3"));
+
+    let resp = cmd(&mut stream, &["HRANDFIELD", "myhash", "2"]).await;
+    assert!(resp.starts_with(b"*2\r\n"));
+
+    let resp = cmd(&mut stream, &["HRANDFIELD", "myhash", "-5"]).await;
+    assert!(resp.starts_with(b"*5\r\n"));
+
+    let resp = cmd(&mut stream, &["HRANDFIELD", "noexist"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_hscan() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    cmd(
+        &mut stream,
+        &["HSET", "myhash", "f1", "v1", "f2", "v2", "f3", "v3"],
+    )
+    .await;
+
+    let resp = cmd(&mut stream, &["HSCAN", "myhash", "0"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.starts_with("*2\r\n"));
+    assert!(resp_str.contains("f1"));
+
+    let resp = cmd(
+        &mut stream,
+        &["HSCAN", "myhash", "0", "MATCH", "f*", "COUNT", "2"],
+    )
+    .await;
+    assert!(resp.starts_with(b"*2\r\n"));
+
+    let resp = cmd(&mut stream, &["HSCAN", "noexist", "0"]).await;
+    assert_resp(&resp, b"*2\r\n$1\r\n0\r\n*0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Set commands
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_spop() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SADD", "myset", "a", "b", "c"]).await;
+
+    let resp = cmd(&mut stream, &["SPOP", "myset"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.contains("a") || resp_str.contains("b") || resp_str.contains("c"),
+        "Expected a member, got: {}",
+        resp_str
+    );
+
+    let resp = cmd(&mut stream, &["SPOP", "myset", "2"]).await;
+    assert!(resp.starts_with(b"*2\r\n") || resp.starts_with(b"*1\r\n"));
+
+    let resp = cmd(&mut stream, &["SPOP", "noexist"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let resp = cmd(&mut stream, &["SPOP", "noexist", "1"]).await;
+    assert_resp(&resp, b"*0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_srandmember() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SADD", "myset", "a", "b", "c"]).await;
+
+    let resp = cmd(&mut stream, &["SRANDMEMBER", "myset"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.contains("a") || resp_str.contains("b") || resp_str.contains("c"),
+        "Expected a member, got: {}",
+        resp_str
+    );
+
+    let resp = cmd(&mut stream, &["SRANDMEMBER", "myset", "2"]).await;
+    assert!(resp.starts_with(b"*2\r\n"));
+
+    let resp = cmd(&mut stream, &["SRANDMEMBER", "myset", "-5"]).await;
+    assert!(resp.starts_with(b"*5\r\n"));
+
+    let resp = cmd(&mut stream, &["SRANDMEMBER", "noexist"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_sunion_sinter_sdiff() {
+    let port = free_port().await;
+    let shutdown = start_server_with_workers(port, 1).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SADD", "s1", "a", "b", "c"]).await;
+    cmd(&mut stream, &["SADD", "s2", "b", "c", "d"]).await;
+
+    let resp = cmd(&mut stream, &["SUNION", "s1", "s2"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.starts_with("*4\r\n"),
+        "Expected 4 members in union, got: {}",
+        resp_str
+    );
+
+    let resp = cmd(&mut stream, &["SINTER", "s1", "s2"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.starts_with("*2\r\n"),
+        "Expected 2 members in intersection, got: {}",
+        resp_str
+    );
+
+    let resp = cmd(&mut stream, &["SDIFF", "s1", "s2"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.starts_with("*1\r\n"),
+        "Expected 1 member in diff, got: {}",
+        resp_str
+    );
+    assert!(resp_str.contains("a"));
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_sunionstore_sinterstore_sdiffstore() {
+    let port = free_port().await;
+    let shutdown = start_server_with_workers(port, 1).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SADD", "s1", "a", "b", "c"]).await;
+    cmd(&mut stream, &["SADD", "s2", "b", "c", "d"]).await;
+
+    let resp = cmd(&mut stream, &["SUNIONSTORE", "dest1", "s1", "s2"]).await;
+    assert_resp(&resp, b":4\r\n");
+
+    let resp = cmd(&mut stream, &["SCARD", "dest1"]).await;
+    assert_resp(&resp, b":4\r\n");
+
+    let resp = cmd(&mut stream, &["SINTERSTORE", "dest2", "s1", "s2"]).await;
+    assert_resp(&resp, b":2\r\n");
+
+    let resp = cmd(&mut stream, &["SCARD", "dest2"]).await;
+    assert_resp(&resp, b":2\r\n");
+
+    let resp = cmd(&mut stream, &["SDIFFSTORE", "dest3", "s1", "s2"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["SCARD", "dest3"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_sintercard() {
+    let port = free_port().await;
+    let shutdown = start_server_with_workers(port, 1).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SADD", "s1", "a", "b", "c"]).await;
+    cmd(&mut stream, &["SADD", "s2", "b", "c", "d"]).await;
+
+    let resp = cmd(&mut stream, &["SINTERCARD", "2", "s1", "s2"]).await;
+    assert_resp(&resp, b":2\r\n");
+
+    let resp = cmd(&mut stream, &["SINTERCARD", "2", "s1", "s2", "LIMIT", "1"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_smove() {
+    let port = free_port().await;
+    let shutdown = start_server_with_workers(port, 1).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SADD", "src", "a", "b"]).await;
+    cmd(&mut stream, &["SADD", "dst", "c"]).await;
+
+    let resp = cmd(&mut stream, &["SMOVE", "src", "dst", "a"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["SISMEMBER", "src", "a"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let resp = cmd(&mut stream, &["SISMEMBER", "dst", "a"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["SMOVE", "src", "dst", "nonexist"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_smove_cross_shard_wrongtype_preserves_source() {
+    let port = free_port().await;
+    let shutdown = start_server_with_workers(port, 2).await;
+    let mut stream = connect(port).await;
+    let (source, destination) = keys_on_different_shards(2, "smove-x:");
+
+    cmd(&mut stream, &["SADD", source.as_str(), "member"]).await;
+    cmd(&mut stream, &["SET", destination.as_str(), "notset"]).await;
+
+    let resp = cmd(
+        &mut stream,
+        &["SMOVE", source.as_str(), destination.as_str(), "member"],
+    )
+    .await;
+    assert_resp_prefix(&resp, b"-WRONGTYPE");
+
+    let resp = cmd(&mut stream, &["SISMEMBER", source.as_str(), "member"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["GET", destination.as_str()]).await;
+    assert_resp(&resp, b"$6\r\nnotset\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_smismember() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SADD", "myset", "a", "b", "c"]).await;
+
+    let resp = cmd(&mut stream, &["SMISMEMBER", "myset", "a", "d", "c"]).await;
+    assert_resp(&resp, b"*3\r\n:1\r\n:0\r\n:1\r\n");
+
+    let resp = cmd(&mut stream, &["SMISMEMBER", "noexist", "a"]).await;
+    assert_resp(&resp, b"*1\r\n:0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_sscan() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SADD", "myset", "a", "b", "c"]).await;
+
+    let resp = cmd(&mut stream, &["SSCAN", "myset", "0"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.starts_with("*2\r\n"));
+    assert!(resp_str.contains("a") || resp_str.contains("b") || resp_str.contains("c"));
+
+    let resp = cmd(&mut stream, &["SSCAN", "noexist", "0"]).await;
+    assert_resp(&resp, b"*2\r\n$1\r\n0\r\n*0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Sorted Set commands
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_zrevrangebyscore() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["ZADD", "zs", "1", "a", "2", "b", "3", "c"]).await;
+
+    let resp = cmd(&mut stream, &["ZREVRANGEBYSCORE", "zs", "3", "1"]).await;
+    assert_resp(&resp, b"*3\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\na\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &["ZREVRANGEBYSCORE", "zs", "2", "1", "WITHSCORES"],
+    )
+    .await;
+    assert_resp(&resp, b"*4\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\na\r\n$1\r\n1\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &["ZREVRANGEBYSCORE", "zs", "3", "1", "LIMIT", "0", "2"],
+    )
+    .await;
+    assert_resp(&resp, b"*2\r\n$1\r\nc\r\n$1\r\nb\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_zpopmin_zpopmax() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["ZADD", "zs", "1", "a", "2", "b", "3", "c"]).await;
+
+    let resp = cmd(&mut stream, &["ZPOPMIN", "zs"]).await;
+    assert_resp(&resp, b"*2\r\n$1\r\na\r\n$1\r\n1\r\n");
+
+    let resp = cmd(&mut stream, &["ZPOPMAX", "zs"]).await;
+    assert_resp(&resp, b"*2\r\n$1\r\nc\r\n$1\r\n3\r\n");
+
+    let resp = cmd(&mut stream, &["ZCARD", "zs"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["ZPOPMIN", "noexist"]).await;
+    assert_resp(&resp, b"*0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_zrangebylex() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(
+        &mut stream,
+        &[
+            "ZADD", "zs", "0", "a", "0", "b", "0", "c", "0", "d", "0", "e",
+        ],
+    )
+    .await;
+
+    let resp = cmd(&mut stream, &["ZRANGEBYLEX", "zs", "-", "+"]).await;
+    assert_resp(
+        &resp,
+        b"*5\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\nd\r\n$1\r\ne\r\n",
+    );
+
+    let resp = cmd(&mut stream, &["ZRANGEBYLEX", "zs", "[b", "[d"]).await;
+    assert_resp(&resp, b"*3\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\nd\r\n");
+
+    let resp = cmd(&mut stream, &["ZRANGEBYLEX", "zs", "(b", "[d"]).await;
+    assert_resp(&resp, b"*2\r\n$1\r\nc\r\n$1\r\nd\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &["ZRANGEBYLEX", "zs", "-", "+", "LIMIT", "1", "2"],
+    )
+    .await;
+    assert_resp(&resp, b"*2\r\n$1\r\nb\r\n$1\r\nc\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_zrevrangebylex() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(
+        &mut stream,
+        &["ZADD", "zs", "0", "a", "0", "b", "0", "c", "0", "d"],
+    )
+    .await;
+
+    let resp = cmd(&mut stream, &["ZREVRANGEBYLEX", "zs", "+", "-"]).await;
+    assert_resp(&resp, b"*4\r\n$1\r\nd\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\na\r\n");
+
+    let resp = cmd(&mut stream, &["ZREVRANGEBYLEX", "zs", "[c", "[a"]).await;
+    assert_resp(&resp, b"*3\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\na\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_zlexcount() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(
+        &mut stream,
+        &["ZADD", "zs", "0", "a", "0", "b", "0", "c", "0", "d"],
+    )
+    .await;
+
+    let resp = cmd(&mut stream, &["ZLEXCOUNT", "zs", "-", "+"]).await;
+    assert_resp(&resp, b":4\r\n");
+
+    let resp = cmd(&mut stream, &["ZLEXCOUNT", "zs", "[b", "[d"]).await;
+    assert_resp(&resp, b":3\r\n");
+
+    let resp = cmd(&mut stream, &["ZLEXCOUNT", "zs", "(b", "(d"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_zmscore() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["ZADD", "zs", "1.5", "a", "2.5", "b"]).await;
+
+    let resp = cmd(&mut stream, &["ZMSCORE", "zs", "a", "nonexist", "b"]).await;
+    assert_resp(&resp, b"*3\r\n$3\r\n1.5\r\n$-1\r\n$3\r\n2.5\r\n");
+
+    let resp = cmd(&mut stream, &["ZMSCORE", "noexist", "a"]).await;
+    assert_resp(&resp, b"*1\r\n$-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_zrandmember() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["ZADD", "zs", "1", "a", "2", "b", "3", "c"]).await;
+
+    let resp = cmd(&mut stream, &["ZRANDMEMBER", "zs"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.contains("a") || resp_str.contains("b") || resp_str.contains("c"));
+
+    let resp = cmd(&mut stream, &["ZRANDMEMBER", "zs", "2"]).await;
+    assert!(resp.starts_with(b"*2\r\n"));
+
+    let resp = cmd(&mut stream, &["ZRANDMEMBER", "zs", "-5"]).await;
+    assert!(resp.starts_with(b"*5\r\n"));
+
+    let resp = cmd(&mut stream, &["ZRANDMEMBER", "zs", "2", "WITHSCORES"]).await;
+    assert!(resp.starts_with(b"*4\r\n"));
+
+    let resp = cmd(&mut stream, &["ZRANDMEMBER", "noexist"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_zscan() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["ZADD", "zs", "1", "a", "2", "b", "3", "c"]).await;
+
+    let resp = cmd(&mut stream, &["ZSCAN", "zs", "0"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.starts_with("*2\r\n"));
+    assert!(resp_str.contains("a") || resp_str.contains("b") || resp_str.contains("c"));
+
+    let resp = cmd(&mut stream, &["ZSCAN", "noexist", "0"]).await;
+    assert_resp(&resp, b"*2\r\n$1\r\n0\r\n*0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+// ---------------------------------------------------------------------------
+// HyperLogLog tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_pfadd_pfcount() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["PFADD", "hll", "a", "b", "c"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["PFADD", "hll", "a", "b", "c"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let resp = cmd(&mut stream, &["PFADD", "hll", "d"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["PFCOUNT", "hll"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    let count: i64 = resp_str
+        .trim()
+        .trim_start_matches(':')
+        .trim_end()
+        .parse()
+        .unwrap();
+    assert!(
+        (3..=5).contains(&count),
+        "HLL count should be ~4, got {}",
+        count
+    );
+
+    let resp = cmd(&mut stream, &["PFCOUNT", "nonexistent"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_pfmerge() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["PFADD", "hll1", "a", "b", "c"]).await;
+    cmd(&mut stream, &["PFADD", "hll2", "c", "d", "e"]).await;
+
+    let resp = cmd(&mut stream, &["PFMERGE", "merged", "hll1", "hll2"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["PFCOUNT", "merged"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    let count: i64 = resp_str
+        .trim()
+        .trim_start_matches(':')
+        .trim_end()
+        .parse()
+        .unwrap();
+    assert!(
+        (4..=6).contains(&count),
+        "Merged HLL count should be ~5, got {}",
+        count
+    );
+
+    let _ = shutdown.send(true);
+}
+
+// ---------------------------------------------------------------------------
+// Bitmap tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_setbit_getbit() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["SETBIT", "bm", "7", "1"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let resp = cmd(&mut stream, &["GETBIT", "bm", "7"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["GETBIT", "bm", "0"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let resp = cmd(&mut stream, &["SETBIT", "bm", "7", "0"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["GETBIT", "bm", "7"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let resp = cmd(&mut stream, &["GETBIT", "nonexistent", "100"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_bitcount() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "bc", "foobar"]).await;
+
+    let resp = cmd(&mut stream, &["BITCOUNT", "bc"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    let count: i64 = resp_str
+        .trim()
+        .trim_start_matches(':')
+        .trim_end()
+        .parse()
+        .unwrap();
+    assert_eq!(count, 26);
+
+    let resp = cmd(&mut stream, &["BITCOUNT", "bc", "0", "0"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    let count: i64 = resp_str
+        .trim()
+        .trim_start_matches(':')
+        .trim_end()
+        .parse()
+        .unwrap();
+    assert_eq!(count, 4);
+
+    let resp = cmd(&mut stream, &["BITCOUNT", "bc", "1", "1"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    let count: i64 = resp_str
+        .trim()
+        .trim_start_matches(':')
+        .trim_end()
+        .parse()
+        .unwrap();
+    assert_eq!(count, 6);
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_bitop() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "a", "abc"]).await;
+    cmd(&mut stream, &["SET", "b", "def"]).await;
+
+    let resp = cmd(&mut stream, &["BITOP", "AND", "dest", "a", "b"]).await;
+    assert_resp(&resp, b":3\r\n");
+
+    let resp = cmd(&mut stream, &["BITOP", "NOT", "notdest", "a"]).await;
+    assert_resp(&resp, b":3\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_bitpos() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    for bit in 0..12 {
+        cmd(&mut stream, &["SETBIT", "bp", &bit.to_string(), "1"]).await;
+    }
+
+    let resp = cmd(&mut stream, &["BITPOS", "bp", "0"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    let pos: i64 = resp_str
+        .trim()
+        .trim_start_matches(':')
+        .trim_end()
+        .parse()
+        .unwrap();
+    assert_eq!(pos, 12);
+
+    let resp = cmd(&mut stream, &["BITPOS", "bp", "1"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    let pos: i64 = resp_str
+        .trim()
+        .trim_start_matches(':')
+        .trim_end()
+        .parse()
+        .unwrap();
+    assert_eq!(pos, 0);
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_bitfield_basic() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["BITFIELD", "mykey", "SET", "u8", "0", "255"]).await;
+    assert_resp(&resp, b"*1\r\n:0\r\n");
+
+    let resp = cmd(&mut stream, &["BITFIELD", "mykey", "GET", "u8", "0"]).await;
+    assert_resp(&resp, b"*1\r\n:255\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &["BITFIELD", "mykey", "INCRBY", "u8", "0", "1"],
+    )
+    .await;
+    assert_resp(&resp, b"*1\r\n:0\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "BITFIELD", "mykey", "OVERFLOW", "SAT", "INCRBY", "u8", "0", "300",
+        ],
+    )
+    .await;
+    assert_resp(&resp, b"*1\r\n:255\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "BITFIELD", "mykey", "OVERFLOW", "FAIL", "INCRBY", "u8", "0", "1",
+        ],
+    )
+    .await;
+    assert_resp(&resp, b"*1\r\n$-1\r\n");
+
+    let resp = cmd(&mut stream, &["BITFIELD", "mykey", "GET", "u8", "0"]).await;
+    assert_resp(&resp, b"*1\r\n:255\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+// ---------------------------------------------------------------------------
+// Geo tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_geoadd_geopos() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "GEOADD",
+            "geo",
+            "13.361389",
+            "38.115556",
+            "Palermo",
+            "15.087269",
+            "37.502669",
+            "Catania",
+        ],
+    )
+    .await;
+    assert_resp(&resp, b":2\r\n");
+
+    let resp = cmd(&mut stream, &["GEOPOS", "geo", "Palermo"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.contains("13.36"),
+        "Expected longitude ~13.36, got: {}",
+        resp_str
+    );
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_geodist() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(
+        &mut stream,
+        &[
+            "GEOADD",
+            "geo",
+            "13.361389",
+            "38.115556",
+            "Palermo",
+            "15.087269",
+            "37.502669",
+            "Catania",
+        ],
+    )
+    .await;
+
+    let resp = cmd(&mut stream, &["GEODIST", "geo", "Palermo", "Catania", "km"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    let dist_str = resp_str.trim_start_matches('$');
+    let lines: Vec<&str> = dist_str.split("\r\n").collect();
+    let dist_val: f64 = lines.get(1).unwrap_or(&"0").parse().unwrap_or(0.0);
+    assert!(
+        dist_val > 150.0 && dist_val < 200.0,
+        "Distance should be ~166km, got: {}",
+        dist_val
+    );
+
+    let resp = cmd(&mut stream, &["GEODIST", "geo", "Palermo", "nonexistent"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_geohash() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(
+        &mut stream,
+        &["GEOADD", "geo", "13.361389", "38.115556", "Palermo"],
+    )
+    .await;
+
+    let resp = cmd(&mut stream, &["GEOHASH", "geo", "Palermo"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.contains("sqc8b49r"),
+        "Expected geohash starting with sqc8b49, got: {}",
+        resp_str
+    );
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_geosearch() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(
+        &mut stream,
+        &[
+            "GEOADD",
+            "geo",
+            "13.361389",
+            "38.115556",
+            "Palermo",
+            "15.087269",
+            "37.502669",
+            "Catania",
+            "2.349014",
+            "48.864716",
+            "Paris",
+        ],
+    )
+    .await;
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "GEOSEARCH",
+            "geo",
+            "FROMLONLAT",
+            "15",
+            "37",
+            "BYRADIUS",
+            "200",
+            "km",
+            "ASC",
+        ],
+    )
+    .await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.contains("Catania") || resp_str.contains("Palermo"),
+        "Expected geo members in range, got: {}",
+        resp_str
+    );
+    assert!(!resp_str.contains("Paris"), "Paris should be out of range");
+
+    let _ = shutdown.send(true);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 — Transactions & Server commands
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_multi_exec() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["MULTI"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["SET", "txkey1", "val1"]).await;
+    assert_resp(&resp, b"+QUEUED\r\n");
+
+    let resp = cmd(&mut stream, &["SET", "txkey2", "val2"]).await;
+    assert_resp(&resp, b"+QUEUED\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "txkey1"]).await;
+    assert_resp(&resp, b"+QUEUED\r\n");
+
+    let resp = cmd(&mut stream, &["EXEC"]).await;
+    assert_resp(&resp, b"*3\r\n+OK\r\n+OK\r\n$4\r\nval1\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "txkey2"]).await;
+    assert_resp(&resp, b"$4\r\nval2\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_multi_discard() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["MULTI"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["SET", "discardkey", "val"]).await;
+    assert_resp(&resp, b"+QUEUED\r\n");
+
+    let resp = cmd(&mut stream, &["DISCARD"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "discardkey"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_multi_errors() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["EXEC"]).await;
+    assert_resp_prefix(&resp, b"-ERR EXEC without MULTI");
+
+    let resp = cmd(&mut stream, &["DISCARD"]).await;
+    assert_resp_prefix(&resp, b"-ERR DISCARD without MULTI");
+
+    let resp = cmd(&mut stream, &["MULTI"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["MULTI"]).await;
+    assert_resp_prefix(&resp, b"-ERR MULTI calls can not be nested");
+
+    let resp = cmd(&mut stream, &["DISCARD"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_watch_unwatch() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["WATCH", "wkey1", "wkey2"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["UNWATCH"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["MULTI"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["WATCH", "wkey1"]).await;
+    assert_resp_prefix(&resp, b"-ERR WATCH inside MULTI");
+
+    let resp = cmd(&mut stream, &["DISCARD"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_client_commands() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["CLIENT", "ID"]).await;
+    assert!(
+        resp.starts_with(b":"),
+        "Expected integer response for CLIENT ID"
+    );
+
+    let resp = cmd(&mut stream, &["CLIENT", "GETNAME"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let resp = cmd(&mut stream, &["CLIENT", "SETNAME", "test-conn"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["CLIENT", "GETNAME"]).await;
+    assert_resp(&resp, b"$9\r\ntest-conn\r\n");
+
+    let resp = cmd(&mut stream, &["CLIENT", "INFO"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.contains("name=test-conn"),
+        "CLIENT INFO should contain connection name"
+    );
+
+    let resp = cmd(&mut stream, &["CLIENT", "LIST"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.contains("id="),
+        "CLIENT LIST should contain connection info"
+    );
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_config_get_set() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["CONFIG", "GET", "maxmemory"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.contains("maxmemory"),
+        "CONFIG GET should return maxmemory"
+    );
+
+    let resp = cmd(&mut stream, &["CONFIG", "SET", "maxmemory", "100mb"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["CONFIG", "SET", "unsupported", "val"]).await;
+    assert_resp_prefix(&resp, b"-ERR");
+
+    let resp = cmd(&mut stream, &["CONFIG", "RESETSTAT"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_time() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["TIME"]).await;
+    assert!(resp.starts_with(b"*2\r\n"), "TIME should return array of 2");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_select() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["SELECT", "0"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["SELECT", "1"]).await;
+    assert_resp_prefix(&resp, b"-ERR");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_quit() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "quitkey", "val"]).await;
+
+    stream.write_all(&resp_cmd(&["QUIT"])).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut buf = vec![0u8; 4096];
+    let n = stream.read(&mut buf).await.unwrap();
+    buf.truncate(n);
+    assert_resp(&buf, b"+OK\r\n");
+
+    let result = stream.read(&mut buf).await;
+    match result {
+        Ok(0) => {}
+        Err(_) => {}
+        Ok(n) => panic!("Expected connection close, got {} bytes", n),
+    }
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_wait() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["WAIT", "1", "1"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let resp = cmd(&mut stream, &["WAIT", "1", "-1"]).await;
+    assert_resp_prefix(&resp, b"-ERR timeout is negative");
+
+    let resp = cmd(&mut stream, &["WAIT", "-1", "1"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_command_subcommands() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["COMMAND", "COUNT"]).await;
+    assert!(
+        resp.starts_with(b":"),
+        "COMMAND COUNT should return integer"
+    );
+
+    let resp = cmd(&mut stream, &["COMMAND", "LIST"]).await;
+    assert!(resp.starts_with(b"*"), "COMMAND LIST should return array");
+    assert!(
+        String::from_utf8_lossy(&resp).contains("get"),
+        "COMMAND LIST should include known commands"
+    );
+
+    let resp = cmd(&mut stream, &["COMMAND", "INFO", "GET", "BOGUS"]).await;
+    assert!(resp.starts_with(b"*"), "COMMAND INFO should return array");
+    assert!(
+        String::from_utf8_lossy(&resp).contains("$-1"),
+        "COMMAND INFO should include nil for unknown commands"
+    );
+
+    let resp = cmd(&mut stream, &["COMMAND", "DOCS", "GET"]).await;
+    assert!(
+        resp.starts_with(b"*"),
+        "COMMAND DOCS should return a non-empty aggregate"
+    );
+    assert!(
+        String::from_utf8_lossy(&resp).contains("summary"),
+        "COMMAND DOCS should include summary fields"
+    );
+
+    let resp = cmd(&mut stream, &["COMMAND", "HELP"]).await;
+    assert!(resp.starts_with(b"*"), "COMMAND HELP should return array");
+
+    let _ = shutdown.send(true);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: Blocking Operations
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_blpop_immediate() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["RPUSH", "blist", "a", "b"]).await;
+
+    let resp = cmd(&mut stream, &["BLPOP", "blist", "0"]).await;
+    assert_resp(&resp, b"*2\r\n$5\r\nblist\r\n$1\r\na\r\n");
+
+    let resp = cmd(&mut stream, &["BLPOP", "empty_list", "0"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_brpop_immediate() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["RPUSH", "blist", "x", "y", "z"]).await;
+
+    let resp = cmd(&mut stream, &["BRPOP", "blist", "0"]).await;
+    assert_resp(&resp, b"*2\r\n$5\r\nblist\r\n$1\r\nz\r\n");
+
+    let resp = cmd(&mut stream, &["LLEN", "blist"]).await;
+    assert_resp(&resp, b":2\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_blpop_multi_key() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["RPUSH", "k2", "val"]).await;
+
+    let resp = cmd(&mut stream, &["BLPOP", "k1", "k2", "0"]).await;
+    assert_resp(&resp, b"*2\r\n$2\r\nk2\r\n$3\r\nval\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_blmove_immediate() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["RPUSH", "bsrc", "a", "b", "c"]).await;
+
+    let resp = cmd(
+        &mut stream,
+        &["BLMOVE", "bsrc", "bdst", "LEFT", "RIGHT", "0"],
+    )
+    .await;
+    assert_resp(&resp, b"$1\r\na\r\n");
+
+    let resp = cmd(&mut stream, &["LRANGE", "bdst", "0", "-1"]).await;
+    assert_resp(&resp, b"*1\r\n$1\r\na\r\n");
+
+    let resp = cmd(
+        &mut stream,
+        &["BLMOVE", "empty_src", "bdst", "LEFT", "RIGHT", "0"],
+    )
+    .await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_bzpopmin_immediate() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["ZADD", "bzs", "1", "a", "2", "b", "3", "c"]).await;
+
+    let resp = cmd(&mut stream, &["BZPOPMIN", "bzs", "0"]).await;
+    assert_resp(&resp, b"*2\r\n$3\r\nbzs\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n");
+
+    let resp = cmd(&mut stream, &["BZPOPMIN", "nope", "0"]).await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_bzpopmax_immediate() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["ZADD", "bzs2", "1", "a", "2", "b", "3", "c"]).await;
+
+    let resp = cmd(&mut stream, &["BZPOPMAX", "bzs2", "0"]).await;
+    assert_resp(&resp, b"*2\r\n$4\r\nbzs2\r\n*2\r\n$1\r\nc\r\n$1\r\n3\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: Stream Consumer Groups
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_xread_cross_shard_multi_stream() {
+    let port = free_port().await;
+    let shutdown = start_server_with_workers(port, 2).await;
+    let mut stream = connect(port).await;
+    let (stream_a, stream_b) = keys_on_different_shards(2, "xread-x:");
+
+    cmd(
+        &mut stream,
+        &["XADD", stream_a.as_str(), "1-0", "field", "value-a"],
+    )
+    .await;
+    cmd(
+        &mut stream,
+        &["XADD", stream_b.as_str(), "1-0", "field", "value-b"],
+    )
+    .await;
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "XREAD",
+            "COUNT",
+            "10",
+            "STREAMS",
+            stream_a.as_str(),
+            stream_b.as_str(),
+            "0-0",
+            "0-0",
+        ],
+    )
+    .await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.contains(stream_a.as_str()),
+        "XREAD response missing {}: {}",
+        stream_a,
+        resp_str
+    );
+    assert!(
+        resp_str.contains(stream_b.as_str()),
+        "XREAD response missing {}: {}",
+        stream_b,
+        resp_str
+    );
+    assert!(
+        resp_str.contains("value-a") && resp_str.contains("value-b"),
+        "XREAD response missing values: {}",
+        resp_str
+    );
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_xgroup_create_destroy() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["XADD", "mystream", "1-0", "f", "v"]).await;
+
+    let resp = cmd(&mut stream, &["XGROUP", "CREATE", "mystream", "grp1", "0"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["XGROUP", "CREATE", "mystream", "grp1", "0"]).await;
+    assert_resp_prefix(&resp, b"-BUSYGROUP");
+
+    let resp = cmd(&mut stream, &["XGROUP", "DESTROY", "mystream", "grp1"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["XGROUP", "DESTROY", "mystream", "grp1"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_xgroup_create_mkstream() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["XGROUP", "CREATE", "noexist", "grp1", "0"]).await;
+    assert_resp_prefix(&resp, b"-ERR");
+
+    let resp = cmd(
+        &mut stream,
+        &["XGROUP", "CREATE", "noexist", "grp1", "0", "MKSTREAM"],
+    )
+    .await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["XLEN", "noexist"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_xreadgroup_new_messages() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["XADD", "s1", "1-0", "k", "v1"]).await;
+    cmd(&mut stream, &["XADD", "s1", "2-0", "k", "v2"]).await;
+    cmd(&mut stream, &["XADD", "s1", "3-0", "k", "v3"]).await;
+
+    cmd(&mut stream, &["XGROUP", "CREATE", "s1", "mygroup", "0"]).await;
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "mygroup",
+            "alice",
+            "COUNT",
+            "2",
+            "STREAMS",
+            "s1",
+            ">",
+        ],
+    )
+    .await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.contains("s1"),
+        "response should contain stream key"
+    );
+    assert!(resp_str.contains("1-0"), "response should contain first ID");
+    assert!(
+        resp_str.contains("2-0"),
+        "response should contain second ID"
+    );
+    assert!(
+        !resp_str.contains("3-0"),
+        "response should NOT contain third ID (COUNT=2)"
+    );
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "mygroup",
+            "alice",
+            "STREAMS",
+            "s1",
+            ">",
+        ],
+    )
+    .await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.contains("3-0"),
+        "second read should deliver remaining entry"
+    );
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_xack() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["XADD", "s", "1-0", "f", "v1"]).await;
+    cmd(&mut stream, &["XADD", "s", "2-0", "f", "v2"]).await;
+    cmd(&mut stream, &["XGROUP", "CREATE", "s", "g", "0"]).await;
+    cmd(
+        &mut stream,
+        &["XREADGROUP", "GROUP", "g", "c1", "STREAMS", "s", ">"],
+    )
+    .await;
+
+    let resp = cmd(&mut stream, &["XACK", "s", "g", "1-0"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["XACK", "s", "g", "1-0"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let resp = cmd(&mut stream, &["XACK", "s", "g", "2-0"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_xpending_summary() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["XADD", "s", "1-0", "f", "v1"]).await;
+    cmd(&mut stream, &["XADD", "s", "2-0", "f", "v2"]).await;
+    cmd(&mut stream, &["XGROUP", "CREATE", "s", "g", "0"]).await;
+    cmd(
+        &mut stream,
+        &["XREADGROUP", "GROUP", "g", "bob", "STREAMS", "s", ">"],
+    )
+    .await;
+
+    let resp = cmd(&mut stream, &["XPENDING", "s", "g"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.starts_with("*4\r\n"),
+        "summary should be 4-element array"
+    );
+    assert!(resp_str.contains(":2\r\n"), "should have 2 pending entries");
+    assert!(resp_str.contains("1-0"), "should contain min ID");
+    assert!(resp_str.contains("2-0"), "should contain max ID");
+    assert!(resp_str.contains("bob"), "should contain consumer name");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_xpending_detail() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["XADD", "s", "1-0", "f", "v"]).await;
+    cmd(&mut stream, &["XGROUP", "CREATE", "s", "g", "0"]).await;
+    cmd(
+        &mut stream,
+        &["XREADGROUP", "GROUP", "g", "c1", "STREAMS", "s", ">"],
+    )
+    .await;
+
+    let resp = cmd(&mut stream, &["XPENDING", "s", "g", "-", "+", "10"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.contains("1-0"), "should contain entry ID");
+    assert!(resp_str.contains("c1"), "should contain consumer name");
+    assert!(resp_str.contains(":1\r\n"), "delivery count should be 1");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_xpending_no_group() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["XADD", "s", "1-0", "f", "v"]).await;
+
+    let resp = cmd(&mut stream, &["XPENDING", "s", "nogroup"]).await;
+    assert_resp_prefix(&resp, b"-NOGROUP");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_xgroup_delconsumer() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["XADD", "s", "1-0", "f", "v"]).await;
+    cmd(&mut stream, &["XGROUP", "CREATE", "s", "g", "0"]).await;
+    cmd(
+        &mut stream,
+        &["XREADGROUP", "GROUP", "g", "c1", "STREAMS", "s", ">"],
+    )
+    .await;
+
+    let resp = cmd(&mut stream, &["XGROUP", "DELCONSUMER", "s", "g", "c1"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["XGROUP", "DELCONSUMER", "s", "g", "c1"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_xdel() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["XADD", "s", "1-0", "f", "v1"]).await;
+    cmd(&mut stream, &["XADD", "s", "2-0", "f", "v2"]).await;
+    cmd(&mut stream, &["XADD", "s", "3-0", "f", "v3"]).await;
+
+    let resp = cmd(&mut stream, &["XDEL", "s", "2-0"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["XLEN", "s"]).await;
+    assert_resp(&resp, b":2\r\n");
+
+    let resp = cmd(&mut stream, &["XDEL", "s", "2-0"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let resp = cmd(&mut stream, &["XDEL", "noexist", "1-0"]).await;
+    assert_resp(&resp, b":0\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_xdel_multiple() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["XADD", "s", "1-0", "f", "v1"]).await;
+    cmd(&mut stream, &["XADD", "s", "2-0", "f", "v2"]).await;
+    cmd(&mut stream, &["XADD", "s", "3-0", "f", "v3"]).await;
+
+    let resp = cmd(&mut stream, &["XDEL", "s", "1-0", "3-0"]).await;
+    assert_resp(&resp, b":2\r\n");
+
+    let resp = cmd(&mut stream, &["XLEN", "s"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_xinfo_stream() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["XADD", "s", "1-0", "f1", "v1"]).await;
+    cmd(&mut stream, &["XADD", "s", "2-0", "f2", "v2"]).await;
+
+    let resp = cmd(&mut stream, &["XINFO", "STREAM", "s"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.contains("length"), "should contain length field");
+    assert!(resp_str.contains(":2\r\n"), "length should be 2");
+    assert!(
+        resp_str.contains("first-entry"),
+        "should contain first-entry"
+    );
+    assert!(resp_str.contains("last-entry"), "should contain last-entry");
+    assert!(resp_str.contains("1-0"), "should contain first entry ID");
+    assert!(resp_str.contains("2-0"), "should contain last entry ID");
+    assert!(
+        resp_str.contains("last-generated-id"),
+        "should contain last-generated-id"
+    );
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_xinfo_stream_nonexistent() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["XINFO", "STREAM", "nokey"]).await;
+    assert_resp_prefix(&resp, b"-ERR");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_xinfo_groups() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["XADD", "s", "1-0", "f", "v"]).await;
+    cmd(&mut stream, &["XGROUP", "CREATE", "s", "g1", "0"]).await;
+    cmd(&mut stream, &["XGROUP", "CREATE", "s", "g2", "$"]).await;
+
+    let resp = cmd(&mut stream, &["XINFO", "GROUPS", "s"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.contains("g1"), "should contain group g1");
+    assert!(resp_str.contains("g2"), "should contain group g2");
+    assert!(resp_str.contains("name"), "should contain name field");
+    assert!(resp_str.contains("pending"), "should contain pending field");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_xinfo_groups_no_stream() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["XINFO", "GROUPS", "nokey"]).await;
+    assert_resp_prefix(&resp, b"-ERR");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_xclaim() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["XADD", "s", "1-0", "f", "v"]).await;
+    cmd(&mut stream, &["XGROUP", "CREATE", "s", "g", "0"]).await;
+    cmd(
+        &mut stream,
+        &["XREADGROUP", "GROUP", "g", "c1", "STREAMS", "s", ">"],
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let resp = cmd(&mut stream, &["XCLAIM", "s", "g", "c2", "0", "1-0"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.contains("1-0"), "claimed entry should be returned");
+    assert!(resp_str.contains("v"), "claimed entry should contain value");
+
+    let resp = cmd(&mut stream, &["XPENDING", "s", "g"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.contains("c2"),
+        "pending should now show c2 as owner"
+    );
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_xautoclaim() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["XADD", "s", "1-0", "f", "v1"]).await;
+    cmd(&mut stream, &["XADD", "s", "2-0", "f", "v2"]).await;
+    cmd(&mut stream, &["XGROUP", "CREATE", "s", "g", "0"]).await;
+    cmd(
+        &mut stream,
+        &["XREADGROUP", "GROUP", "g", "c1", "STREAMS", "s", ">"],
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let resp = cmd(&mut stream, &["XAUTOCLAIM", "s", "g", "c2", "0", "0-0"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.contains("1-0"), "should auto-claim first entry");
+    assert!(resp_str.contains("2-0"), "should auto-claim second entry");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_xreadgroup_pending_reread() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["XADD", "s", "1-0", "k", "v1"]).await;
+    cmd(&mut stream, &["XADD", "s", "2-0", "k", "v2"]).await;
+    cmd(&mut stream, &["XGROUP", "CREATE", "s", "g", "0"]).await;
+
+    cmd(
+        &mut stream,
+        &["XREADGROUP", "GROUP", "g", "alice", "STREAMS", "s", ">"],
+    )
+    .await;
+
+    let resp = cmd(
+        &mut stream,
+        &["XREADGROUP", "GROUP", "g", "alice", "STREAMS", "s", "0"],
+    )
+    .await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.contains("1-0"),
+        "pending re-read should return first entry"
+    );
+    assert!(
+        resp_str.contains("2-0"),
+        "pending re-read should return second entry"
+    );
+
+    cmd(&mut stream, &["XACK", "s", "g", "1-0", "2-0"]).await;
+
+    let resp = cmd(
+        &mut stream,
+        &["XREADGROUP", "GROUP", "g", "alice", "STREAMS", "s", "0"],
+    )
+    .await;
+    assert_resp(&resp, b"$-1\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_stream_consumer_group_full_workflow() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["XADD", "jobs", "1-0", "task", "build"]).await;
+    cmd(&mut stream, &["XADD", "jobs", "2-0", "task", "test"]).await;
+    cmd(&mut stream, &["XADD", "jobs", "3-0", "task", "deploy"]).await;
+
+    cmd(&mut stream, &["XGROUP", "CREATE", "jobs", "workers", "0"]).await;
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "workers",
+            "w1",
+            "COUNT",
+            "1",
+            "STREAMS",
+            "jobs",
+            ">",
+        ],
+    )
+    .await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.contains("1-0"), "w1 should get entry 1-0");
+
+    let resp = cmd(
+        &mut stream,
+        &[
+            "XREADGROUP",
+            "GROUP",
+            "workers",
+            "w2",
+            "COUNT",
+            "1",
+            "STREAMS",
+            "jobs",
+            ">",
+        ],
+    )
+    .await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.contains("2-0"), "w2 should get entry 2-0");
+
+    let resp = cmd(&mut stream, &["XACK", "jobs", "workers", "1-0"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let resp = cmd(&mut stream, &["XPENDING", "jobs", "workers"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.contains(":1\r\n"),
+        "should have 1 pending after ACK"
+    );
+
+    let resp = cmd(&mut stream, &["XINFO", "STREAM", "jobs"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.contains(":3\r\n"), "stream length should be 3");
+    assert!(resp_str.contains("1-0"), "first entry should be 1-0");
+    assert!(resp_str.contains("3-0"), "last entry should be 3-0");
+
+    let resp = cmd(&mut stream, &["XINFO", "GROUPS", "jobs"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.contains("workers"), "should list workers group");
 
     let _ = shutdown.send(true);
 }
