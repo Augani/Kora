@@ -22,22 +22,12 @@ pub enum IndexType {
 /// Errors from index operations.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum IndexError {
-    /// An index already exists for this field and type.
-    #[error("index already exists for field {field_id} with type {index_type:?}")]
-    AlreadyExists {
-        /// Field that already has the index.
-        field_id: FieldId,
-        /// Duplicate index type.
-        index_type: IndexType,
-    },
-    /// No index exists for this field and type.
-    #[error("no index found for field {field_id} with type {index_type:?}")]
-    NotFound {
-        /// Field missing the index.
-        field_id: FieldId,
-        /// Requested index type.
-        index_type: IndexType,
-    },
+    /// An index already exists for this field.
+    #[error("index already exists for field {0}")]
+    AlreadyExists(FieldId),
+    /// No index exists for this field.
+    #[error("no index found for field {0}")]
+    NotFound(FieldId),
     /// A unique constraint violation occurred.
     #[error("unique index violation: hash {hash} already maps to doc_id {existing_doc_id}")]
     UniqueViolation {
@@ -63,11 +53,8 @@ impl IndexConfig {
 
     /// Register an index for a field. Returns an error if one already exists.
     pub fn add(&mut self, field_id: FieldId, index_type: IndexType) -> Result<(), IndexError> {
-        if let Some(&existing) = self.entries.get(&field_id) {
-            return Err(IndexError::AlreadyExists {
-                field_id,
-                index_type: existing,
-            });
+        if self.entries.contains_key(&field_id) {
+            return Err(IndexError::AlreadyExists(field_id));
         }
         self.entries.insert(field_id, index_type);
         Ok(())
@@ -75,10 +62,9 @@ impl IndexConfig {
 
     /// Remove an index configuration for a field. Returns an error if not found.
     pub fn remove(&mut self, field_id: FieldId) -> Result<IndexType, IndexError> {
-        self.entries.remove(&field_id).ok_or(IndexError::NotFound {
-            field_id,
-            index_type: IndexType::Hash,
-        })
+        self.entries
+            .remove(&field_id)
+            .ok_or(IndexError::NotFound(field_id))
     }
 
     /// Look up the index type for a field.
@@ -544,13 +530,7 @@ mod tests {
         let err = config
             .add(0, IndexType::Sorted)
             .expect_err("duplicate add must fail");
-        assert!(matches!(
-            err,
-            IndexError::AlreadyExists {
-                field_id: 0,
-                index_type: IndexType::Hash,
-            }
-        ));
+        assert!(matches!(err, IndexError::AlreadyExists(0)));
     }
 
     #[test]
@@ -559,7 +539,7 @@ mod tests {
         let err = config
             .remove(99)
             .expect_err("remove non-existent must fail");
-        assert!(matches!(err, IndexError::NotFound { field_id: 99, .. }));
+        assert!(matches!(err, IndexError::NotFound(99)));
     }
 
     #[test]
