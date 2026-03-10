@@ -304,7 +304,8 @@ impl Database {
             .collect())
     }
 
-    /// Find documents matching a WHERE clause with optional projection, limit, and offset.
+    /// Find documents matching a WHERE clause with optional projection, limit, offset, and sorting.
+    #[allow(clippy::too_many_arguments)]
     pub fn doc_find(
         &self,
         collection: &str,
@@ -312,10 +313,18 @@ impl Database {
         projection: Option<&[&str]>,
         limit: Option<usize>,
         offset: usize,
+        order_by: Option<&str>,
+        order_desc: bool,
     ) -> Result<Vec<Value>, DocError> {
-        self.doc_engine
-            .read()
-            .find(collection, where_clause, projection, limit, offset)
+        self.doc_engine.read().find(
+            collection,
+            where_clause,
+            projection,
+            limit,
+            offset,
+            order_by,
+            order_desc,
+        )
     }
 
     /// Count documents matching a WHERE clause.

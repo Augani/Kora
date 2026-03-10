@@ -170,6 +170,10 @@ impl kora_core::shard::WalWriter for ShardStorage {
             tracing::error!("Shard {} WAL append failed: {}", self.shard_id, e);
         }
     }
+
+    fn truncate(&mut self) -> std::result::Result<(), String> {
+        self.wal_truncate().map_err(|e| e.to_string())
+    }
 }
 
 /// Convert a core `WalRecord` to a storage `WalEntry`.

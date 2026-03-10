@@ -812,6 +812,7 @@ impl DocEngine {
     }
 
     /// Execute a WHERE query and return matching documents.
+    #[allow(clippy::too_many_arguments)]
     pub fn find(
         &self,
         collection: &str,
@@ -819,6 +820,8 @@ impl DocEngine {
         projection: Option<&[&str]>,
         limit: Option<usize>,
         offset: usize,
+        order_by: Option<&str>,
+        order_desc: bool,
     ) -> Result<Vec<Value>, DocError> {
         let collection_id = self.collection_id(collection)?;
         let state = self
@@ -830,6 +833,12 @@ impl DocEngine {
             .map_err(|err| DocError::InvalidExpression(err.to_string()))?;
 
         let doc_ids = self.execute_expr(collection_id, state, &expr)?;
+
+        let doc_ids = if let Some(sort_field) = order_by {
+            self.sort_doc_ids(collection_id, state, doc_ids, sort_field, order_desc)?
+        } else {
+            doc_ids
+        };
 
         let end = match limit {
             Some(lim) => (offset.saturating_add(lim)).min(doc_ids.len()),
@@ -896,6 +905,7 @@ impl DocEngine {
                 let right_ids = self.execute_expr(collection_id, state, right)?;
                 Ok(union_sorted(&left_ids, &right_ids))
             }
+            Expr::Not(_) | Expr::Exists(_) => self.fallback_scan(collection_id, state, expr),
             _ => self.execute_leaf(collection_id, state, expr),
         }
     }
@@ -990,6 +1000,34 @@ impl DocEngine {
                 self.filter_candidates_by_expr(collection_id, state, expr, candidates)
             }
 
+            (Expr::In(_, values), Some(IndexType::Hash), Some(fid)) => {
+                let mut all_candidates = Vec::new();
+                for value in values {
+                    if let Some(hashed) = expr_value_to_hash(value) {
+                        if let Some(idx) = state.indexes.hash(fid) {
+                            all_candidates.extend_from_slice(idx.lookup(hashed));
+                        }
+                    }
+                }
+                all_candidates.sort_unstable();
+                all_candidates.dedup();
+                self.filter_candidates_by_expr(collection_id, state, expr, all_candidates)
+            }
+
+            (Expr::In(_, values), Some(IndexType::Unique), Some(fid)) => {
+                let mut all_candidates = Vec::new();
+                for value in values {
+                    if let Some(hashed) = expr_value_to_hash(value) {
+                        if let Some(idx) = state.indexes.unique(fid) {
+                            all_candidates.extend_from_slice(idx.lookup(hashed));
+                        }
+                    }
+                }
+                all_candidates.sort_unstable();
+                all_candidates.dedup();
+                self.filter_candidates_by_expr(collection_id, state, expr, all_candidates)
+            }
+
             _ => self.fallback_scan(collection_id, state, expr),
         }
     }
@@ -1064,6 +1102,39 @@ impl DocEngine {
         }
 
         Ok(result)
+    }
+
+    fn sort_doc_ids(
+        &self,
+        collection_id: CollectionId,
+        state: &CollectionState,
+        doc_ids: Vec<DocId>,
+        sort_field: &str,
+        descending: bool,
+    ) -> Result<Vec<DocId>, DocError> {
+        let mut keyed: Vec<(DocId, Option<Value>)> = Vec::with_capacity(doc_ids.len());
+        for &doc_id in &doc_ids {
+            let sort_val = state
+                .docs_by_internal_id
+                .get(&doc_id)
+                .and_then(|packed| {
+                    Recomposer::recompose(packed, &self.registry, &state.dictionary, collection_id)
+                        .ok()
+                })
+                .and_then(|json| resolve_json_path(&json, sort_field).cloned());
+            keyed.push((doc_id, sort_val));
+        }
+
+        keyed.sort_by(|a, b| {
+            let ordering = cmp_json_values(&a.1, &b.1);
+            if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+
+        Ok(keyed.into_iter().map(|(id, _)| id).collect())
     }
 }
 
@@ -1223,7 +1294,10 @@ fn expr_field(expr: &Expr) -> &str {
         | Expr::Gte(f, _)
         | Expr::Lt(f, _)
         | Expr::Lte(f, _)
-        | Expr::Contains(f, _) => f.as_str(),
+        | Expr::Contains(f, _)
+        | Expr::In(f, _)
+        | Expr::Exists(f) => f.as_str(),
+        Expr::Not(inner) => expr_field(inner),
         Expr::And(_, _) | Expr::Or(_, _) => "",
     }
 }
@@ -1272,6 +1346,14 @@ fn eval_expr_on_json(doc: &Value, expr: &Expr) -> bool {
                 .iter()
                 .any(|item| json_matches_expr_value(item, value))
         }
+        Expr::In(path, values) => {
+            let Some(field_val) = resolve_json_path(doc, path) else {
+                return false;
+            };
+            values.iter().any(|v| json_matches_expr_value(field_val, v))
+        }
+        Expr::Exists(path) => resolve_json_path(doc, path).is_some(),
+        Expr::Not(inner) => !eval_expr_on_json(doc, inner),
         Expr::And(left, right) => eval_expr_on_json(doc, left) && eval_expr_on_json(doc, right),
         Expr::Or(left, right) => eval_expr_on_json(doc, left) || eval_expr_on_json(doc, right),
     }
@@ -1284,6 +1366,31 @@ fn json_matches_expr_value(json_val: &Value, expr_val: &ExprValue) -> bool {
         (Value::Bool(a), ExprValue::Bool(b)) => a == b,
         (Value::Null, ExprValue::Null) => true,
         _ => false,
+    }
+}
+
+fn cmp_json_values(a: &Option<Value>, b: &Option<Value>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(va), Some(vb)) => cmp_json_value_inner(va, vb),
+    }
+}
+
+fn cmp_json_value_inner(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Number(a), Value::Number(b)) => {
+            let fa = a.as_f64().unwrap_or(0.0);
+            let fb = b.as_f64().unwrap_or(0.0);
+            fa.partial_cmp(&fb).unwrap_or(Ordering::Equal)
+        }
+        (Value::String(a), Value::String(b)) => a.cmp(b),
+        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        (Value::Null, Value::Null) => Ordering::Equal,
+        _ => Ordering::Equal,
     }
 }
 
@@ -2085,7 +2192,7 @@ mod tests {
             .expect("set");
 
         let results = engine
-            .find("users", r#"city = "Accra""#, None, None, 0)
+            .find("users", r#"city = "Accra""#, None, None, 0, None, false)
             .expect("find should work");
         assert_eq!(results.len(), 2);
         for doc in &results {
@@ -2115,7 +2222,15 @@ mod tests {
             .expect("set");
 
         let results = engine
-            .find("users", &format!("city = \"{}\"", first), None, None, 0)
+            .find(
+                "users",
+                &format!("city = \"{}\"", first),
+                None,
+                None,
+                0,
+                None,
+                false,
+            )
             .expect("find should work");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["city"], first);
@@ -2148,7 +2263,15 @@ mod tests {
             .expect("set");
 
         let results = engine
-            .find("users", "age >= 25 AND age <= 35", None, None, 0)
+            .find(
+                "users",
+                "age >= 25 AND age <= 35",
+                None,
+                None,
+                0,
+                None,
+                false,
+            )
             .expect("find should work");
         assert_eq!(results.len(), 3);
         for doc in &results {
@@ -2186,7 +2309,15 @@ mod tests {
             .expect("set");
 
         let results = engine
-            .find("posts", r#"tags CONTAINS "rust""#, None, None, 0)
+            .find(
+                "posts",
+                r#"tags CONTAINS "rust""#,
+                None,
+                None,
+                0,
+                None,
+                false,
+            )
             .expect("find should work");
         assert_eq!(results.len(), 2);
         for doc in &results {
@@ -2223,6 +2354,8 @@ mod tests {
                 None,
                 None,
                 0,
+                None,
+                false,
             )
             .expect("find should work");
         assert_eq!(results.len(), 1);
@@ -2256,7 +2389,15 @@ mod tests {
             .expect("set");
 
         let results = engine
-            .find("users", r#"city = "Accra" AND age >= 25"#, None, None, 0)
+            .find(
+                "users",
+                r#"city = "Accra" AND age >= 25"#,
+                None,
+                None,
+                0,
+                None,
+                false,
+            )
             .expect("find should work");
         assert_eq!(results.len(), 2);
         for doc in &results {
@@ -2295,6 +2436,8 @@ mod tests {
                 None,
                 None,
                 0,
+                None,
+                false,
             )
             .expect("find should work");
         assert_eq!(results.len(), 3);
@@ -2330,7 +2473,15 @@ mod tests {
             .expect("set");
 
         let results = engine
-            .find("users", r#"city = "Accra""#, Some(&["name"]), None, 0)
+            .find(
+                "users",
+                r#"city = "Accra""#,
+                Some(&["name"]),
+                None,
+                0,
+                None,
+                false,
+            )
             .expect("find should work");
         assert_eq!(results.len(), 2);
         for doc in &results {
@@ -2361,7 +2512,7 @@ mod tests {
         }
 
         let results = engine
-            .find("users", "active = true", None, Some(2), 1)
+            .find("users", "active = true", None, Some(2), 1, None, false)
             .expect("find should work");
         assert_eq!(results.len(), 2);
     }
@@ -2410,7 +2561,7 @@ mod tests {
             .expect("set");
 
         let results = engine
-            .find("users", r#"city = "Accra""#, None, None, 0)
+            .find("users", r#"city = "Accra""#, None, None, 0, None, false)
             .expect("find should work");
         assert_eq!(results.len(), 2);
         for doc in &results {
@@ -2433,8 +2584,272 @@ mod tests {
             .expect("set");
 
         let results = engine
-            .find("users", r#"city = "NonExistent""#, None, None, 0)
+            .find(
+                "users",
+                r#"city = "NonExistent""#,
+                None,
+                None,
+                0,
+                None,
+                false,
+            )
             .expect("find should work");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn find_with_in_operator() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create");
+        engine
+            .set("users", "u1", &json!({"name": "Alice", "status": "active"}))
+            .expect("set");
+        engine
+            .set("users", "u2", &json!({"name": "Bob", "status": "pending"}))
+            .expect("set");
+        engine
+            .set(
+                "users",
+                "u3",
+                &json!({"name": "Charlie", "status": "deleted"}),
+            )
+            .expect("set");
+
+        let results = engine
+            .find(
+                "users",
+                r#"status IN ("active", "pending")"#,
+                None,
+                None,
+                0,
+                None,
+                false,
+            )
+            .expect("find");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn find_in_with_hash_index() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create");
+        engine
+            .create_index("users", "status", IndexType::Hash)
+            .expect("index");
+        engine
+            .set("users", "u1", &json!({"name": "Alice", "status": "active"}))
+            .expect("set");
+        engine
+            .set("users", "u2", &json!({"name": "Bob", "status": "pending"}))
+            .expect("set");
+        engine
+            .set(
+                "users",
+                "u3",
+                &json!({"name": "Charlie", "status": "deleted"}),
+            )
+            .expect("set");
+
+        let results = engine
+            .find(
+                "users",
+                r#"status IN ("active", "pending")"#,
+                None,
+                None,
+                0,
+                None,
+                false,
+            )
+            .expect("find");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn find_with_exists() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create");
+        engine
+            .set(
+                "users",
+                "u1",
+                &json!({"name": "Alice", "email": "alice@test.com"}),
+            )
+            .expect("set");
+        engine
+            .set("users", "u2", &json!({"name": "Bob"}))
+            .expect("set");
+
+        let results = engine
+            .find("users", "email EXISTS", None, None, 0, None, false)
+            .expect("find");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["name"], "Alice");
+    }
+
+    #[test]
+    fn find_with_not() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create");
+        engine
+            .set("users", "u1", &json!({"name": "Alice", "status": "active"}))
+            .expect("set");
+        engine
+            .set("users", "u2", &json!({"name": "Bob", "status": "deleted"}))
+            .expect("set");
+        engine
+            .set(
+                "users",
+                "u3",
+                &json!({"name": "Charlie", "status": "active"}),
+            )
+            .expect("set");
+
+        let results = engine
+            .find(
+                "users",
+                r#"NOT status = "deleted""#,
+                None,
+                None,
+                0,
+                None,
+                false,
+            )
+            .expect("find");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn find_with_parenthesized_grouping() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create");
+        engine
+            .set("users", "u1", &json!({"city": "Accra", "age": 30}))
+            .expect("set");
+        engine
+            .set("users", "u2", &json!({"city": "Lagos", "age": 20}))
+            .expect("set");
+        engine
+            .set("users", "u3", &json!({"city": "Nairobi", "age": 35}))
+            .expect("set");
+
+        let results = engine
+            .find(
+                "users",
+                r#"(city = "Accra" OR city = "Lagos") AND age > 18"#,
+                None,
+                None,
+                0,
+                None,
+                false,
+            )
+            .expect("find");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn find_order_by_ascending() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create");
+        engine
+            .set("users", "alice", &json!({"name": "Alice", "age": 30}))
+            .expect("set");
+        engine
+            .set("users", "bob", &json!({"name": "Bob", "age": 20}))
+            .expect("set");
+        engine
+            .set("users", "charlie", &json!({"name": "Charlie", "age": 25}))
+            .expect("set");
+
+        let results = engine
+            .find("users", "age > 0", None, None, 0, Some("age"), false)
+            .expect("find");
+        let ages: Vec<i64> = results.iter().map(|v| v["age"].as_i64().unwrap()).collect();
+        assert_eq!(ages, vec![20, 25, 30]);
+    }
+
+    #[test]
+    fn find_order_by_descending() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create");
+        engine
+            .set("users", "alice", &json!({"name": "Alice", "age": 30}))
+            .expect("set");
+        engine
+            .set("users", "bob", &json!({"name": "Bob", "age": 20}))
+            .expect("set");
+        engine
+            .set("users", "charlie", &json!({"name": "Charlie", "age": 25}))
+            .expect("set");
+
+        let results = engine
+            .find("users", "age > 0", None, None, 0, Some("age"), true)
+            .expect("find");
+        let ages: Vec<i64> = results.iter().map(|v| v["age"].as_i64().unwrap()).collect();
+        assert_eq!(ages, vec![30, 25, 20]);
+    }
+
+    #[test]
+    fn find_order_by_string_field() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create");
+        engine
+            .set("users", "a", &json!({"name": "Charlie"}))
+            .expect("set");
+        engine
+            .set("users", "b", &json!({"name": "Alice"}))
+            .expect("set");
+        engine
+            .set("users", "c", &json!({"name": "Bob"}))
+            .expect("set");
+
+        let results = engine
+            .find("users", "name EXISTS", None, None, 0, Some("name"), false)
+            .expect("find");
+        let names: Vec<&str> = results
+            .iter()
+            .map(|v| v["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["Alice", "Bob", "Charlie"]);
+    }
+
+    #[test]
+    fn find_order_by_missing_field_sorts_to_end() {
+        let mut engine = DocEngine::new();
+        engine
+            .create_collection("users", CollectionConfig::default())
+            .expect("create");
+        engine
+            .set("users", "a", &json!({"name": "Alice", "age": 30}))
+            .expect("set");
+        engine
+            .set("users", "b", &json!({"name": "Bob"}))
+            .expect("set");
+        engine
+            .set("users", "c", &json!({"name": "Charlie", "age": 20}))
+            .expect("set");
+
+        let results = engine
+            .find("users", "name EXISTS", None, None, 0, Some("age"), false)
+            .expect("find");
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0]["age"], 20);
+        assert_eq!(results[1]["age"], 30);
+        assert_eq!(results[2]["name"], "Bob");
     }
 }

@@ -831,7 +831,7 @@ pub enum Command {
         /// Collection name.
         collection: Vec<u8>,
     },
-    /// DOC.FIND collection WHERE expr \[PROJECT f1 f2 ...\] \[LIMIT n\] \[OFFSET n\]
+    /// DOC.FIND collection WHERE expr \[ORDER BY field \[ASC|DESC\]\] \[PROJECT f1 f2 ...\] \[LIMIT n\] \[OFFSET n\]
     DocFind {
         /// Collection name.
         collection: Vec<u8>,
@@ -843,6 +843,10 @@ pub enum Command {
         limit: Option<usize>,
         /// Result offset (default 0).
         offset: usize,
+        /// Optional field path to sort results by.
+        order_by: Option<Vec<u8>>,
+        /// True if sort order is descending (default ascending).
+        order_desc: bool,
     },
     /// DOC.COUNT collection WHERE expr
     DocCount {

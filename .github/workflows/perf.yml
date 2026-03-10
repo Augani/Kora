@@ -1,0 +1,46 @@
+name: Performance
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly run (Mondays at 03:00 UTC)
+    - cron: "0 3 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  perf-bench:
+    name: Real App Traffic Benchmarks
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install redis-server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server
+
+      - name: Run perf scenarios (non-blocking)
+        shell: bash
+        run: |
+          mkdir -p perf-artifacts
+          set +e
+          export REAL_BENCH_SECONDS=8
+          export PUBSUB_BENCH_SECONDS=8
+          cargo test -p kora-server --test real_app_traffic --release -- --ignored --nocapture \
+            | tee perf-artifacts/real_app_traffic.log
+          echo "$?" > perf-artifacts/exit_code.txt
+          set -e
+
+      - name: Upload perf artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-${{ github.run_id }}
+          path: perf-artifacts/

@@ -246,6 +246,7 @@ kora-cli \
   --port 6379 \
   --workers 8 \
   --log-level info \
+  --password "s3cret" \
   --data-dir /var/lib/kora \
   --snapshot-interval-secs 300 \
   --snapshot-retain 24 \
@@ -261,6 +262,7 @@ bind = "0.0.0.0"
 port = 6379
 workers = 8
 log_level = "info"
+password = "s3cret"
 cdc_capacity = 65536
 metrics_port = 9090
 unix_socket = "/tmp/kora.sock"

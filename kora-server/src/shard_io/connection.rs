@@ -37,9 +37,10 @@ use kora_core::shard::{ShardStore, WalRecord, WalWriter};
 use kora_doc::{CollectionConfig, CompressionProfile, DocEngine, DocMutation, IndexType};
 use kora_protocol::{parse_command, serialize_response_versioned, HotCommandRef, RespParser};
 use kora_pubsub::{MessageSink, PubSubMessage};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use super::dispatch;
 use super::stage_metrics::{format_stage_metrics_info, BatchStage, BatchStageMetrics};
@@ -71,6 +72,7 @@ struct ConnState {
     multi_queue: Vec<Command>,
     client_name: Option<Vec<u8>>,
     quit_requested: bool,
+    authenticated: bool,
 }
 
 type PendingForeignBatch = Vec<(usize, Command)>;
@@ -94,6 +96,21 @@ struct FlushDurations {
 
 fn internal_shard_error() -> CommandResponse {
     CommandResponse::Error("ERR internal error".into())
+}
+
+fn auth_required_for_connection(shared: &Arc<AffinitySharedState>, conn: &ConnState) -> bool {
+    shared.runtime_config.read().requirepass.is_some() && !conn.authenticated
+}
+
+fn is_pre_auth_allowed_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Auth { .. } | Command::Hello { .. } | Command::Quit
+    )
+}
+
+fn noauth_error() -> CommandResponse {
+    CommandResponse::Error("NOAUTH Authentication required".into())
 }
 
 async fn handle_wait_command(numreplicas: i64, timeout: i64) -> CommandResponse {
@@ -191,6 +208,7 @@ pub(crate) async fn handle_connection_affinity<S: AsyncReadExt + AsyncWriteExt +
         multi_queue: Vec::new(),
         client_name: None,
         quit_requested: false,
+        authenticated: shared.runtime_config.read().requirepass.is_none(),
     };
 
     let result = handle_stream_loop(
@@ -302,6 +320,7 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 
             loop {
                 if !conn.in_multi
+                    && !auth_required_for_connection(shared, conn)
                     && parser
                         .try_parse_hot_command_with(|hot_cmd| {
                             process_hot_command(
@@ -360,6 +379,7 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                             if handle_pubsub_command(&cmd, shared, conn, write_buf) {
                                 continue;
                             }
+                            let should_signal = should_notify_blocking_waiters(&cmd);
                             if is_complex_command(&cmd) {
                                 let flush_durations = flush_pending_responses(
                                     router,
@@ -406,6 +426,9 @@ async fn handle_stream_loop<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                                     &mut stage_durations,
                                     track_stages,
                                 );
+                            }
+                            if should_signal {
+                                signal_blocking_waiters(shared, conn.shard_id);
                             }
                         }
                         Err(e) => {
@@ -505,6 +528,10 @@ async fn try_handle_connection_command(
     stage_durations: &mut BatchLoopDurations,
     track_stages: bool,
 ) -> Option<CommandResponse> {
+    if auth_required_for_connection(shared, conn) && !is_pre_auth_allowed_command(cmd) {
+        return Some(noauth_error());
+    }
+
     match cmd {
         Command::Multi => {
             if conn.in_multi {
@@ -544,6 +571,7 @@ async fn try_handle_connection_command(
 
             let mut exec_results = Vec::with_capacity(queued.len());
             for queued_cmd in queued {
+                let should_signal = should_notify_blocking_waiters(&queued_cmd);
                 let resp = execute_single_command(
                     queued_cmd,
                     conn.shard_id,
@@ -554,6 +582,9 @@ async fn try_handle_connection_command(
                     conn,
                 )
                 .await;
+                if should_signal {
+                    signal_blocking_waiters(shared, conn.shard_id);
+                }
                 exec_results.push(resp);
             }
             Some(CommandResponse::Array(exec_results))
@@ -635,7 +666,9 @@ async fn try_handle_connection_command(
         Command::CommandHelp => Some(command_help_response()),
         Command::CommandDocs { names } => Some(command_docs_response(names)),
         Command::ConfigGet { pattern } => Some(handle_config_get(pattern, shared)),
-        Command::ConfigSet { parameter, value } => Some(handle_config_set(parameter, value)),
+        Command::ConfigSet { parameter, value } => {
+            Some(handle_config_set(parameter, value, shared).await)
+        }
         Command::ConfigResetStat => Some(CommandResponse::Ok),
         cmd if is_blocking_command(cmd) => {
             let flush_durations = flush_pending_responses(
@@ -679,8 +712,7 @@ async fn try_handle_connection_command(
             let deadline =
                 tokio::time::Instant::now() + tokio::time::Duration::from_secs_f64(timeout_secs);
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                if tokio::time::Instant::now() >= deadline {
+                if !wait_for_blocking_signal(shared, deadline).await {
                     return Some(CommandResponse::Nil);
                 }
                 let retry_resp = if is_complex_command(cmd) {
@@ -747,8 +779,9 @@ async fn execute_single_command(
     }
 }
 
-fn handle_config_get(pattern: &str, _shared: &Arc<AffinitySharedState>) -> CommandResponse {
+fn handle_config_get(pattern: &str, shared: &Arc<AffinitySharedState>) -> CommandResponse {
     let pat = pattern.to_ascii_lowercase();
+    let cfg = shared.runtime_config.read().clone();
     let mut result = Vec::new();
 
     let matches_pattern = |name: &str| -> bool {
@@ -764,29 +797,104 @@ fn handle_config_get(pattern: &str, _shared: &Arc<AffinitySharedState>) -> Comma
 
     if matches_pattern("bind") {
         result.push(CommandResponse::BulkString(b"bind".to_vec()));
-        result.push(CommandResponse::BulkString(b"127.0.0.1".to_vec()));
+        result.push(CommandResponse::BulkString(cfg.bind.into_bytes()));
     }
     if matches_pattern("maxmemory") {
         result.push(CommandResponse::BulkString(b"maxmemory".to_vec()));
-        result.push(CommandResponse::BulkString(b"0".to_vec()));
+        result.push(CommandResponse::BulkString(
+            cfg.maxmemory.to_string().into_bytes(),
+        ));
     }
     if matches_pattern("save") {
         result.push(CommandResponse::BulkString(b"save".to_vec()));
-        result.push(CommandResponse::BulkString(b"".to_vec()));
+        let save = cfg
+            .save_interval_secs
+            .map(|secs| format!("{secs} 1"))
+            .unwrap_or_default();
+        result.push(CommandResponse::BulkString(save.into_bytes()));
     }
     if matches_pattern("dir") {
         result.push(CommandResponse::BulkString(b"dir".to_vec()));
-        result.push(CommandResponse::BulkString(b".".to_vec()));
+        let dir = cfg
+            .data_dir
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string());
+        result.push(CommandResponse::BulkString(dir.into_bytes()));
+    }
+    if matches_pattern("requirepass") {
+        result.push(CommandResponse::BulkString(b"requirepass".to_vec()));
+        result.push(CommandResponse::BulkString(
+            cfg.requirepass.unwrap_or_default().into_bytes(),
+        ));
     }
 
     CommandResponse::Array(result)
 }
 
-fn handle_config_set(parameter: &str, _value: &str) -> CommandResponse {
+fn invalid_maxmemory_error() -> CommandResponse {
+    CommandResponse::Error("ERR invalid maxmemory value".into())
+}
+
+fn parse_maxmemory_bytes(value: &str) -> Result<usize, CommandResponse> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err(invalid_maxmemory_error());
+    }
+
+    let (digits, multiplier) = if let Some(v) = normalized.strip_suffix("kb") {
+        (v, 1024u64)
+    } else if let Some(v) = normalized.strip_suffix("mb") {
+        (v, 1024u64 * 1024)
+    } else if let Some(v) = normalized.strip_suffix("gb") {
+        (v, 1024u64 * 1024 * 1024)
+    } else if let Some(v) = normalized.strip_suffix('b') {
+        (v, 1u64)
+    } else {
+        (normalized.as_str(), 1u64)
+    };
+
+    if digits.is_empty() {
+        return Err(invalid_maxmemory_error());
+    }
+
+    let base = digits
+        .parse::<u64>()
+        .map_err(|_| invalid_maxmemory_error())?;
+    let bytes = base
+        .checked_mul(multiplier)
+        .ok_or_else(invalid_maxmemory_error)?;
+    usize::try_from(bytes).map_err(|_| invalid_maxmemory_error())
+}
+
+async fn handle_config_set(
+    parameter: &str,
+    value: &str,
+    shared: &Arc<AffinitySharedState>,
+) -> CommandResponse {
     let param_lower = parameter.to_ascii_lowercase();
     match param_lower.as_str() {
-        "maxmemory" => CommandResponse::Ok,
-        _ => CommandResponse::Error(format!("ERR Unsupported CONFIG parameter: {}", parameter)),
+        "maxmemory" => {
+            let bytes = match parse_maxmemory_bytes(value) {
+                Ok(parsed) => parsed,
+                Err(err) => return err,
+            };
+            if let Err(err) = super::apply_max_memory(shared, bytes).await {
+                return CommandResponse::Error(err);
+            }
+            shared.runtime_config.write().maxmemory = bytes;
+            CommandResponse::Ok
+        }
+        "requirepass" => {
+            let requirepass = if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
+            shared.runtime_config.write().requirepass = requirepass;
+            CommandResponse::Ok
+        }
+        _ => CommandResponse::Error("ERR Unsupported CONFIG parameter".into()),
     }
 }
 
@@ -833,6 +941,54 @@ fn blocking_timeout(cmd: &Command) -> f64 {
         | Command::BZPopMax { timeout, .. } => *timeout,
         _ => 0.0,
     }
+}
+
+fn should_notify_blocking_waiters(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::LPush { .. }
+            | Command::RPush { .. }
+            | Command::LPop { .. }
+            | Command::RPop { .. }
+            | Command::LRem { .. }
+            | Command::LSet { .. }
+            | Command::LMove { .. }
+            | Command::BLMove { .. }
+            | Command::ZAdd { .. }
+            | Command::ZRem { .. }
+            | Command::ZIncrBy { .. }
+            | Command::ZPopMin { .. }
+            | Command::ZPopMax { .. }
+    )
+}
+
+fn signal_blocking_waiters(shared: &Arc<AffinitySharedState>, shard_id: u16) {
+    if let Some(notifier) = shared.blocking_notifiers.get(shard_id as usize) {
+        notifier.notify_waiters();
+    }
+}
+
+async fn wait_for_blocking_signal(
+    shared: &Arc<AffinitySharedState>,
+    deadline: tokio::time::Instant,
+) -> bool {
+    if tokio::time::Instant::now() >= deadline {
+        return false;
+    }
+    let mut waiters = JoinSet::new();
+    for notifier in shared.blocking_notifiers.iter() {
+        let notifier = notifier.clone();
+        waiters.spawn(async move {
+            notifier.notified().await;
+        });
+    }
+
+    let woke = matches!(
+        tokio::time::timeout_at(deadline, waiters.join_next()).await,
+        Ok(Some(Ok(())))
+    );
+    waiters.abort_all();
+    woke
 }
 
 fn push_ready_response(responses: &mut Vec<Option<CommandResponse>>, resp: CommandResponse) {
@@ -1180,18 +1336,17 @@ fn try_handle_local_affinity(
         }
         Command::Hello { version } => Some(handle_hello(version, conn)),
         Command::Auth { ref password } => {
-            if let Some(ref expected) = shared.auth_password {
+            if let Some(expected) = shared.runtime_config.read().requirepass.clone() {
                 let provided = String::from_utf8_lossy(password);
-                if provided.as_ref() != expected.as_str() {
+                if provided.as_ref() != expected {
                     return Some(CommandResponse::Error("ERR invalid password".into()));
                 }
             }
+            conn.authenticated = true;
             Some(CommandResponse::Ok)
         }
         Command::BgSave => Some(handle_bgsave_affinity(shared)),
-        Command::BgRewriteAof => Some(CommandResponse::SimpleString(
-            "Background AOF rewrite started".into(),
-        )),
+        Command::BgRewriteAof => Some(handle_bgrewriteaof_affinity(shared)),
         Command::CommandInfo { names } => Some(command_info_response(names)),
         Command::CommandCount => Some(CommandResponse::Integer(supported_command_count())),
         Command::CommandList => Some(command_list_response()),
@@ -1274,6 +1429,8 @@ fn try_handle_local_affinity(
             fields,
             limit,
             offset,
+            order_by,
+            order_desc,
         } => Some(handle_doc_find(
             &shared.doc_engine,
             collection,
@@ -1281,6 +1438,8 @@ fn try_handle_local_affinity(
             fields,
             *limit,
             *offset,
+            order_by.as_deref(),
+            *order_desc,
         )),
         Command::DocCount {
             collection,
@@ -1362,8 +1521,15 @@ fn handle_bgsave_affinity(shared: &Arc<AffinitySharedState>) -> CommandResponse 
     }
 }
 
+fn handle_bgrewriteaof_affinity(shared: &Arc<AffinitySharedState>) -> CommandResponse {
+    match super::start_manual_aof_rewrite(shared) {
+        Ok(()) => CommandResponse::SimpleString("Background AOF rewrite started".into()),
+        Err(err) => CommandResponse::Error(err),
+    }
+}
+
 fn handle_doc_create(
-    doc_engine: &Mutex<DocEngine>,
+    doc_engine: &RwLock<DocEngine>,
     collection: &[u8],
     compression: &Option<Vec<u8>>,
 ) -> CommandResponse {
@@ -1381,32 +1547,32 @@ fn handle_doc_create(
     };
 
     let config = CollectionConfig { compression };
-    match doc_engine.lock().create_collection(&collection, config) {
+    match doc_engine.write().create_collection(&collection, config) {
         Ok(_) => CommandResponse::Ok,
         Err(err) => CommandResponse::Error(format!("ERR {}", err)),
     }
 }
 
-fn handle_doc_drop(doc_engine: &Mutex<DocEngine>, collection: &[u8]) -> CommandResponse {
+fn handle_doc_drop(doc_engine: &RwLock<DocEngine>, collection: &[u8]) -> CommandResponse {
     let collection = match parse_utf8_arg(collection, "collection") {
         Ok(value) => value,
         Err(err) => return err,
     };
 
-    if doc_engine.lock().drop_collection(&collection) {
+    if doc_engine.write().drop_collection(&collection) {
         CommandResponse::Integer(1)
     } else {
         CommandResponse::Integer(0)
     }
 }
 
-fn handle_doc_info(doc_engine: &Mutex<DocEngine>, collection: &[u8]) -> CommandResponse {
+fn handle_doc_info(doc_engine: &RwLock<DocEngine>, collection: &[u8]) -> CommandResponse {
     let collection = match parse_utf8_arg(collection, "collection") {
         Ok(value) => value,
         Err(err) => return err,
     };
 
-    let Some(info) = doc_engine.lock().collection_info(&collection) else {
+    let Some(info) = doc_engine.read().collection_info(&collection) else {
         return CommandResponse::Nil;
     };
 
@@ -1438,13 +1604,13 @@ fn handle_doc_info(doc_engine: &Mutex<DocEngine>, collection: &[u8]) -> CommandR
     ])
 }
 
-fn handle_doc_dictinfo(doc_engine: &Mutex<DocEngine>, collection: &[u8]) -> CommandResponse {
+fn handle_doc_dictinfo(doc_engine: &RwLock<DocEngine>, collection: &[u8]) -> CommandResponse {
     let collection = match parse_utf8_arg(collection, "collection") {
         Ok(value) => value,
         Err(err) => return err,
     };
 
-    let info = match doc_engine.lock().dictionary_info(&collection) {
+    let info = match doc_engine.read().dictionary_info(&collection) {
         Ok(info) => info,
         Err(err) => return CommandResponse::Error(format!("ERR {}", err)),
     };
@@ -1487,13 +1653,13 @@ fn handle_doc_dictinfo(doc_engine: &Mutex<DocEngine>, collection: &[u8]) -> Comm
     ])
 }
 
-fn handle_doc_storage(doc_engine: &Mutex<DocEngine>, collection: &[u8]) -> CommandResponse {
+fn handle_doc_storage(doc_engine: &RwLock<DocEngine>, collection: &[u8]) -> CommandResponse {
     let collection = match parse_utf8_arg(collection, "collection") {
         Ok(value) => value,
         Err(err) => return err,
     };
 
-    let info = match doc_engine.lock().storage_info(&collection) {
+    let info = match doc_engine.read().storage_info(&collection) {
         Ok(info) => info,
         Err(err) => return CommandResponse::Error(format!("ERR {}", err)),
     };
@@ -1531,7 +1697,7 @@ fn handle_doc_storage(doc_engine: &Mutex<DocEngine>, collection: &[u8]) -> Comma
 }
 
 fn handle_doc_set(
-    doc_engine: &Mutex<DocEngine>,
+    doc_engine: &RwLock<DocEngine>,
     collection: &[u8],
     doc_id: &[u8],
     json: &[u8],
@@ -1549,14 +1715,14 @@ fn handle_doc_set(
         Err(err) => return CommandResponse::Error(format!("ERR invalid JSON: {}", err)),
     };
 
-    match doc_engine.lock().set(&collection, &doc_id, &json) {
+    match doc_engine.write().set(&collection, &doc_id, &json) {
         Ok(_) => CommandResponse::Ok,
         Err(err) => CommandResponse::Error(format!("ERR {}", err)),
     }
 }
 
 fn handle_doc_mset(
-    doc_engine: &Mutex<DocEngine>,
+    doc_engine: &RwLock<DocEngine>,
     collection: &[u8],
     entries: &[(Vec<u8>, Vec<u8>)],
 ) -> CommandResponse {
@@ -1578,7 +1744,7 @@ fn handle_doc_mset(
         parsed_entries.push((doc_id, json));
     }
 
-    let mut engine = doc_engine.lock();
+    let mut engine = doc_engine.write();
     for (doc_id, json) in &parsed_entries {
         if let Err(err) = engine.set(&collection, doc_id, json) {
             return CommandResponse::Error(format!("ERR {}", err));
@@ -1589,7 +1755,7 @@ fn handle_doc_mset(
 }
 
 fn handle_doc_get(
-    doc_engine: &Mutex<DocEngine>,
+    doc_engine: &RwLock<DocEngine>,
     collection: &[u8],
     doc_id: &[u8],
     fields: &[Vec<u8>],
@@ -1609,10 +1775,8 @@ fn handle_doc_get(
     let projection_vec = (!field_strings.is_empty())
         .then(|| field_strings.iter().map(String::as_str).collect::<Vec<_>>());
 
-    let doc = match doc_engine
-        .lock()
-        .get(&collection, &doc_id, projection_vec.as_deref())
-    {
+    let engine = doc_engine.read();
+    let doc = match engine.get(&collection, &doc_id, projection_vec.as_deref()) {
         Ok(value) => value,
         Err(err) => return CommandResponse::Error(format!("ERR {}", err)),
     };
@@ -1627,7 +1791,7 @@ fn handle_doc_get(
 }
 
 fn handle_doc_mget(
-    doc_engine: &Mutex<DocEngine>,
+    doc_engine: &RwLock<DocEngine>,
     collection: &[u8],
     doc_ids: &[Vec<u8>],
 ) -> CommandResponse {
@@ -1640,7 +1804,7 @@ fn handle_doc_mget(
         Err(err) => return err,
     };
 
-    let engine = doc_engine.lock();
+    let engine = doc_engine.read();
     let mut results = Vec::with_capacity(doc_ids.len());
     for doc_id in doc_ids {
         match engine.get(&collection, &doc_id, None) {
@@ -1662,7 +1826,7 @@ fn handle_doc_mget(
 }
 
 fn handle_doc_update(
-    doc_engine: &Mutex<DocEngine>,
+    doc_engine: &RwLock<DocEngine>,
     collection: &[u8],
     doc_id: &[u8],
     mutations: &[DocUpdateMutation],
@@ -1747,7 +1911,7 @@ fn handle_doc_update(
         }
     }
 
-    match doc_engine.lock().update(&collection, &doc_id, &parsed) {
+    match doc_engine.write().update(&collection, &doc_id, &parsed) {
         Ok(true) => CommandResponse::Integer(1),
         Ok(false) => CommandResponse::Integer(0),
         Err(err) => CommandResponse::Error(format!("ERR {}", err)),
@@ -1755,7 +1919,7 @@ fn handle_doc_update(
 }
 
 fn handle_doc_del(
-    doc_engine: &Mutex<DocEngine>,
+    doc_engine: &RwLock<DocEngine>,
     collection: &[u8],
     doc_id: &[u8],
 ) -> CommandResponse {
@@ -1768,7 +1932,7 @@ fn handle_doc_del(
         Err(err) => return err,
     };
 
-    match doc_engine.lock().del(&collection, &doc_id) {
+    match doc_engine.write().del(&collection, &doc_id) {
         Ok(true) => CommandResponse::Integer(1),
         Ok(false) => CommandResponse::Integer(0),
         Err(err) => CommandResponse::Error(format!("ERR {}", err)),
@@ -1776,7 +1940,7 @@ fn handle_doc_del(
 }
 
 fn handle_doc_exists(
-    doc_engine: &Mutex<DocEngine>,
+    doc_engine: &RwLock<DocEngine>,
     collection: &[u8],
     doc_id: &[u8],
 ) -> CommandResponse {
@@ -1789,7 +1953,7 @@ fn handle_doc_exists(
         Err(err) => return err,
     };
 
-    match doc_engine.lock().exists(&collection, &doc_id) {
+    match doc_engine.read().exists(&collection, &doc_id) {
         Ok(true) => CommandResponse::Integer(1),
         Ok(false) => CommandResponse::Integer(0),
         Err(err) => CommandResponse::Error(format!("ERR {}", err)),
@@ -1819,7 +1983,7 @@ fn index_type_name(idx_type: IndexType) -> &'static str {
 }
 
 fn handle_doc_createindex(
-    doc_engine: &Mutex<DocEngine>,
+    doc_engine: &RwLock<DocEngine>,
     collection: &[u8],
     field: &[u8],
     index_type: &[u8],
@@ -1838,7 +2002,7 @@ fn handle_doc_createindex(
     };
 
     match doc_engine
-        .lock()
+        .write()
         .create_index(&collection, &field, idx_type)
     {
         Ok(()) => CommandResponse::Ok,
@@ -1847,7 +2011,7 @@ fn handle_doc_createindex(
 }
 
 fn handle_doc_dropindex(
-    doc_engine: &Mutex<DocEngine>,
+    doc_engine: &RwLock<DocEngine>,
     collection: &[u8],
     field: &[u8],
 ) -> CommandResponse {
@@ -1860,19 +2024,19 @@ fn handle_doc_dropindex(
         Err(err) => return err,
     };
 
-    match doc_engine.lock().drop_index(&collection, &field) {
+    match doc_engine.write().drop_index(&collection, &field) {
         Ok(()) => CommandResponse::Ok,
         Err(err) => CommandResponse::Error(format!("ERR {}", err)),
     }
 }
 
-fn handle_doc_indexes(doc_engine: &Mutex<DocEngine>, collection: &[u8]) -> CommandResponse {
+fn handle_doc_indexes(doc_engine: &RwLock<DocEngine>, collection: &[u8]) -> CommandResponse {
     let collection = match parse_utf8_arg(collection, "collection") {
         Ok(value) => value,
         Err(err) => return err,
     };
 
-    let indexes = match doc_engine.lock().indexes(&collection) {
+    let indexes = match doc_engine.read().indexes(&collection) {
         Ok(value) => value,
         Err(err) => return CommandResponse::Error(format!("ERR {}", err)),
     };
@@ -1890,13 +2054,16 @@ fn handle_doc_indexes(doc_engine: &Mutex<DocEngine>, collection: &[u8]) -> Comma
     CommandResponse::Array(entries)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_doc_find(
-    doc_engine: &Mutex<DocEngine>,
+    doc_engine: &RwLock<DocEngine>,
     collection: &[u8],
     where_clause: &[u8],
     fields: &[Vec<u8>],
     limit: Option<usize>,
     offset: usize,
+    order_by: Option<&[u8]>,
+    order_desc: bool,
 ) -> CommandResponse {
     let collection = match parse_utf8_arg(collection, "collection") {
         Ok(value) => value,
@@ -1913,12 +2080,22 @@ fn handle_doc_find(
     let projection = (!field_strings.is_empty())
         .then(|| field_strings.iter().map(String::as_str).collect::<Vec<_>>());
 
-    let docs = match doc_engine.lock().find(
+    let order_by_str = match order_by {
+        Some(bytes) => match std::str::from_utf8(bytes) {
+            Ok(s) => Some(s),
+            Err(_) => return CommandResponse::Error("ERR invalid UTF-8 in ORDER BY field".into()),
+        },
+        None => None,
+    };
+
+    let docs = match doc_engine.read().find(
         &collection,
         &where_clause,
         projection.as_deref(),
         limit,
         offset,
+        order_by_str,
+        order_desc,
     ) {
         Ok(value) => value,
         Err(err) => return CommandResponse::Error(format!("ERR {}", err)),
@@ -1936,7 +2113,7 @@ fn handle_doc_find(
 }
 
 fn handle_doc_count(
-    doc_engine: &Mutex<DocEngine>,
+    doc_engine: &RwLock<DocEngine>,
     collection: &[u8],
     where_clause: &[u8],
 ) -> CommandResponse {
@@ -1949,7 +2126,7 @@ fn handle_doc_count(
         Err(err) => return err,
     };
 
-    match doc_engine.lock().count(&collection, &where_clause) {
+    match doc_engine.read().count(&collection, &where_clause) {
         Ok(count) => CommandResponse::Integer(count as i64),
         Err(err) => CommandResponse::Error(format!("ERR {}", err)),
     }

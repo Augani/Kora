@@ -7,17 +7,22 @@
 //! ## Grammar
 //!
 //! ```text
-//! expr     = or_expr
-//! or_expr  = and_expr ( "OR" and_expr )*
-//! and_expr = compare  ( "AND" compare )*
-//! compare  = IDENT op value
-//! op       = "=" | "!=" | ">" | ">=" | "<" | "<=" | "CONTAINS"
-//! value    = STRING | NUMBER | "true" | "false" | "null"
+//! expr       = or_expr
+//! or_expr    = and_expr ( "OR" and_expr )*
+//! and_expr   = primary  ( "AND" primary )*
+//! primary    = "NOT" primary
+//!            | "(" expr ")"
+//!            | IDENT "EXISTS"
+//!            | IDENT "IN" "(" value ("," value)* ")"
+//!            | IDENT op value
+//! op         = "=" | "!=" | ">" | ">=" | "<" | "<=" | "CONTAINS"
+//! value      = STRING | NUMBER | "true" | "false" | "null"
 //! ```
 //!
 //! `AND` binds tighter than `OR`, matching SQL precedence. Keywords (`AND`,
-//! `OR`, `CONTAINS`, `TRUE`, `FALSE`, `NULL`) are case-insensitive. Field
-//! names may contain dots to address nested paths (e.g., `address.city`).
+//! `OR`, `NOT`, `IN`, `EXISTS`, `CONTAINS`, `TRUE`, `FALSE`, `NULL`) are
+//! case-insensitive. Field names may contain dots to address nested paths
+//! (e.g., `address.city`).
 //!
 //! ## Lexer
 //!
@@ -29,7 +34,7 @@
 //!
 //! A top-down [`Parser`] consumes the token stream using the precedence
 //! climbing pattern: `parse_or` calls `parse_and`, which calls
-//! `parse_compare`, yielding left-associative trees for chained conjunctions
+//! `parse_primary`, yielding left-associative trees for chained conjunctions
 //! and disjunctions.
 
 use thiserror::Error;
@@ -51,6 +56,12 @@ pub enum Expr {
     Lte(String, f64),
     /// Array membership test: `field CONTAINS value`.
     Contains(String, ExprValue),
+    /// Set membership test: `field IN (value1, value2, ...)`.
+    In(String, Vec<ExprValue>),
+    /// Field existence test: `field EXISTS`.
+    Exists(String),
+    /// Logical NOT of an expression.
+    Not(Box<Expr>),
     /// Logical AND of two expressions.
     And(Box<Expr>, Box<Expr>),
     /// Logical OR of two expressions.
@@ -100,10 +111,16 @@ enum Token {
     Lte,
     And,
     Or,
+    Not,
+    In,
+    Exists,
     Contains,
     True,
     False,
     Null,
+    LParen,
+    RParen,
+    Comma,
 }
 
 struct Lexer<'a> {
@@ -182,6 +199,18 @@ impl<'a> Lexer<'a> {
                     Ok(Token::Lt)
                 }
             }
+            b'(' => {
+                self.pos += 1;
+                Ok(Token::LParen)
+            }
+            b')' => {
+                self.pos += 1;
+                Ok(Token::RParen)
+            }
+            b',' => {
+                self.pos += 1;
+                Ok(Token::Comma)
+            }
             b'-' => self.lex_number(),
             b if b.is_ascii_digit() => self.lex_number(),
             b if b.is_ascii_alphabetic() || b == b'_' => self.lex_ident_or_keyword(),
@@ -255,6 +284,9 @@ impl<'a> Lexer<'a> {
         match upper.as_str() {
             "AND" => Ok(Token::And),
             "OR" => Ok(Token::Or),
+            "NOT" => Ok(Token::Not),
+            "IN" => Ok(Token::In),
+            "EXISTS" => Ok(Token::Exists),
             "CONTAINS" => Ok(Token::Contains),
             "TRUE" => Ok(Token::True),
             "FALSE" => Ok(Token::False),
@@ -305,18 +337,37 @@ impl Parser {
     }
 
     fn parse_and(&mut self) -> Result<Expr, ExprError> {
-        let mut left = self.parse_compare()?;
+        let mut left = self.parse_primary()?;
 
         while self.peek() == Some(&Token::And) {
             self.advance();
-            let right = self.parse_compare()?;
+            let right = self.parse_primary()?;
             left = Expr::And(Box::new(left), Box::new(right));
         }
 
         Ok(left)
     }
 
-    fn parse_compare(&mut self) -> Result<Expr, ExprError> {
+    fn parse_primary(&mut self) -> Result<Expr, ExprError> {
+        match self.peek() {
+            Some(Token::Not) => {
+                self.advance();
+                let inner = self.parse_primary()?;
+                Ok(Expr::Not(Box::new(inner)))
+            }
+            Some(Token::LParen) => {
+                self.advance();
+                let inner = self.parse_expr()?;
+                if self.advance() != Some(Token::RParen) {
+                    return Err(ExprError::UnexpectedToken("expected ')'".into()));
+                }
+                Ok(inner)
+            }
+            _ => self.parse_comparison(),
+        }
+    }
+
+    fn parse_comparison(&mut self) -> Result<Expr, ExprError> {
         let field = match self.advance() {
             Some(Token::Ident(name)) => name,
             Some(other) => return Err(ExprError::UnexpectedToken(format!("{other:?}"))),
@@ -357,6 +408,26 @@ impl Parser {
                 let value = self.parse_value()?;
                 Ok(Expr::Contains(field, value))
             }
+            Token::In => {
+                if self.advance() != Some(Token::LParen) {
+                    return Err(ExprError::UnexpectedToken("expected '(' after IN".into()));
+                }
+                if self.peek() == Some(&Token::RParen) {
+                    return Err(ExprError::UnexpectedToken("IN list cannot be empty".into()));
+                }
+                let mut values = vec![self.parse_value()?];
+                while self.peek() == Some(&Token::Comma) {
+                    self.advance();
+                    values.push(self.parse_value()?);
+                }
+                if self.advance() != Some(Token::RParen) {
+                    return Err(ExprError::UnexpectedToken(
+                        "expected ')' to close IN list".into(),
+                    ));
+                }
+                Ok(Expr::In(field, values))
+            }
+            Token::Exists => Ok(Expr::Exists(field)),
             other => Err(ExprError::UnexpectedToken(format!("{other:?}"))),
         }
     }
@@ -580,5 +651,195 @@ mod tests {
     fn error_malformed_expression() {
         let err = parse_where(r#"= "Accra""#).unwrap_err();
         assert!(matches!(err, ExprError::UnexpectedToken(_)));
+    }
+
+    #[test]
+    fn parse_in_strings() {
+        let expr = parse_where(r#"status IN ("active", "pending")"#).unwrap();
+        assert_eq!(
+            expr,
+            Expr::In(
+                "status".into(),
+                vec![
+                    ExprValue::String("active".into()),
+                    ExprValue::String("pending".into()),
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn parse_in_numbers() {
+        let expr = parse_where("age IN (25, 30, 35)").unwrap();
+        assert_eq!(
+            expr,
+            Expr::In(
+                "age".into(),
+                vec![
+                    ExprValue::Number(25.0),
+                    ExprValue::Number(30.0),
+                    ExprValue::Number(35.0),
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn parse_in_single_value() {
+        let expr = parse_where(r#"status IN ("active")"#).unwrap();
+        assert_eq!(
+            expr,
+            Expr::In("status".into(), vec![ExprValue::String("active".into())])
+        );
+    }
+
+    #[test]
+    fn parse_in_mixed_with_and() {
+        let expr = parse_where(r#"status IN ("active", "pending") AND age > 25"#).unwrap();
+        assert_eq!(
+            expr,
+            Expr::And(
+                Box::new(Expr::In(
+                    "status".into(),
+                    vec![
+                        ExprValue::String("active".into()),
+                        ExprValue::String("pending".into()),
+                    ],
+                )),
+                Box::new(Expr::Gt("age".into(), 25.0)),
+            )
+        );
+    }
+
+    #[test]
+    fn parse_in_case_insensitive() {
+        let expr = parse_where(r#"status in ("active")"#).unwrap();
+        assert_eq!(
+            expr,
+            Expr::In("status".into(), vec![ExprValue::String("active".into())])
+        );
+    }
+
+    #[test]
+    fn parse_exists() {
+        let expr = parse_where("address.city EXISTS").unwrap();
+        assert_eq!(expr, Expr::Exists("address.city".into()));
+    }
+
+    #[test]
+    fn parse_exists_case_insensitive() {
+        let expr = parse_where("name exists").unwrap();
+        assert_eq!(expr, Expr::Exists("name".into()));
+    }
+
+    #[test]
+    fn parse_exists_with_and() {
+        let expr = parse_where(r#"email EXISTS AND status = "active""#).unwrap();
+        assert_eq!(
+            expr,
+            Expr::And(
+                Box::new(Expr::Exists("email".into())),
+                Box::new(Expr::Eq(
+                    "status".into(),
+                    ExprValue::String("active".into()),
+                )),
+            )
+        );
+    }
+
+    #[test]
+    fn parse_parenthesized_grouping() {
+        let expr = parse_where(r#"(city = "Accra" OR city = "Lagos") AND age > 25"#).unwrap();
+        assert_eq!(
+            expr,
+            Expr::And(
+                Box::new(Expr::Or(
+                    Box::new(Expr::Eq("city".into(), ExprValue::String("Accra".into()),)),
+                    Box::new(Expr::Eq("city".into(), ExprValue::String("Lagos".into()),)),
+                )),
+                Box::new(Expr::Gt("age".into(), 25.0)),
+            )
+        );
+    }
+
+    #[test]
+    fn parse_nested_parentheses() {
+        let expr = parse_where(r#"(a = "x" AND (b = "y" OR c = "z"))"#).unwrap();
+        assert_eq!(
+            expr,
+            Expr::And(
+                Box::new(Expr::Eq("a".into(), ExprValue::String("x".into()))),
+                Box::new(Expr::Or(
+                    Box::new(Expr::Eq("b".into(), ExprValue::String("y".into()))),
+                    Box::new(Expr::Eq("c".into(), ExprValue::String("z".into()))),
+                )),
+            )
+        );
+    }
+
+    #[test]
+    fn parse_not_simple() {
+        let expr = parse_where(r#"NOT status = "deleted""#).unwrap();
+        assert_eq!(
+            expr,
+            Expr::Not(Box::new(Expr::Eq(
+                "status".into(),
+                ExprValue::String("deleted".into()),
+            )))
+        );
+    }
+
+    #[test]
+    fn parse_not_parenthesized() {
+        let expr = parse_where(r#"NOT (a = "x" AND b = "y")"#).unwrap();
+        assert_eq!(
+            expr,
+            Expr::Not(Box::new(Expr::And(
+                Box::new(Expr::Eq("a".into(), ExprValue::String("x".into()))),
+                Box::new(Expr::Eq("b".into(), ExprValue::String("y".into()))),
+            )))
+        );
+    }
+
+    #[test]
+    fn parse_not_case_insensitive() {
+        let expr = parse_where("not active = true").unwrap();
+        assert_eq!(
+            expr,
+            Expr::Not(Box::new(Expr::Eq("active".into(), ExprValue::Bool(true))))
+        );
+    }
+
+    #[test]
+    fn parse_not_with_and() {
+        let expr = parse_where(r#"NOT status = "deleted" AND age > 18"#).unwrap();
+        assert_eq!(
+            expr,
+            Expr::And(
+                Box::new(Expr::Not(Box::new(Expr::Eq(
+                    "status".into(),
+                    ExprValue::String("deleted".into()),
+                )))),
+                Box::new(Expr::Gt("age".into(), 18.0)),
+            )
+        );
+    }
+
+    #[test]
+    fn error_empty_in_list() {
+        let err = parse_where("status IN ()").unwrap_err();
+        assert!(matches!(err, ExprError::UnexpectedToken(_)));
+    }
+
+    #[test]
+    fn parse_double_not() {
+        let expr = parse_where(r#"NOT NOT active = true"#).unwrap();
+        assert_eq!(
+            expr,
+            Expr::Not(Box::new(Expr::Not(Box::new(Expr::Eq(
+                "active".into(),
+                ExprValue::Bool(true),
+            )))))
+        );
     }
 }

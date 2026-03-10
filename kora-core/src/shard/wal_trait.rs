@@ -69,4 +69,11 @@ pub enum WalRecord {
 pub trait WalWriter: Send {
     /// Append a mutation record to the WAL.
     fn append(&mut self, record: &WalRecord);
+
+    /// Truncate the WAL file as part of maintenance operations.
+    ///
+    /// Default implementation is a no-op for in-memory or non-persistent backends.
+    fn truncate(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }

@@ -13,76 +13,15 @@ use kora_server::{KoraServer, ServerConfig};
 use kora_storage::manager::StorageConfig;
 use kora_storage::wal::SyncPolicy;
 
+mod test_support;
+use test_support::{
+    assert_resp, assert_resp_prefix, cmd, connect, free_port, resp_cmd, send_and_read,
+    start_server, start_server_with_config, start_server_with_workers,
+};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Find a free port by binding to :0 and reading the assigned port.
-async fn free_port() -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
-
-/// Build a RESP bulk string: $<len>\r\n<data>\r\n
-fn bulk(s: &str) -> Vec<u8> {
-    format!("${}\r\n{}\r\n", s.len(), s).into_bytes()
-}
-
-/// Encode a command as a RESP array of bulk strings.
-fn resp_cmd(args: &[&str]) -> Vec<u8> {
-    let mut out = format!("*{}\r\n", args.len()).into_bytes();
-    for arg in args {
-        out.extend_from_slice(&bulk(arg));
-    }
-    out
-}
-
-/// Start a server on the given port and return the shutdown sender.
-/// The server runs in a background task.
-async fn start_server(port: u16) -> tokio::sync::watch::Sender<bool> {
-    start_server_with_workers(port, 2).await
-}
-
-async fn start_server_with_workers(
-    port: u16,
-    worker_count: usize,
-) -> tokio::sync::watch::Sender<bool> {
-    let (tx, rx) = tokio::sync::watch::channel(false);
-    let config = ServerConfig {
-        bind_address: format!("127.0.0.1:{}", port),
-        worker_count,
-        ..Default::default()
-    };
-    let server = KoraServer::new(config);
-    tokio::spawn(async move {
-        let _ = server.run(rx).await;
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    tx
-}
-
-/// Connect to the server, retrying briefly if necessary.
-async fn connect(port: u16) -> TcpStream {
-    for _ in 0..20 {
-        match TcpStream::connect(format!("127.0.0.1:{}", port)).await {
-            Ok(s) => return s,
-            Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
-        }
-    }
-    panic!("could not connect to server on port {}", port);
-}
-
-/// Send a RESP command and read the full response as bytes.
-async fn send_and_read(stream: &mut TcpStream, cmd: &[u8]) -> Vec<u8> {
-    stream.write_all(cmd).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    let mut buf = vec![0u8; 8192];
-    let n = stream.read(&mut buf).await.unwrap();
-    buf.truncate(n);
-    buf
-}
 
 async fn read_exact_response(stream: &mut TcpStream, len: usize) -> Vec<u8> {
     let mut buf = vec![0u8; len];
@@ -91,32 +30,6 @@ async fn read_exact_response(stream: &mut TcpStream, len: usize) -> Vec<u8> {
         .unwrap()
         .unwrap();
     buf
-}
-
-/// Send a command (given as string args) and return the raw RESP response.
-async fn cmd(stream: &mut TcpStream, args: &[&str]) -> Vec<u8> {
-    send_and_read(stream, &resp_cmd(args)).await
-}
-
-/// Assert the response equals the given bytes exactly.
-fn assert_resp(resp: &[u8], expected: &[u8]) {
-    assert_eq!(
-        resp,
-        expected,
-        "\nExpected: {:?}\n     Got: {:?}",
-        String::from_utf8_lossy(expected),
-        String::from_utf8_lossy(resp),
-    );
-}
-
-/// Assert the response starts with the given prefix (useful for errors).
-fn assert_resp_prefix(resp: &[u8], prefix: &[u8]) {
-    assert!(
-        resp.starts_with(prefix),
-        "\nExpected prefix: {:?}\n           Got: {:?}",
-        String::from_utf8_lossy(prefix),
-        String::from_utf8_lossy(resp),
-    );
 }
 
 fn keys_on_different_shards(shard_count: usize, prefix: &str) -> (String, String) {
@@ -1083,8 +996,7 @@ async fn start_server_with_storage(
     port: u16,
     data_dir: PathBuf,
 ) -> tokio::sync::watch::Sender<bool> {
-    let (tx, rx) = tokio::sync::watch::channel(false);
-    let config = ServerConfig {
+    start_server_with_config(ServerConfig {
         bind_address: format!("127.0.0.1:{}", port),
         worker_count: 2,
         storage: Some(StorageConfig {
@@ -1097,13 +1009,8 @@ async fn start_server_with_storage(
             wal_max_bytes: 64 * 1024 * 1024,
         }),
         ..Default::default()
-    };
-    let server = KoraServer::new(config);
-    tokio::spawn(async move {
-        let _ = server.run(rx).await;
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    tx
+    })
+    .await
 }
 
 #[tokio::test]
@@ -1229,6 +1136,98 @@ async fn test_bgsave_creates_rdb() {
 
     let has_rdb = (0..2u16).any(|id| data_dir.join(format!("shard-{}/shard.rdb", id)).exists());
     assert!(has_rdb, "RDB snapshot should exist after BGSAVE");
+}
+
+#[tokio::test]
+async fn test_bgrewriteaof_errors_when_persistence_missing_or_wal_disabled() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["BGREWRITEAOF"]).await;
+    assert_resp_prefix(&resp, b"-ERR persistence not configured");
+
+    let _ = shutdown.send(true);
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let data_dir = tmp_dir.path().to_path_buf();
+    let disabled_port = free_port().await;
+    let shutdown = start_server_with_config(ServerConfig {
+        bind_address: format!("127.0.0.1:{}", disabled_port),
+        worker_count: 1,
+        storage: Some(StorageConfig {
+            data_dir,
+            wal_sync_policy: SyncPolicy::EveryWrite,
+            wal_enabled: false,
+            rdb_enabled: true,
+            snapshot_interval_secs: None,
+            snapshot_retain: Some(24),
+            wal_max_bytes: 64 * 1024 * 1024,
+        }),
+        ..Default::default()
+    })
+    .await;
+    let mut stream = connect(disabled_port).await;
+
+    let resp = cmd(&mut stream, &["BGREWRITEAOF"]).await;
+    assert_resp_prefix(&resp, b"-ERR WAL disabled");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_bgrewriteaof_truncates_wal() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let data_dir = tmp_dir.path().to_path_buf();
+    let wal_path = data_dir.join("shard-0").join("shard.wal");
+    let port = free_port().await;
+    let shutdown = start_server_with_config(ServerConfig {
+        bind_address: format!("127.0.0.1:{}", port),
+        worker_count: 1,
+        storage: Some(StorageConfig {
+            data_dir: data_dir.clone(),
+            wal_sync_policy: SyncPolicy::EveryWrite,
+            wal_enabled: true,
+            rdb_enabled: true,
+            snapshot_interval_secs: None,
+            snapshot_retain: Some(24),
+            wal_max_bytes: 64 * 1024 * 1024,
+        }),
+        ..Default::default()
+    })
+    .await;
+    let mut stream = connect(port).await;
+
+    for i in 0..400 {
+        let key = format!("rewrite:key:{i}");
+        let value = format!("payload-{}-{}", i, "x".repeat(64));
+        let resp = cmd(&mut stream, &["SET", key.as_str(), value.as_str()]).await;
+        assert_resp(&resp, b"+OK\r\n");
+    }
+
+    let initial_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    assert!(
+        initial_len > 0,
+        "expected WAL to contain data before rewrite"
+    );
+
+    let resp = cmd(&mut stream, &["BGREWRITEAOF"]).await;
+    assert_resp(&resp, b"+Background AOF rewrite started\r\n");
+
+    let truncate_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        if len == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < truncate_deadline,
+            "WAL did not truncate to zero after BGREWRITEAOF (latest len={len})"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = shutdown.send(true);
 }
 
 #[tokio::test]
@@ -1706,9 +1705,7 @@ async fn test_object_refcount_idletime_help() {
 async fn test_lset() {
     let port = free_port().await;
     let shutdown = start_server(port).await;
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap();
+    let mut stream = connect(port).await;
 
     cmd(&mut stream, &["RPUSH", "mylist", "a", "b", "c"]).await;
 
@@ -1737,9 +1734,7 @@ async fn test_lset() {
 async fn test_linsert() {
     let port = free_port().await;
     let shutdown = start_server(port).await;
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap();
+    let mut stream = connect(port).await;
 
     cmd(&mut stream, &["RPUSH", "mylist", "a", "c"]).await;
 
@@ -1769,9 +1764,7 @@ async fn test_linsert() {
 async fn test_lrem() {
     let port = free_port().await;
     let shutdown = start_server(port).await;
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap();
+    let mut stream = connect(port).await;
 
     cmd(&mut stream, &["RPUSH", "mylist", "a", "b", "a", "c", "a"]).await;
 
@@ -1797,9 +1790,7 @@ async fn test_lrem() {
 async fn test_ltrim() {
     let port = free_port().await;
     let shutdown = start_server(port).await;
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap();
+    let mut stream = connect(port).await;
 
     cmd(&mut stream, &["RPUSH", "mylist", "a", "b", "c", "d", "e"]).await;
 
@@ -1816,9 +1807,7 @@ async fn test_ltrim() {
 async fn test_lpos() {
     let port = free_port().await;
     let shutdown = start_server(port).await;
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap();
+    let mut stream = connect(port).await;
 
     cmd(
         &mut stream,
@@ -1848,9 +1837,7 @@ async fn test_lpos() {
 async fn test_rpoplpush() {
     let port = free_port().await;
     let shutdown = start_server(port).await;
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap();
+    let mut stream = connect(port).await;
 
     cmd(&mut stream, &["RPUSH", "src", "a", "b", "c"]).await;
 
@@ -1873,9 +1860,7 @@ async fn test_rpoplpush() {
 async fn test_lmove() {
     let port = free_port().await;
     let shutdown = start_server(port).await;
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap();
+    let mut stream = connect(port).await;
 
     cmd(&mut stream, &["RPUSH", "src", "a", "b", "c"]).await;
 
@@ -1934,9 +1919,7 @@ async fn test_lmove_cross_shard_wrongtype_preserves_source() {
 async fn test_hmget() {
     let port = free_port().await;
     let shutdown = start_server(port).await;
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap();
+    let mut stream = connect(port).await;
 
     cmd(
         &mut stream,
@@ -1957,9 +1940,7 @@ async fn test_hmget() {
 async fn test_hmset() {
     let port = free_port().await;
     let shutdown = start_server(port).await;
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap();
+    let mut stream = connect(port).await;
 
     let resp = cmd(&mut stream, &["HMSET", "myhash", "f1", "v1", "f2", "v2"]).await;
     assert_resp(&resp, b":2\r\n");
@@ -1974,9 +1955,7 @@ async fn test_hmset() {
 async fn test_hkeys_hvals() {
     let port = free_port().await;
     let shutdown = start_server(port).await;
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap();
+    let mut stream = connect(port).await;
 
     cmd(&mut stream, &["HSET", "myhash", "f1", "v1", "f2", "v2"]).await;
 
@@ -2005,9 +1984,7 @@ async fn test_hkeys_hvals() {
 async fn test_hsetnx() {
     let port = free_port().await;
     let shutdown = start_server(port).await;
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap();
+    let mut stream = connect(port).await;
 
     let resp = cmd(&mut stream, &["HSETNX", "myhash", "f1", "v1"]).await;
     assert_resp(&resp, b":1\r\n");
@@ -2025,9 +2002,7 @@ async fn test_hsetnx() {
 async fn test_hincrbyfloat() {
     let port = free_port().await;
     let shutdown = start_server(port).await;
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap();
+    let mut stream = connect(port).await;
 
     let resp = cmd(&mut stream, &["HINCRBYFLOAT", "myhash", "f1", "10.5"]).await;
     assert_resp(&resp, b"$4\r\n10.5\r\n");
@@ -2045,9 +2020,7 @@ async fn test_hincrbyfloat() {
 async fn test_hrandfield() {
     let port = free_port().await;
     let shutdown = start_server(port).await;
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap();
+    let mut stream = connect(port).await;
 
     cmd(
         &mut stream,
@@ -2075,9 +2048,7 @@ async fn test_hrandfield() {
 async fn test_hscan() {
     let port = free_port().await;
     let shutdown = start_server(port).await;
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap();
+    let mut stream = connect(port).await;
 
     cmd(
         &mut stream,
@@ -3054,6 +3025,88 @@ async fn test_client_commands() {
 }
 
 #[tokio::test]
+async fn test_auth_gate_and_auth_variants() {
+    let port = free_port().await;
+    let shutdown = start_server_with_config(ServerConfig {
+        bind_address: format!("127.0.0.1:{}", port),
+        worker_count: 2,
+        password: Some("secret".into()),
+        ..Default::default()
+    })
+    .await;
+    let mut stream = connect(port).await;
+
+    let resp = cmd(&mut stream, &["GET", "auth:key"]).await;
+    assert_resp_prefix(&resp, b"-NOAUTH Authentication required");
+
+    let resp = cmd(&mut stream, &["HELLO", "3"]).await;
+    assert_resp_prefix(&resp, b"%");
+
+    let resp = cmd(&mut stream, &["AUTH", "wrong"]).await;
+    assert_resp_prefix(&resp, b"-ERR invalid password");
+
+    let resp = cmd(&mut stream, &["SET", "auth:key", "value"]).await;
+    assert_resp_prefix(&resp, b"-NOAUTH Authentication required");
+
+    let resp = cmd(&mut stream, &["AUTH", "default", "secret"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["SET", "auth:key", "value"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(&mut stream, &["GET", "auth:key"]).await;
+    assert_resp(&resp, b"$5\r\nvalue\r\n");
+
+    let mut unauth = connect(port).await;
+    let resp = cmd(&mut unauth, &["GET", "auth:key"]).await;
+    assert_resp_prefix(&resp, b"-NOAUTH Authentication required");
+
+    let resp = cmd(&mut unauth, &["QUIT"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_config_set_requirepass_runtime_behavior() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut authenticated = connect(port).await;
+
+    let resp = cmd(&mut authenticated, &["SET", "runtime:key", "value"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let resp = cmd(
+        &mut authenticated,
+        &["CONFIG", "SET", "requirepass", "runtime-pass"],
+    )
+    .await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    // Existing authenticated connection remains authenticated after password change.
+    let resp = cmd(&mut authenticated, &["GET", "runtime:key"]).await;
+    assert_resp(&resp, b"$5\r\nvalue\r\n");
+
+    let mut blocked = connect(port).await;
+    let resp = cmd(&mut blocked, &["GET", "runtime:key"]).await;
+    assert_resp_prefix(&resp, b"-NOAUTH Authentication required");
+
+    let resp = cmd(&mut blocked, &["AUTH", "runtime-pass"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+    let resp = cmd(&mut blocked, &["GET", "runtime:key"]).await;
+    assert_resp(&resp, b"$5\r\nvalue\r\n");
+
+    let resp = cmd(&mut authenticated, &["CONFIG", "SET", "requirepass", ""]).await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let mut open = connect(port).await;
+    let resp = cmd(&mut open, &["GET", "runtime:key"]).await;
+    assert_resp(&resp, b"$5\r\nvalue\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
 async fn test_config_get_set() {
     let port = free_port().await;
     let shutdown = start_server(port).await;
@@ -3069,8 +3122,27 @@ async fn test_config_get_set() {
     let resp = cmd(&mut stream, &["CONFIG", "SET", "maxmemory", "100mb"]).await;
     assert_resp(&resp, b"+OK\r\n");
 
+    let resp = cmd(&mut stream, &["CONFIG", "GET", "maxmemory"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.contains("104857600"),
+        "CONFIG GET maxmemory should reflect parsed bytes"
+    );
+
+    let resp = cmd(&mut stream, &["CONFIG", "SET", "maxmemory", "128KB"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+    let resp = cmd(&mut stream, &["CONFIG", "GET", "max*"]).await;
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(
+        resp_str.contains("131072"),
+        "CONFIG GET with wildcard should include updated maxmemory bytes"
+    );
+
+    let resp = cmd(&mut stream, &["CONFIG", "SET", "maxmemory", "bad"]).await;
+    assert_resp_prefix(&resp, b"-ERR invalid maxmemory value");
+
     let resp = cmd(&mut stream, &["CONFIG", "SET", "unsupported", "val"]).await;
-    assert_resp_prefix(&resp, b"-ERR");
+    assert_resp(&resp, b"-ERR Unsupported CONFIG parameter\r\n");
 
     let resp = cmd(&mut stream, &["CONFIG", "RESETSTAT"]).await;
     assert_resp(&resp, b"+OK\r\n");
@@ -3238,6 +3310,41 @@ async fn test_blpop_multi_key() {
 
     let resp = cmd(&mut stream, &["BLPOP", "k1", "k2", "0"]).await;
     assert_resp(&resp, b"*2\r\n$2\r\nk2\r\n$3\r\nval\r\n");
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test]
+async fn test_blpop_unblocks_immediately_on_push() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+    let mut blocker = connect(port).await;
+    let mut producer = connect(port).await;
+
+    blocker
+        .write_all(&resp_cmd(&["BLPOP", "wake:list", "1"]))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    let start = tokio::time::Instant::now();
+    let resp = cmd(&mut producer, &["LPUSH", "wake:list", "value"]).await;
+    assert_resp(&resp, b":1\r\n");
+
+    let expected = b"*2\r\n$9\r\nwake:list\r\n$5\r\nvalue\r\n";
+    let response = tokio::time::timeout(
+        Duration::from_millis(300),
+        read_exact_response(&mut blocker, expected.len()),
+    )
+    .await
+    .expect("BLPOP response should arrive quickly");
+    assert_resp(&response, expected);
+
+    assert!(
+        start.elapsed() < Duration::from_millis(120),
+        "BLPOP wakeup took too long ({:?})",
+        start.elapsed()
+    );
 
     let _ = shutdown.send(true);
 }
@@ -4089,6 +4196,54 @@ async fn test_doc_find_with_limit_offset() {
     } else {
         panic!("expected array response from DOC.FIND with OFFSET");
     }
+
+    let _ = shutdown.send(true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_doc_read_concurrency_no_deadlock() {
+    let port = free_port().await;
+    let shutdown = start_server(port).await;
+
+    let mut setup = connect(port).await;
+    let resp = cmd(&mut setup, &["DOC.CREATE", "bench"]).await;
+    assert_resp(&resp, b"+OK\r\n");
+    let resp = cmd(
+        &mut setup,
+        &[
+            "DOC.SET",
+            "bench",
+            "doc:1",
+            r#"{"name":"Ada","city":"Accra"}"#,
+        ],
+    )
+    .await;
+    assert_resp(&resp, b"+OK\r\n");
+
+    let mut workers = Vec::new();
+    for _ in 0..16 {
+        workers.push(tokio::spawn(async move {
+            let mut stream = connect(port).await;
+            for _ in 0..80 {
+                let get_resp = cmd(&mut stream, &["DOC.GET", "bench", "doc:1"]).await;
+                assert!(
+                    get_resp.starts_with(b"$"),
+                    "DOC.GET should return bulk JSON"
+                );
+
+                let exists_resp = cmd(&mut stream, &["DOC.EXISTS", "bench", "doc:1"]).await;
+                assert_resp(&exists_resp, b":1\r\n");
+            }
+        }));
+    }
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for worker in workers {
+            worker.await.expect("concurrency worker task panicked");
+        }
+    })
+    .await
+    .expect("parallel DOC read workload timed out");
 
     let _ = shutdown.send(true);
 }

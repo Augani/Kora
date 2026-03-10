@@ -39,8 +39,8 @@ use kora_pubsub::PubSubBroker;
 
 use kora_storage::manager::StorageConfig;
 use kora_storage::rdb::{self, RdbEntry, RdbValue};
-use parking_lot::Mutex;
-use tokio::sync::{mpsc, oneshot, watch};
+use parking_lot::{Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 
 use self::stage_metrics::{format_stage_metrics_prometheus, BatchStage, BatchStageMetrics};
 
@@ -69,6 +69,12 @@ pub(crate) enum ShardRequest {
         queued_at: Instant,
         response_tx: oneshot::Sender<Result<(), String>>,
     },
+    /// Apply maxmemory setting on this shard's store.
+    SetMaxMemory {
+        bytes: usize,
+        queued_at: Instant,
+        response_tx: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// Parameters for an RDB snapshot operation.
@@ -78,6 +84,17 @@ pub(crate) struct SnapshotRequest {
     pub write_latest: bool,
     pub backup_name: Option<String>,
     pub retain_backups: Option<usize>,
+    pub truncate_wal: bool,
+}
+
+/// Mutable runtime server settings that can be changed via CONFIG SET.
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeConfig {
+    pub bind: String,
+    pub maxmemory: usize,
+    pub requirepass: Option<String>,
+    pub data_dir: Option<PathBuf>,
+    pub save_interval_secs: Option<u64>,
 }
 
 /// Routes commands to the correct shard worker via per-shard unbounded channels.
@@ -192,14 +209,15 @@ pub(crate) struct AffinitySharedState {
     pub pub_sub: PubSubBroker,
     pub cdc_rings: Vec<Mutex<CdcRing>>,
     pub cdc_groups: Mutex<ConsumerGroupManager>,
-    pub doc_engine: Mutex<DocEngine>,
+    pub doc_engine: RwLock<DocEngine>,
 
     pub histograms: Arc<CommandHistograms>,
     pub track_latency: AtomicBool,
     pub latency_sums_ns: Arc<[AtomicU64; 32]>,
     pub batch_stage_metrics: Arc<BatchStageMetrics>,
-    pub auth_password: Option<String>,
+    pub runtime_config: RwLock<RuntimeConfig>,
     pub storage_config: Option<StorageConfig>,
+    pub blocking_notifiers: Arc<[Arc<Notify>]>,
 
     pub snapshot_in_progress: AtomicBool,
     pub next_conn_id: AtomicU64,
@@ -265,18 +283,34 @@ impl ShardIoEngine {
         let batch_stage_metrics = Arc::new(BatchStageMetrics::new(metrics_port > 0));
 
         let pub_sub = PubSubBroker::new(shard_count);
+        let blocking_notifiers: Arc<[Arc<Notify>]> = (0..shard_count)
+            .map(|_| Arc::new(Notify::new()))
+            .collect::<Vec<_>>()
+            .into();
+        let runtime_config = RuntimeConfig {
+            bind: bind_address.clone(),
+            maxmemory: 0,
+            requirepass: auth_password,
+            data_dir: storage_config.as_ref().map(|cfg| cfg.data_dir.clone()),
+            save_interval_secs: storage_config.as_ref().and_then(|cfg| {
+                cfg.rdb_enabled
+                    .then_some(cfg.snapshot_interval_secs)
+                    .flatten()
+            }),
+        };
 
         let shared = Arc::new(AffinitySharedState {
             pub_sub,
             cdc_rings,
             cdc_groups: Mutex::new(ConsumerGroupManager::default()),
-            doc_engine: Mutex::new(DocEngine::new()),
+            doc_engine: RwLock::new(DocEngine::new()),
             histograms,
             track_latency: AtomicBool::new(metrics_port > 0),
             latency_sums_ns,
             batch_stage_metrics,
-            auth_password,
+            runtime_config: RwLock::new(runtime_config),
             storage_config,
+            blocking_notifiers,
             snapshot_in_progress: AtomicBool::new(false),
             next_conn_id: AtomicU64::new(1),
             router: router.clone(),
@@ -594,8 +628,14 @@ fn handle_shard_request(
             let execute_start = Instant::now();
             let entries = store_to_rdb_entries(&store.borrow());
             let shard_dir = request.data_dir.join(format!("shard-{}", shard_id));
-            let result =
+            let mut result =
                 save_snapshot_files(&shard_dir, &entries, &request).map_err(|e| e.to_string());
+            if result.is_ok() && request.truncate_wal {
+                let mut wal = wal_writer.borrow_mut();
+                if let Some(ref mut writer) = *wal {
+                    result = writer.truncate();
+                }
+            }
             shared.batch_stage_metrics.record(
                 BatchStage::RemoteExecute,
                 execute_start.elapsed().as_nanos() as u64,
@@ -609,7 +649,56 @@ fn handle_shard_request(
             }
             let _ = response_tx.send(result);
         }
+        ShardRequest::SetMaxMemory {
+            bytes,
+            queued_at,
+            response_tx,
+        } => {
+            shared.batch_stage_metrics.record(
+                BatchStage::RemoteQueue,
+                queued_at.elapsed().as_nanos() as u64,
+            );
+            let execute_start = Instant::now();
+            store.borrow_mut().set_max_memory(bytes);
+            shared.batch_stage_metrics.record(
+                BatchStage::RemoteExecute,
+                execute_start.elapsed().as_nanos() as u64,
+            );
+            let _ = response_tx.send(Ok(()));
+        }
     }
+}
+
+/// Applies `maxmemory` immediately across all shards.
+pub(crate) async fn apply_max_memory(
+    shared: &Arc<AffinitySharedState>,
+    bytes: usize,
+) -> Result<(), String> {
+    let mut receivers = Vec::with_capacity(shared.router.shard_count());
+    for sender in shared.router.shard_senders.iter() {
+        let (tx, rx) = oneshot::channel();
+        if sender
+            .send(ShardRequest::SetMaxMemory {
+                bytes,
+                queued_at: Instant::now(),
+                response_tx: tx,
+            })
+            .is_err()
+        {
+            return Err("ERR shard unavailable".into());
+        }
+        receivers.push(rx);
+    }
+
+    for rx in receivers {
+        match tokio::time::timeout(CROSS_SHARD_TIMEOUT, rx).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(err))) => return Err(err),
+            _ => return Err("ERR shard unavailable".into()),
+        }
+    }
+
+    Ok(())
 }
 
 /// Triggers a manual RDB snapshot across all shards.
@@ -628,8 +717,34 @@ pub(crate) fn start_manual_snapshot(shared: &Arc<AffinitySharedState>) -> Result
             write_latest: true,
             backup_name: None,
             retain_backups: None,
+            truncate_wal: false,
         },
         "manual",
+        "ERR snapshot already in progress",
+    )
+}
+
+/// Triggers a background AOF/WAL rewrite across all shards.
+pub(crate) fn start_manual_aof_rewrite(shared: &Arc<AffinitySharedState>) -> Result<(), String> {
+    let config = shared
+        .storage_config
+        .clone()
+        .ok_or_else(|| "ERR persistence not configured".to_string())?;
+    if !config.wal_enabled {
+        return Err("ERR WAL disabled".into());
+    }
+
+    start_snapshot(
+        shared,
+        SnapshotRequest {
+            data_dir: config.data_dir,
+            write_latest: true,
+            backup_name: None,
+            retain_backups: None,
+            truncate_wal: true,
+        },
+        "rewrite",
+        "ERR rewrite already in progress",
     )
 }
 
@@ -637,13 +752,14 @@ fn start_snapshot(
     shared: &Arc<AffinitySharedState>,
     request: SnapshotRequest,
     trigger: &'static str,
+    busy_error: &'static str,
 ) -> Result<(), String> {
     if shared
         .snapshot_in_progress
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return Err("ERR snapshot already in progress".into());
+        return Err(busy_error.into());
     }
 
     let mut receivers = Vec::with_capacity(shared.router.shard_count());
@@ -708,8 +824,14 @@ async fn run_periodic_snapshot_scheduler(
                     write_latest: true,
                     backup_name,
                     retain_backups: config.snapshot_retain,
+                    truncate_wal: false,
                 };
-                if let Err(err) = start_snapshot(&shared, request, "scheduled") {
+                if let Err(err) = start_snapshot(
+                    &shared,
+                    request,
+                    "scheduled",
+                    "ERR snapshot already in progress",
+                ) {
                     tracing::warn!("Scheduled snapshot skipped: {}", err);
                 }
             }
@@ -932,5 +1054,60 @@ async fn build_affinity_metrics(shared: &AffinitySharedState) -> StatsSnapshot {
         memory_used: 0,
         bytes_in: 0,
         bytes_out: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_storage_config(data_dir: PathBuf) -> StorageConfig {
+        StorageConfig {
+            data_dir,
+            wal_sync_policy: kora_storage::wal::SyncPolicy::EveryWrite,
+            wal_enabled: true,
+            rdb_enabled: true,
+            snapshot_interval_secs: None,
+            snapshot_retain: Some(24),
+            wal_max_bytes: 64 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn test_bgrewriteaof_returns_busy_when_snapshot_in_progress() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage_config = make_storage_config(tmp_dir.path().to_path_buf());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let router = ShardRouter {
+            shard_senders: vec![tx].into(),
+            shard_count: 1,
+        };
+
+        let shared = Arc::new(AffinitySharedState {
+            pub_sub: PubSubBroker::new(1),
+            cdc_rings: Vec::new(),
+            cdc_groups: Mutex::new(ConsumerGroupManager::default()),
+            doc_engine: RwLock::new(DocEngine::new()),
+            histograms: Arc::new(CommandHistograms::new()),
+            track_latency: AtomicBool::new(false),
+            latency_sums_ns: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            batch_stage_metrics: Arc::new(BatchStageMetrics::new(false)),
+            runtime_config: RwLock::new(RuntimeConfig {
+                bind: "127.0.0.1:6379".into(),
+                maxmemory: 0,
+                requirepass: None,
+                data_dir: Some(tmp_dir.path().to_path_buf()),
+                save_interval_secs: None,
+            }),
+            storage_config: Some(storage_config),
+            blocking_notifiers: vec![Arc::new(Notify::new())].into(),
+            snapshot_in_progress: AtomicBool::new(true),
+            next_conn_id: AtomicU64::new(1),
+            router,
+            conn_counts: vec![AtomicUsize::new(0)].into(),
+        });
+
+        let err = start_manual_aof_rewrite(&shared).unwrap_err();
+        assert_eq!(err, "ERR rewrite already in progress");
     }
 }

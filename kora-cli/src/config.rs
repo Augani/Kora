@@ -12,6 +12,7 @@
 //! port = 6379
 //! workers = 8
 //! log_level = "info"
+//! password = "s3cret"
 //!
 //! [storage]
 //! data_dir = "/var/lib/kora"
@@ -34,10 +35,10 @@ pub struct FileConfig {
     pub port: Option<u16>,
     /// Number of worker threads.
     pub workers: Option<usize>,
-    /// Number of Tokio runtime worker threads.
-    pub runtime_workers: Option<usize>,
     /// Log level.
     pub log_level: Option<String>,
+    /// Optional AUTH password (`requirepass` equivalent).
+    pub password: Option<String>,
     /// Storage configuration.
     pub storage: StorageFileConfig,
     /// CDC ring buffer capacity per shard (0 = disabled).
@@ -93,6 +94,7 @@ bind = "0.0.0.0"
 port = 7379
 workers = 8
 log_level = "debug"
+password = "devpass"
 
 [storage]
 data_dir = "/var/lib/kora"
@@ -108,6 +110,7 @@ wal_max_bytes = 134217728
         assert_eq!(config.port, Some(7379));
         assert_eq!(config.workers, Some(8));
         assert_eq!(config.log_level, Some("debug".into()));
+        assert_eq!(config.password, Some("devpass".into()));
         assert_eq!(config.storage.data_dir, Some("/var/lib/kora".into()));
         assert_eq!(config.storage.wal_sync, Some("every_write".into()));
         assert_eq!(config.storage.snapshot_interval_secs, Some(300));
@@ -122,6 +125,7 @@ wal_max_bytes = 134217728
         assert_eq!(config.port, Some(8080));
         assert_eq!(config.bind, None);
         assert_eq!(config.workers, None);
+        assert_eq!(config.password, None);
     }
 
     #[test]

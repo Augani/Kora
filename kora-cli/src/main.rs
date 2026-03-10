@@ -54,6 +54,10 @@ struct Args {
     #[arg(long)]
     log_level: Option<String>,
 
+    /// Optional AUTH password (`requirepass` equivalent).
+    #[arg(long)]
+    password: Option<String>,
+
     /// Data directory for persistence.
     #[arg(long)]
     data_dir: Option<String>,
@@ -95,6 +99,7 @@ fn main() -> anyhow::Result<()> {
         .log_level
         .or(file_config.log_level)
         .unwrap_or_else(|| "info".into());
+    let password = args.password.or(file_config.password);
     let worker_count = args
         .workers
         .or(file_config.workers)
@@ -153,7 +158,7 @@ fn main() -> anyhow::Result<()> {
 
         metrics_port,
         unix_socket,
-        password: None,
+        password,
     };
 
     tracing::info!(
