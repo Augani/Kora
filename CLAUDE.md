@@ -89,7 +89,7 @@ embedded → core, storage, vector, cdc, observability
 
 ## Language & Toolchain
 
-- **Language:** Rust (edition 2021, MSRV 1.75)
+- **Language:** Rust (edition 2021, MSRV 1.82)
 - **Build system:** Cargo workspace
 - **Async runtime:** Tokio (server crate)
 

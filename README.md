@@ -22,7 +22,7 @@ It speaks RESP2 on the wire, so existing Redis clients work out of the box. But 
 ## Key Features
 
 - **Multi-threaded shard-affinity I/O** — each worker owns data + connections, scales linearly with cores
-- **JSON document database** — secondary indexes (hash, sorted, array, unique), WHERE clause queries, field projection
+- **JSON document database** — secondary indexes (hash, sorted, array, unique), WHERE queries with IN/EXISTS/NOT/ORDER BY, field projection
 - **HNSW vector search** — cosine, L2, and inner product distance metrics
 - **Change data capture** — per-shard ring buffers with cursor-based subscriptions and gap detection
 - **Sharded pub/sub** — SUBSCRIBE, PSUBSCRIBE, PUBLISH with glob pattern matching
@@ -195,24 +195,38 @@ db.set("key", b"works from both paths");
 
 ## Document Database
 
-Kora includes a JSON-native document database with secondary indexes and a WHERE expression query engine.
+Kora includes a JSON-native document database with secondary indexes, a WHERE expression query engine, and SQL-like query operators.
 
 ### Via redis-cli
 
 ```bash
-# Create a collection
+# Create a collection and insert documents
 127.0.0.1:6379> DOC.CREATE users
-
-# Insert documents
 127.0.0.1:6379> DOC.SET users user:1 '{"name":"Augustus","age":30,"city":"Accra"}'
 127.0.0.1:6379> DOC.SET users user:2 '{"name":"Kwame","age":25,"city":"Kumasi"}'
+127.0.0.1:6379> DOC.SET users user:3 '{"name":"Ama","age":28,"city":"Accra","email":"ama@kora.dev"}'
 
-# Create a secondary index
+# Create secondary indexes
 127.0.0.1:6379> DOC.CREATEINDEX users city hash
+127.0.0.1:6379> DOC.CREATEINDEX users age sorted
 
 # Query with WHERE clause
 127.0.0.1:6379> DOC.FIND users WHERE city = "Accra"
 127.0.0.1:6379> DOC.FIND users WHERE age > 20 AND city = "Accra" LIMIT 10
+
+# IN operator — match against a set of values
+127.0.0.1:6379> DOC.FIND users WHERE city IN ("Accra", "Kumasi")
+
+# EXISTS — check field presence
+127.0.0.1:6379> DOC.FIND users WHERE email EXISTS
+
+# NOT and parenthesized grouping
+127.0.0.1:6379> DOC.FIND users WHERE NOT city = "Kumasi"
+127.0.0.1:6379> DOC.FIND users WHERE (city = "Accra" OR city = "Kumasi") AND age >= 25
+
+# ORDER BY — sort results
+127.0.0.1:6379> DOC.FIND users WHERE age > 0 ORDER BY age ASC
+127.0.0.1:6379> DOC.FIND users WHERE city = "Accra" ORDER BY name DESC LIMIT 10
 
 # Count matching documents
 127.0.0.1:6379> DOC.COUNT users WHERE age >= 25
@@ -302,7 +316,7 @@ cargo bench -p kora-protocol
 cargo bench -p kora-vector
 ```
 
-Requires Rust 1.75+ (edition 2021).
+Requires Rust 1.82+ (edition 2021).
 
 ---
 
