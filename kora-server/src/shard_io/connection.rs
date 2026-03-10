@@ -1372,11 +1372,38 @@ fn try_handle_local_affinity(
             collection,
             doc_id,
             json,
-        } => Some(handle_doc_set(&shared.doc_engine, collection, doc_id, json)),
+        } => {
+            let resp = handle_doc_set(&shared.doc_engine, collection, doc_id, json);
+            if matches!(resp, CommandResponse::Ok) {
+                if let Some(ref wal) = shared.doc_wal {
+                    wal.lock().append(&WalRecord::DocSet {
+                        collection: collection.to_vec(),
+                        doc_id: doc_id.to_vec(),
+                        json: json.to_vec(),
+                    });
+                }
+            }
+            Some(resp)
+        }
         Command::DocMSet {
             collection,
             entries,
-        } => Some(handle_doc_mset(&shared.doc_engine, collection, entries)),
+        } => {
+            let resp = handle_doc_mset(&shared.doc_engine, collection, entries);
+            if matches!(resp, CommandResponse::Ok) {
+                if let Some(ref wal) = shared.doc_wal {
+                    let mut w = wal.lock();
+                    for (doc_id, json) in entries {
+                        w.append(&WalRecord::DocSet {
+                            collection: collection.to_vec(),
+                            doc_id: doc_id.clone(),
+                            json: json.clone(),
+                        });
+                    }
+                }
+            }
+            Some(resp)
+        }
         Command::DocGet {
             collection,
             doc_id,
@@ -1395,14 +1422,36 @@ fn try_handle_local_affinity(
             collection,
             doc_id,
             mutations,
-        } => Some(handle_doc_update(
-            &shared.doc_engine,
-            collection,
-            doc_id,
-            mutations,
-        )),
+        } => {
+            let resp = handle_doc_update(&shared.doc_engine, collection, doc_id, mutations);
+            if matches!(resp, CommandResponse::Ok) {
+                if let Some(ref wal) = shared.doc_wal {
+                    let col = String::from_utf8_lossy(collection);
+                    let did = String::from_utf8_lossy(doc_id);
+                    if let Ok(Some(doc)) = shared.doc_engine.read().get(&col, &did, None) {
+                        if let Ok(json_bytes) = serde_json::to_vec(&doc) {
+                            wal.lock().append(&WalRecord::DocSet {
+                                collection: collection.to_vec(),
+                                doc_id: doc_id.to_vec(),
+                                json: json_bytes,
+                            });
+                        }
+                    }
+                }
+            }
+            Some(resp)
+        }
         Command::DocDel { collection, doc_id } => {
-            Some(handle_doc_del(&shared.doc_engine, collection, doc_id))
+            let resp = handle_doc_del(&shared.doc_engine, collection, doc_id);
+            if matches!(resp, CommandResponse::Integer(1)) {
+                if let Some(ref wal) = shared.doc_wal {
+                    wal.lock().append(&WalRecord::DocDel {
+                        collection: collection.to_vec(),
+                        doc_id: doc_id.to_vec(),
+                    });
+                }
+            }
+            Some(resp)
         }
         Command::DocExists { collection, doc_id } => {
             Some(handle_doc_exists(&shared.doc_engine, collection, doc_id))

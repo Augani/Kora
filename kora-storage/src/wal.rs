@@ -86,6 +86,36 @@ pub enum WalEntry {
     },
     /// FLUSHDB — clear all keys.
     FlushDb,
+    /// DOC.SET collection doc_id json
+    DocSet {
+        /// Collection name.
+        collection: Vec<u8>,
+        /// External document ID.
+        doc_id: Vec<u8>,
+        /// JSON payload bytes.
+        json: Vec<u8>,
+    },
+    /// DOC.DEL collection doc_id
+    DocDel {
+        /// Collection name.
+        collection: Vec<u8>,
+        /// External document ID.
+        doc_id: Vec<u8>,
+    },
+    /// VECSET key dimensions vector\_bytes
+    VecSet {
+        /// The key.
+        key: Vec<u8>,
+        /// Vector dimensions.
+        dimensions: usize,
+        /// Raw f32 values as LE bytes (each f32 is 4 bytes).
+        vector: Vec<u8>,
+    },
+    /// VECDEL key
+    VecDel {
+        /// The key.
+        key: Vec<u8>,
+    },
 }
 
 const WAL_SET: u8 = 1;
@@ -96,6 +126,10 @@ const WAL_RPUSH: u8 = 5;
 const WAL_HSET: u8 = 6;
 const WAL_SADD: u8 = 7;
 const WAL_FLUSH: u8 = 8;
+const WAL_DOC_SET: u8 = 9;
+const WAL_DOC_DEL: u8 = 10;
+const WAL_VEC_SET: u8 = 11;
+const WAL_VEC_DEL: u8 = 12;
 
 /// The Write-Ahead Log.
 pub struct WriteAheadLog {
@@ -320,6 +354,35 @@ fn encode_entry(entry: &WalEntry) -> Vec<u8> {
         WalEntry::FlushDb => {
             buf.push(WAL_FLUSH);
         }
+        WalEntry::DocSet {
+            collection,
+            doc_id,
+            json,
+        } => {
+            buf.push(WAL_DOC_SET);
+            write_bytes(&mut buf, collection);
+            write_bytes(&mut buf, doc_id);
+            write_bytes(&mut buf, json);
+        }
+        WalEntry::DocDel { collection, doc_id } => {
+            buf.push(WAL_DOC_DEL);
+            write_bytes(&mut buf, collection);
+            write_bytes(&mut buf, doc_id);
+        }
+        WalEntry::VecSet {
+            key,
+            dimensions,
+            vector,
+        } => {
+            buf.push(WAL_VEC_SET);
+            write_bytes(&mut buf, key);
+            buf.extend_from_slice(&(*dimensions as u32).to_le_bytes());
+            write_bytes(&mut buf, vector);
+        }
+        WalEntry::VecDel { key } => {
+            buf.push(WAL_VEC_DEL);
+            write_bytes(&mut buf, key);
+        }
     }
     buf
 }
@@ -407,6 +470,46 @@ fn decode_entry(data: &[u8]) -> Result<WalEntry> {
             Ok(WalEntry::SAdd { key, members })
         }
         WAL_FLUSH => Ok(WalEntry::FlushDb),
+        WAL_DOC_SET => {
+            let collection = read_bytes(data, &mut cursor)?;
+            let doc_id = read_bytes(data, &mut cursor)?;
+            let json = read_bytes(data, &mut cursor)?;
+            Ok(WalEntry::DocSet {
+                collection,
+                doc_id,
+                json,
+            })
+        }
+        WAL_DOC_DEL => {
+            let collection = read_bytes(data, &mut cursor)?;
+            let doc_id = read_bytes(data, &mut cursor)?;
+            Ok(WalEntry::DocDel { collection, doc_id })
+        }
+        WAL_VEC_SET => {
+            let key = read_bytes(data, &mut cursor)?;
+            if cursor + 4 > data.len() {
+                return Err(StorageError::CorruptEntry(
+                    "truncated vec dimensions".into(),
+                ));
+            }
+            let dimensions = u32::from_le_bytes(
+                data[cursor..cursor + 4]
+                    .try_into()
+                    .map_err(|_| StorageError::CorruptEntry("invalid dimensions bytes".into()))?,
+            ) as usize;
+            cursor += 4;
+            let vector = read_bytes(data, &mut cursor)?;
+            Ok(WalEntry::VecSet {
+                key,
+                dimensions,
+                vector,
+            })
+        }
+        WAL_VEC_DEL => {
+            let key = read_bytes(data, &mut cursor)?;
+            let _ = cursor;
+            Ok(WalEntry::VecDel { key })
+        }
         other => Err(StorageError::CorruptEntry(format!(
             "unknown entry type: {}",
             other

@@ -206,6 +206,29 @@ fn wal_record_to_entry(record: &kora_core::shard::WalRecord) -> WalEntry {
             members: members.clone(),
         },
         kora_core::shard::WalRecord::FlushDb => WalEntry::FlushDb,
+        kora_core::shard::WalRecord::DocSet {
+            collection,
+            doc_id,
+            json,
+        } => WalEntry::DocSet {
+            collection: collection.clone(),
+            doc_id: doc_id.clone(),
+            json: json.clone(),
+        },
+        kora_core::shard::WalRecord::DocDel { collection, doc_id } => WalEntry::DocDel {
+            collection: collection.clone(),
+            doc_id: doc_id.clone(),
+        },
+        kora_core::shard::WalRecord::VecSet {
+            key,
+            dimensions,
+            vector,
+        } => WalEntry::VecSet {
+            key: key.clone(),
+            dimensions: *dimensions,
+            vector: vector.clone(),
+        },
+        kora_core::shard::WalRecord::VecDel { key } => WalEntry::VecDel { key: key.clone() },
     }
 }
 

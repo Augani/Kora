@@ -23,7 +23,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
 
@@ -39,6 +39,8 @@ use kora_pubsub::PubSubBroker;
 
 use kora_storage::manager::StorageConfig;
 use kora_storage::rdb::{self, RdbEntry, RdbValue};
+use kora_storage::shard_storage::ShardStorage;
+use kora_storage::wal::WalEntry;
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::{mpsc, oneshot, watch, Notify};
 
@@ -210,6 +212,7 @@ pub(crate) struct AffinitySharedState {
     pub cdc_rings: Vec<Mutex<CdcRing>>,
     pub cdc_groups: Mutex<ConsumerGroupManager>,
     pub doc_engine: RwLock<DocEngine>,
+    pub doc_wal: Option<parking_lot::Mutex<Box<dyn WalWriter>>>,
 
     pub histograms: Arc<CommandHistograms>,
     pub track_latency: AtomicBool,
@@ -240,7 +243,7 @@ impl ShardIoEngine {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         shard_count: usize,
-        wal_writers: Vec<Option<Box<dyn WalWriter>>>,
+        shard_storages: Vec<Option<ShardStorage>>,
         cdc_capacity: usize,
 
         metrics_port: u16,
@@ -249,7 +252,7 @@ impl ShardIoEngine {
         bind_address: String,
         unix_socket: Option<PathBuf>,
     ) -> Self {
-        assert_eq!(wal_writers.len(), shard_count);
+        assert_eq!(shard_storages.len(), shard_count);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let mut shard_senders = Vec::with_capacity(shard_count);
@@ -299,11 +302,26 @@ impl ShardIoEngine {
             }),
         };
 
+        let doc_wal: Option<parking_lot::Mutex<Box<dyn WalWriter>>> =
+            storage_config.as_ref().and_then(|cfg| {
+                ShardStorage::open_with_config(
+                    0,
+                    &cfg.data_dir,
+                    cfg.wal_sync_policy,
+                    cfg.wal_enabled,
+                    false,
+                    0,
+                )
+                .ok()
+                .map(|s| parking_lot::Mutex::new(Box::new(s) as Box<dyn WalWriter>))
+            });
+
         let shared = Arc::new(AffinitySharedState {
             pub_sub,
             cdc_rings,
             cdc_groups: Mutex::new(ConsumerGroupManager::default()),
             doc_engine: RwLock::new(DocEngine::new()),
+            doc_wal,
             histograms,
             track_latency: AtomicBool::new(metrics_port > 0),
             latency_sums_ns,
@@ -317,10 +335,11 @@ impl ShardIoEngine {
             conn_counts: conn_counts.clone(),
         });
 
+        let recovery_barrier = Arc::new(Barrier::new(shard_count + 1));
         let mut thread_handles = Vec::with_capacity(shard_count);
-        for (i, (rx, wal_writer)) in shard_receivers
+        for (i, (rx, shard_storage)) in shard_receivers
             .into_iter()
-            .zip(wal_writers.into_iter())
+            .zip(shard_storages.into_iter())
             .enumerate()
         {
             let shared = shared.clone();
@@ -329,6 +348,7 @@ impl ShardIoEngine {
             let shutdown_rx = shutdown_rx.clone();
             let bind_addr = bind_address.clone();
             let unix_path = if i == 0 { unix_socket.clone() } else { None };
+            let barrier = recovery_barrier.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("kora-shard-io-{}", i))
@@ -340,7 +360,19 @@ impl ShardIoEngine {
 
                     let local = tokio::task::LocalSet::new();
                     local.block_on(&rt, async move {
-                        let store = Rc::new(RefCell::new(ShardStore::new(i as u16)));
+                        let mut store = ShardStore::new(i as u16);
+
+                        let wal_writer: Option<Box<dyn WalWriter>> =
+                            if let Some(storage) = shard_storage {
+                                recover_shard(i as u16, &storage, &mut store, &shared.doc_engine);
+                                Some(Box::new(storage))
+                            } else {
+                                None
+                            };
+
+                        barrier.wait();
+
+                        let store = Rc::new(RefCell::new(store));
                         let wal = Rc::new(RefCell::new(wal_writer));
                         shard_worker_loop(
                             i as u16,
@@ -361,6 +393,7 @@ impl ShardIoEngine {
 
             thread_handles.push(handle);
         }
+        recovery_barrier.wait();
 
         ShardIoEngine {
             shared,
@@ -476,6 +509,161 @@ fn spawn_connection_handler<
 
         counts[shard_idx].fetch_sub(1, Ordering::Relaxed);
     });
+}
+
+fn recover_shard(
+    shard_id: u16,
+    storage: &ShardStorage,
+    store: &mut ShardStore,
+    doc_engine: &RwLock<DocEngine>,
+) {
+    let mut total_recovered = 0u64;
+
+    match storage.rdb_load() {
+        Ok(entries) if !entries.is_empty() => {
+            for entry in &entries {
+                let cmd = rdb_entry_to_command(entry);
+                store.execute(cmd);
+            }
+            tracing::info!(
+                "Shard {} recovered {} entries from RDB snapshot",
+                shard_id,
+                entries.len()
+            );
+            total_recovered += entries.len() as u64;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!("Shard {} RDB load failed: {}", shard_id, e);
+        }
+    }
+
+    match storage.wal_replay(|entry| {
+        match entry {
+            WalEntry::DocSet {
+                collection,
+                doc_id,
+                json,
+            } => {
+                let col = String::from_utf8_lossy(&collection);
+                let did = String::from_utf8_lossy(&doc_id);
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&json) {
+                    let mut engine = doc_engine.write();
+                    let _ = engine.create_collection(&col, Default::default());
+                    if let Err(e) = engine.set(&col, &did, &value) {
+                        tracing::warn!("Shard {} WAL doc replay error: {}", shard_id, e);
+                    }
+                }
+            }
+            WalEntry::DocDel { collection, doc_id } => {
+                let col = String::from_utf8_lossy(&collection);
+                let did = String::from_utf8_lossy(&doc_id);
+                let mut engine = doc_engine.write();
+                let _ = engine.del(&col, &did);
+            }
+            WalEntry::VecSet {
+                key,
+                dimensions,
+                vector,
+            } => {
+                let floats: Vec<f32> = vector
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect();
+                store.execute(Command::VecSet {
+                    key,
+                    dimensions,
+                    vector: floats,
+                });
+            }
+            WalEntry::VecDel { key } => {
+                store.execute(Command::VecDel { key });
+            }
+            other => {
+                let cmd = wal_entry_to_command(other);
+                store.execute(cmd);
+            }
+        }
+        total_recovered += 1;
+    }) {
+        Ok(count) if count > 0 => {
+            tracing::info!("Shard {} replayed {} WAL entries", shard_id, count);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!("Shard {} WAL replay failed: {}", shard_id, e);
+        }
+    }
+
+    if total_recovered > 0 {
+        tracing::info!(
+            "Shard {} recovery complete: {} total entries restored",
+            shard_id,
+            total_recovered
+        );
+    }
+}
+
+fn rdb_entry_to_command(entry: &RdbEntry) -> Command {
+    match &entry.value {
+        RdbValue::String(v) => Command::Set {
+            key: entry.key.clone(),
+            value: v.clone(),
+            ex: None,
+            px: entry.ttl_ms,
+            nx: false,
+            xx: false,
+        },
+        RdbValue::Int(n) => Command::Set {
+            key: entry.key.clone(),
+            value: n.to_string().into_bytes(),
+            ex: None,
+            px: entry.ttl_ms,
+            nx: false,
+            xx: false,
+        },
+        RdbValue::List(items) => Command::RPush {
+            key: entry.key.clone(),
+            values: items.clone(),
+        },
+        RdbValue::Set(members) => Command::SAdd {
+            key: entry.key.clone(),
+            members: members.clone(),
+        },
+        RdbValue::Hash(fields) => Command::HSet {
+            key: entry.key.clone(),
+            fields: fields.clone(),
+        },
+    }
+}
+
+fn wal_entry_to_command(entry: WalEntry) -> Command {
+    match entry {
+        WalEntry::Set { key, value, ttl_ms } => Command::Set {
+            key,
+            value,
+            ex: None,
+            px: ttl_ms,
+            nx: false,
+            xx: false,
+        },
+        WalEntry::Del { key } => Command::Del { keys: vec![key] },
+        WalEntry::Expire { key, ttl_ms } => Command::PExpire {
+            key,
+            millis: ttl_ms,
+        },
+        WalEntry::LPush { key, values } => Command::LPush { key, values },
+        WalEntry::RPush { key, values } => Command::RPush { key, values },
+        WalEntry::HSet { key, fields } => Command::HSet { key, fields },
+        WalEntry::SAdd { key, members } => Command::SAdd { key, members },
+        WalEntry::FlushDb => Command::FlushDb,
+        WalEntry::DocSet { .. }
+        | WalEntry::DocDel { .. }
+        | WalEntry::VecSet { .. }
+        | WalEntry::VecDel { .. } => {
+            unreachable!("doc/vec entries handled separately in recover_shard")
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1088,6 +1276,7 @@ mod tests {
             cdc_rings: Vec::new(),
             cdc_groups: Mutex::new(ConsumerGroupManager::default()),
             doc_engine: RwLock::new(DocEngine::new()),
+            doc_wal: None,
             histograms: Arc::new(CommandHistograms::new()),
             track_latency: AtomicBool::new(false),
             latency_sums_ns: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),

@@ -9,6 +9,7 @@ description = "Embeddable library mode for Kōra — use as a direct API without
 [dependencies]
 kora-core.workspace = true
 kora-doc.workspace = true
+kora-storage.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -22,3 +23,4 @@ server = ["dep:kora-server", "dep:tokio"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"

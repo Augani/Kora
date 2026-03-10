@@ -60,6 +60,36 @@ pub enum WalRecord {
     },
     /// FLUSHDB — clear all keys.
     FlushDb,
+    /// DOC.SET collection doc_id json
+    DocSet {
+        /// Collection name.
+        collection: Vec<u8>,
+        /// External document ID.
+        doc_id: Vec<u8>,
+        /// JSON payload bytes.
+        json: Vec<u8>,
+    },
+    /// DOC.DEL collection doc_id
+    DocDel {
+        /// Collection name.
+        collection: Vec<u8>,
+        /// External document ID.
+        doc_id: Vec<u8>,
+    },
+    /// VECSET key dimensions vector\_bytes
+    VecSet {
+        /// The key.
+        key: Vec<u8>,
+        /// Vector dimensions.
+        dimensions: usize,
+        /// Raw f32 values as LE bytes (each f32 is 4 bytes).
+        vector: Vec<u8>,
+    },
+    /// VECDEL key
+    VecDel {
+        /// The key.
+        key: Vec<u8>,
+    },
 }
 
 /// Trait for writing WAL entries from a shard worker thread.

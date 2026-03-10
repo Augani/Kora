@@ -12,7 +12,6 @@
 
 mod shard_io;
 
-use kora_core::shard::WalWriter;
 use kora_storage::manager::StorageConfig;
 use kora_storage::shard_storage::ShardStorage;
 
@@ -69,11 +68,10 @@ pub struct KoraServer {
     engine: shard_io::ShardIoEngine,
 }
 
-fn create_shard_storage(config: &ServerConfig) -> Vec<Option<Box<dyn WalWriter>>> {
+fn create_shard_storage(config: &ServerConfig) -> Vec<Option<ShardStorage>> {
     match config.storage {
         Some(ref sc) => {
-            let mut writers: Vec<Option<Box<dyn WalWriter>>> =
-                Vec::with_capacity(config.worker_count);
+            let mut storages: Vec<Option<ShardStorage>> = Vec::with_capacity(config.worker_count);
             for i in 0..config.worker_count {
                 match ShardStorage::open_with_config(
                     i as u16,
@@ -85,15 +83,15 @@ fn create_shard_storage(config: &ServerConfig) -> Vec<Option<Box<dyn WalWriter>>
                 ) {
                     Ok(storage) => {
                         tracing::info!("Opened per-shard storage for shard {}", i);
-                        writers.push(Some(Box::new(storage)));
+                        storages.push(Some(storage));
                     }
                     Err(e) => {
                         tracing::error!("Failed to open shard {} storage: {}", i, e);
-                        writers.push(None);
+                        storages.push(None);
                     }
                 }
             }
-            writers
+            storages
         }
         None => (0..config.worker_count).map(|_| None).collect(),
     }

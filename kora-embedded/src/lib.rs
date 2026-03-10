@@ -45,16 +45,19 @@
 
 #![warn(clippy::all)]
 
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use kora_core::command::{Command, CommandResponse};
-use kora_core::shard::ShardEngine;
+use kora_core::shard::{ShardEngine, ShardStore, WalRecord, WalWriter};
 use kora_doc::{
     CollectionConfig, CollectionInfo, DictionaryInfo, DocEngine, DocError, DocMutation, IndexType,
     SetResult, StorageInfo,
 };
-use parking_lot::RwLock;
+use kora_storage::shard_storage::ShardStorage;
+use kora_storage::wal::{SyncPolicy, WalEntry};
+use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 
 #[cfg(feature = "server")]
@@ -83,6 +86,12 @@ pub struct Config {
     /// Each shard owns an independent key-space partition and runs on its own
     /// OS thread, so this value controls both parallelism and memory partitioning.
     pub shard_count: usize,
+    /// Optional data directory for persistence. When set, WAL and RDB snapshots
+    /// are stored under `{data_dir}/shard-{N}/`. Data is recovered automatically
+    /// on startup.
+    pub data_dir: Option<PathBuf>,
+    /// WAL sync policy (only used when `data_dir` is set).
+    pub wal_sync: SyncPolicy,
 }
 
 impl Default for Config {
@@ -91,6 +100,8 @@ impl Default for Config {
             shard_count: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4),
+            data_dir: None,
+            wal_sync: SyncPolicy::EverySecond,
         }
     }
 }
@@ -113,7 +124,7 @@ impl Default for Config {
 /// use kora_embedded::{Config, Database};
 /// use std::sync::Arc;
 ///
-/// let db = Arc::new(Database::open(Config { shard_count: 4 }));
+/// let db = Arc::new(Database::open(Config { shard_count: 4, ..Config::default() }));
 /// db.set("counter", b"0");
 /// db.incr("counter").unwrap();
 /// assert_eq!(db.get("counter"), Some(b"1".to_vec()));
@@ -121,6 +132,7 @@ impl Default for Config {
 pub struct Database {
     engine: Arc<ShardEngine>,
     doc_engine: Arc<RwLock<DocEngine>>,
+    doc_wal: Option<Mutex<Box<dyn WalWriter>>>,
 }
 
 impl Database {
@@ -129,9 +141,88 @@ impl Database {
     /// This spawns `config.shard_count` background worker threads that remain
     /// alive for the lifetime of the returned `Database`.
     pub fn open(config: Config) -> Self {
-        let engine = Arc::new(ShardEngine::new(config.shard_count));
         let doc_engine = Arc::new(RwLock::new(DocEngine::new()));
-        Self { engine, doc_engine }
+
+        let (engine, doc_wal) = match config.data_dir {
+            Some(ref data_dir) => {
+                let mut wal_writers: Vec<Option<Box<dyn WalWriter>>> =
+                    Vec::with_capacity(config.shard_count);
+                let mut recovery_fns: Vec<Box<dyn FnOnce(usize, &mut ShardStore) + Send>> =
+                    Vec::with_capacity(config.shard_count);
+                let barrier = Arc::new(Barrier::new(config.shard_count + 1));
+
+                for i in 0..config.shard_count {
+                    match ShardStorage::open_with_config(
+                        i as u16,
+                        data_dir,
+                        config.wal_sync,
+                        true,
+                        true,
+                        0,
+                    ) {
+                        Ok(storage) => {
+                            let doc_eng = doc_engine.clone();
+                            let shard_id = i as u16;
+                            let barrier_clone = barrier.clone();
+                            recovery_fns.push(Box::new(move |_idx, store| {
+                                recover_embedded_shard(shard_id, &storage, store, &doc_eng);
+                                barrier_clone.wait();
+                            }));
+                            let storage2 = ShardStorage::open_with_config(
+                                i as u16,
+                                data_dir,
+                                config.wal_sync,
+                                true,
+                                true,
+                                0,
+                            )
+                            .expect("failed to reopen shard storage for WAL writing");
+                            wal_writers.push(Some(Box::new(storage2)));
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to open shard {} storage: {}", i, e);
+                            wal_writers.push(None);
+                            let barrier_clone = barrier.clone();
+                            recovery_fns.push(Box::new(move |_, _| {
+                                barrier_clone.wait();
+                            }));
+                        }
+                    }
+                }
+
+                let doc_wal_writer: Option<Mutex<Box<dyn WalWriter>>> =
+                    match ShardStorage::open_with_config(
+                        0,
+                        data_dir,
+                        config.wal_sync,
+                        true,
+                        true,
+                        0,
+                    ) {
+                        Ok(storage) => Some(Mutex::new(Box::new(storage))),
+                        Err(e) => {
+                            tracing::error!("Failed to open doc WAL writer: {}", e);
+                            None
+                        }
+                    };
+
+                let engine = Arc::new(ShardEngine::new_with_recovery(
+                    config.shard_count,
+                    wal_writers,
+                    Some(recovery_fns),
+                ));
+                barrier.wait();
+
+                (engine, doc_wal_writer)
+            }
+            None => (Arc::new(ShardEngine::new(config.shard_count)), None),
+        };
+
+        Self {
+            engine,
+            doc_engine,
+            doc_wal,
+        }
     }
 
     /// Return a reference to the underlying [`ShardEngine`](kora_core::shard::ShardEngine).
@@ -196,7 +287,13 @@ impl Database {
         doc_id: &str,
         json: &Value,
     ) -> Result<DocSetResult, DocError> {
-        self.doc_engine.write().set(collection, doc_id, json)
+        let result = self.doc_engine.write().set(collection, doc_id, json)?;
+        self.append_doc_wal(WalRecord::DocSet {
+            collection: collection.as_bytes().to_vec(),
+            doc_id: doc_id.as_bytes().to_vec(),
+            json: serde_json::to_vec(json).unwrap_or_default(),
+        });
+        Ok(result)
     }
 
     /// Insert or replace multiple JSON documents in one collection.
@@ -206,10 +303,21 @@ impl Database {
         entries: &[(&str, &Value)],
     ) -> Result<Vec<DocSetResult>, DocError> {
         let mut engine = self.doc_engine.write();
-        entries
+        let results: Result<Vec<DocSetResult>, DocError> = entries
             .iter()
             .map(|(doc_id, json)| engine.set(collection, doc_id, json))
-            .collect()
+            .collect();
+        drop(engine);
+        if let Ok(ref _res) = results {
+            for (doc_id, json) in entries {
+                self.append_doc_wal(WalRecord::DocSet {
+                    collection: collection.as_bytes().to_vec(),
+                    doc_id: doc_id.as_bytes().to_vec(),
+                    json: serde_json::to_vec(json).unwrap_or_default(),
+                });
+            }
+        }
+        results
     }
 
     /// Read one JSON document, optionally projecting a subset of fields.
@@ -251,14 +359,31 @@ impl Database {
         doc_id: &str,
         mutations: &[DocUpdateMutation],
     ) -> Result<bool, DocError> {
-        self.doc_engine
-            .write()
-            .update(collection, doc_id, mutations)
+        let mut engine = self.doc_engine.write();
+        let updated = engine.update(collection, doc_id, mutations)?;
+        if updated {
+            if let Ok(Some(doc)) = engine.get(collection, doc_id, None) {
+                drop(engine);
+                self.append_doc_wal(WalRecord::DocSet {
+                    collection: collection.as_bytes().to_vec(),
+                    doc_id: doc_id.as_bytes().to_vec(),
+                    json: serde_json::to_vec(&doc).unwrap_or_default(),
+                });
+            }
+        }
+        Ok(updated)
     }
 
     /// Delete a document. Returns `Ok(true)` if the document existed.
     pub fn doc_del(&self, collection: &str, doc_id: &str) -> Result<bool, DocError> {
-        self.doc_engine.write().del(collection, doc_id)
+        let deleted = self.doc_engine.write().del(collection, doc_id)?;
+        if deleted {
+            self.append_doc_wal(WalRecord::DocDel {
+                collection: collection.as_bytes().to_vec(),
+                doc_id: doc_id.as_bytes().to_vec(),
+            });
+        }
+        Ok(deleted)
     }
 
     /// Check whether a document exists in a collection.
@@ -886,6 +1011,12 @@ impl Database {
         }
     }
 
+    fn append_doc_wal(&self, record: WalRecord) {
+        if let Some(ref wal) = self.doc_wal {
+            wal.lock().append(&record);
+        }
+    }
+
     // ─── Hybrid mode ────────────────────────────────────────────
 
     /// Start a TCP listener on `addr` for hybrid embedded + network mode.
@@ -934,6 +1065,136 @@ fn parse_index_type_str(raw: &str) -> Result<IndexType, DocError> {
     }
 }
 
+fn recover_embedded_shard(
+    shard_id: u16,
+    storage: &ShardStorage,
+    store: &mut ShardStore,
+    doc_engine: &RwLock<DocEngine>,
+) {
+    match storage.rdb_load() {
+        Ok(entries) if !entries.is_empty() => {
+            for entry in &entries {
+                let cmd = rdb_entry_to_restore_command(entry);
+                store.execute(cmd);
+            }
+            tracing::info!(
+                "Shard {} recovered {} entries from RDB",
+                shard_id,
+                entries.len()
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!("Shard {} RDB load failed: {}", shard_id, e),
+    }
+
+    match storage.wal_replay(|entry| match entry {
+        WalEntry::DocSet {
+            collection,
+            doc_id,
+            json,
+        } => {
+            let col = String::from_utf8_lossy(&collection);
+            let did = String::from_utf8_lossy(&doc_id);
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&json) {
+                let mut engine = doc_engine.write();
+                let _ = engine.create_collection(&col, Default::default());
+                let _ = engine.set(&col, &did, &value);
+            }
+        }
+        WalEntry::DocDel { collection, doc_id } => {
+            let col = String::from_utf8_lossy(&collection);
+            let did = String::from_utf8_lossy(&doc_id);
+            let mut engine = doc_engine.write();
+            let _ = engine.del(&col, &did);
+        }
+        WalEntry::VecSet {
+            key,
+            dimensions,
+            vector,
+        } => {
+            let floats: Vec<f32> = vector
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            store.execute(Command::VecSet {
+                key,
+                dimensions,
+                vector: floats,
+            });
+        }
+        WalEntry::VecDel { key } => {
+            store.execute(Command::VecDel { key });
+        }
+        other => {
+            store.execute(wal_entry_to_restore_command(other));
+        }
+    }) {
+        Ok(count) if count > 0 => {
+            tracing::info!("Shard {} replayed {} WAL entries", shard_id, count);
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!("Shard {} WAL replay failed: {}", shard_id, e),
+    }
+}
+
+fn rdb_entry_to_restore_command(entry: &kora_storage::rdb::RdbEntry) -> Command {
+    use kora_storage::rdb::RdbValue;
+    match &entry.value {
+        RdbValue::String(v) => Command::Set {
+            key: entry.key.clone(),
+            value: v.clone(),
+            ex: None,
+            px: entry.ttl_ms,
+            nx: false,
+            xx: false,
+        },
+        RdbValue::Int(n) => Command::Set {
+            key: entry.key.clone(),
+            value: n.to_string().into_bytes(),
+            ex: None,
+            px: entry.ttl_ms,
+            nx: false,
+            xx: false,
+        },
+        RdbValue::List(items) => Command::RPush {
+            key: entry.key.clone(),
+            values: items.clone(),
+        },
+        RdbValue::Set(members) => Command::SAdd {
+            key: entry.key.clone(),
+            members: members.clone(),
+        },
+        RdbValue::Hash(fields) => Command::HSet {
+            key: entry.key.clone(),
+            fields: fields.clone(),
+        },
+    }
+}
+
+fn wal_entry_to_restore_command(entry: WalEntry) -> Command {
+    match entry {
+        WalEntry::Set { key, value, ttl_ms } => Command::Set {
+            key,
+            value,
+            ex: None,
+            px: ttl_ms,
+            nx: false,
+            xx: false,
+        },
+        WalEntry::Del { key } => Command::Del { keys: vec![key] },
+        WalEntry::Expire { key, ttl_ms } => Command::PExpire {
+            key,
+            millis: ttl_ms,
+        },
+        WalEntry::LPush { key, values } => Command::LPush { key, values },
+        WalEntry::RPush { key, values } => Command::RPush { key, values },
+        WalEntry::HSet { key, fields } => Command::HSet { key, fields },
+        WalEntry::SAdd { key, members } => Command::SAdd { key, members },
+        WalEntry::FlushDb => Command::FlushDb,
+        _ => unreachable!("doc/vec entries handled separately"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -942,7 +1203,10 @@ mod tests {
 
     #[test]
     fn test_basic_set_get() {
-        let db = Database::open(Config { shard_count: 2 });
+        let db = Database::open(Config {
+            shard_count: 2,
+            ..Config::default()
+        });
         db.set("hello", b"world");
         assert_eq!(db.get("hello"), Some(b"world".to_vec()));
         assert_eq!(db.get("nonexistent"), None);
@@ -950,7 +1214,10 @@ mod tests {
 
     #[test]
     fn test_del() {
-        let db = Database::open(Config { shard_count: 2 });
+        let db = Database::open(Config {
+            shard_count: 2,
+            ..Config::default()
+        });
         db.set("k", b"v");
         assert!(db.del("k"));
         assert!(!db.del("k"));
@@ -959,7 +1226,10 @@ mod tests {
 
     #[test]
     fn test_incr() {
-        let db = Database::open(Config { shard_count: 2 });
+        let db = Database::open(Config {
+            shard_count: 2,
+            ..Config::default()
+        });
         assert_eq!(db.incr("counter").unwrap(), 1);
         assert_eq!(db.incr("counter").unwrap(), 2);
         assert_eq!(db.incr("counter").unwrap(), 3);
@@ -967,7 +1237,10 @@ mod tests {
 
     #[test]
     fn test_list_operations() {
-        let db = Database::open(Config { shard_count: 2 });
+        let db = Database::open(Config {
+            shard_count: 2,
+            ..Config::default()
+        });
         db.rpush("list", &[b"a", b"b", b"c"]);
         let items = db.lrange("list", 0, -1);
         assert_eq!(items, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
@@ -975,7 +1248,10 @@ mod tests {
 
     #[test]
     fn test_hash_operations() {
-        let db = Database::open(Config { shard_count: 2 });
+        let db = Database::open(Config {
+            shard_count: 2,
+            ..Config::default()
+        });
         db.hset("user", "name", b"Alice");
         assert_eq!(db.hget("user", "name"), Some(b"Alice".to_vec()));
         assert_eq!(db.hget("user", "age"), None);
@@ -983,7 +1259,10 @@ mod tests {
 
     #[test]
     fn test_set_operations() {
-        let db = Database::open(Config { shard_count: 2 });
+        let db = Database::open(Config {
+            shard_count: 2,
+            ..Config::default()
+        });
         db.sadd("tags", &[b"rust", b"cache", b"rust"]);
         let members = db.smembers("tags");
         assert_eq!(members.len(), 2); // "rust" deduplicated
@@ -991,7 +1270,10 @@ mod tests {
 
     #[test]
     fn test_db_size_and_flush() {
-        let db = Database::open(Config { shard_count: 2 });
+        let db = Database::open(Config {
+            shard_count: 2,
+            ..Config::default()
+        });
         db.set("a", b"1");
         db.set("b", b"2");
         assert_eq!(db.db_size(), 2);
@@ -1001,7 +1283,10 @@ mod tests {
 
     #[test]
     fn test_concurrent_access() {
-        let db = std::sync::Arc::new(Database::open(Config { shard_count: 4 }));
+        let db = std::sync::Arc::new(Database::open(Config {
+            shard_count: 4,
+            ..Config::default()
+        }));
         let mut handles = vec![];
         for t in 0..4 {
             let db = db.clone();
@@ -1021,7 +1306,10 @@ mod tests {
 
     #[test]
     fn test_vector_set_search_del() {
-        let db = Database::open(Config { shard_count: 2 });
+        let db = Database::open(Config {
+            shard_count: 2,
+            ..Config::default()
+        });
 
         let v1 = vec![1.0f32, 0.0, 0.0, 0.0];
         let v2 = vec![0.0f32, 1.0, 0.0, 0.0];
@@ -1049,7 +1337,10 @@ mod tests {
 
     #[test]
     fn test_vector_dimension_mismatch() {
-        let db = Database::open(Config { shard_count: 2 });
+        let db = Database::open(Config {
+            shard_count: 2,
+            ..Config::default()
+        });
         db.vector_set("idx", 3, &[1.0, 2.0, 3.0]).unwrap();
         let result = db.vector_set("idx", 5, &[1.0, 2.0, 3.0, 4.0, 5.0]);
         assert!(result.is_err());
@@ -1057,14 +1348,20 @@ mod tests {
 
     #[test]
     fn test_vector_search_nonexistent_index() {
-        let db = Database::open(Config { shard_count: 2 });
+        let db = Database::open(Config {
+            shard_count: 2,
+            ..Config::default()
+        });
         let results = db.vector_search("nonexistent", &[1.0, 2.0], 5).unwrap();
         assert!(results.is_empty());
     }
 
     #[test]
     fn test_document_crud() {
-        let db = Database::open(Config { shard_count: 2 });
+        let db = Database::open(Config {
+            shard_count: 2,
+            ..Config::default()
+        });
         db.doc_create_collection("users", DocCollectionConfig::default())
             .expect("collection should be created");
 
@@ -1114,7 +1411,10 @@ mod tests {
 
     #[test]
     fn test_document_collection_drop() {
-        let db = Database::open(Config { shard_count: 2 });
+        let db = Database::open(Config {
+            shard_count: 2,
+            ..Config::default()
+        });
         db.doc_create_collection("users", DocCollectionConfig::default())
             .expect("collection should be created");
         db.doc_set("users", "doc:1", &json!({"name": "Augustus"}))
@@ -1132,7 +1432,10 @@ mod tests {
 
     #[test]
     fn test_document_batch_ops() {
-        let db = Database::open(Config { shard_count: 2 });
+        let db = Database::open(Config {
+            shard_count: 2,
+            ..Config::default()
+        });
         db.doc_create_collection("users", DocCollectionConfig::default())
             .expect("collection should be created");
 
@@ -1166,7 +1469,10 @@ mod tests {
 
     #[test]
     fn test_document_update_ops() {
-        let db = Database::open(Config { shard_count: 2 });
+        let db = Database::open(Config {
+            shard_count: 2,
+            ..Config::default()
+        });
         db.doc_create_collection("users", DocCollectionConfig::default())
             .expect("collection should be created");
         db.doc_set(
@@ -1220,5 +1526,81 @@ mod tests {
                 "tags": ["systems", "cache"]
             })
         );
+    }
+
+    #[test]
+    fn test_persistence_survives_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+
+        {
+            let db = Database::open(Config {
+                shard_count: 2,
+                data_dir: Some(data_dir.clone()),
+                wal_sync: SyncPolicy::EveryWrite,
+            });
+            db.set("greeting", b"hello world");
+            db.set("counter", b"42");
+            db.hset("user:1", "name", b"Augustus");
+            db.hset("user:1", "city", b"Accra");
+            db.rpush("tasks", &[b"task-1", b"task-2"]);
+            db.sadd("tags", &[b"rust", b"cache"]);
+        }
+
+        {
+            let db = Database::open(Config {
+                shard_count: 2,
+                data_dir: Some(data_dir.clone()),
+                wal_sync: SyncPolicy::EveryWrite,
+            });
+            assert_eq!(db.get("greeting"), Some(b"hello world".to_vec()));
+            assert_eq!(db.get("counter"), Some(b"42".to_vec()));
+            assert_eq!(db.hget("user:1", "name"), Some(b"Augustus".to_vec()));
+            assert_eq!(db.hget("user:1", "city"), Some(b"Accra".to_vec()));
+            assert_eq!(
+                db.lrange("tasks", 0, -1),
+                vec![b"task-1".to_vec(), b"task-2".to_vec()]
+            );
+            let members = db.smembers("tags");
+            assert_eq!(members.len(), 2);
+            assert!(db.sismember("tags", b"rust"));
+            assert!(db.sismember("tags", b"cache"));
+        }
+    }
+
+    #[test]
+    fn test_persistence_doc_survives_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+
+        {
+            let db = Database::open(Config {
+                shard_count: 1,
+                data_dir: Some(data_dir.clone()),
+                wal_sync: SyncPolicy::EveryWrite,
+            });
+            db.doc_create_collection("users", DocCollectionConfig::default())
+                .unwrap();
+            db.doc_set(
+                "users",
+                "user:1",
+                &json!({"name": "Augustus", "city": "Accra"}),
+            )
+            .unwrap();
+        }
+
+        {
+            let db = Database::open(Config {
+                shard_count: 1,
+                data_dir: Some(data_dir.clone()),
+                wal_sync: SyncPolicy::EveryWrite,
+            });
+            let doc = db
+                .doc_get("users", "user:1", None)
+                .expect("get should succeed")
+                .expect("doc should exist");
+            assert_eq!(doc["name"], "Augustus");
+            assert_eq!(doc["city"], "Accra");
+        }
     }
 }

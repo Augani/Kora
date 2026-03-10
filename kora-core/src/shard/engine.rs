@@ -85,20 +85,47 @@ impl ShardEngine {
         shard_count: usize,
         wal_writers: Vec<Option<Box<dyn WalWriter>>>,
     ) -> Self {
+        Self::new_with_recovery(shard_count, wal_writers, None)
+    }
+
+    /// Create a new ShardEngine with per-shard WAL writers and optional
+    /// per-shard recovery callbacks.
+    ///
+    /// Each recovery callback receives the shard index and a mutable reference
+    /// to the freshly created `ShardStore`, allowing callers to replay RDB
+    /// snapshots and WAL entries before the worker starts accepting commands.
+    pub fn new_with_recovery(
+        shard_count: usize,
+        wal_writers: Vec<Option<Box<dyn WalWriter>>>,
+        recovery_fns: Option<Vec<Box<dyn FnOnce(usize, &mut ShardStore) + Send>>>,
+    ) -> Self {
         assert_eq!(
             wal_writers.len(),
             shard_count,
             "wal_writers length must match shard_count"
         );
 
+        let mut recovery_iter: Vec<Option<Box<dyn FnOnce(usize, &mut ShardStore) + Send>>> =
+            match recovery_fns {
+                Some(fns) => {
+                    assert_eq!(fns.len(), shard_count);
+                    fns.into_iter().map(Some).collect()
+                }
+                None => (0..shard_count).map(|_| None).collect(),
+            };
+
         let mut workers = Vec::with_capacity(shard_count);
 
         for (i, wal_writer) in wal_writers.into_iter().enumerate() {
             let (tx, rx) = crossbeam_channel::unbounded::<ShardMessage>();
+            let recovery_fn = recovery_iter[i].take();
             let handle = thread::Builder::new()
                 .name(format!("kora-shard-{}", i))
                 .spawn(move || {
                     let mut store = ShardStore::new(i as u16);
+                    if let Some(recover) = recovery_fn {
+                        recover(i, &mut store);
+                    }
                     worker_loop(&mut store, &rx, wal_writer);
                 })
                 .expect("failed to spawn shard worker thread");
@@ -838,6 +865,36 @@ pub fn command_to_wal_record(cmd: &Command) -> Option<WalRecord> {
             members: members.clone(),
         }),
         Command::FlushDb | Command::FlushAll => Some(WalRecord::FlushDb),
+        Command::DocSet {
+            collection,
+            doc_id,
+            json,
+        } => Some(WalRecord::DocSet {
+            collection: collection.clone(),
+            doc_id: doc_id.clone(),
+            json: json.clone(),
+        }),
+        Command::DocDel { collection, doc_id } => Some(WalRecord::DocDel {
+            collection: collection.clone(),
+            doc_id: doc_id.clone(),
+        }),
+        Command::DocMSet { .. } => None,
+        Command::VecSet {
+            key,
+            dimensions,
+            vector,
+        } => {
+            let mut vec_bytes = Vec::with_capacity(vector.len() * 4);
+            for &f in vector {
+                vec_bytes.extend_from_slice(&f.to_le_bytes());
+            }
+            Some(WalRecord::VecSet {
+                key: key.clone(),
+                dimensions: *dimensions,
+                vector: vec_bytes,
+            })
+        }
+        Command::VecDel { key } => Some(WalRecord::VecDel { key: key.clone() }),
         _ => None,
     }
 }

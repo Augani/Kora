@@ -4247,3 +4247,108 @@ async fn test_doc_read_concurrency_no_deadlock() {
 
     let _ = shutdown.send(true);
 }
+
+#[tokio::test]
+async fn test_server_kv_data_survives_restart() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let data_dir = tmp_dir.path().to_path_buf();
+
+    let port = free_port().await;
+    let shutdown = start_server_with_storage(port, data_dir.clone()).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["SET", "restart:k1", "hello"]).await;
+    cmd(&mut stream, &["SET", "restart:k2", "world"]).await;
+    cmd(&mut stream, &["LPUSH", "restart:list", "a", "b"]).await;
+    cmd(&mut stream, &["HSET", "restart:hash", "f1", "v1"]).await;
+    cmd(&mut stream, &["SADD", "restart:set", "x", "y"]).await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = shutdown.send(true);
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let port2 = free_port().await;
+    let shutdown2 = start_server_with_storage(port2, data_dir).await;
+    let mut stream2 = connect(port2).await;
+
+    let resp = cmd(&mut stream2, &["GET", "restart:k1"]).await;
+    assert_resp(&resp, b"$5\r\nhello\r\n");
+
+    let resp = cmd(&mut stream2, &["GET", "restart:k2"]).await;
+    assert_resp(&resp, b"$5\r\nworld\r\n");
+
+    let resp = cmd(&mut stream2, &["LLEN", "restart:list"]).await;
+    assert_resp(&resp, b":2\r\n");
+
+    let resp = cmd(&mut stream2, &["HGET", "restart:hash", "f1"]).await;
+    assert_resp(&resp, b"$2\r\nv1\r\n");
+
+    let resp = cmd(&mut stream2, &["SCARD", "restart:set"]).await;
+    assert_resp(&resp, b":2\r\n");
+
+    let _ = shutdown2.send(true);
+}
+
+#[tokio::test]
+async fn test_server_doc_data_survives_restart() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let data_dir = tmp_dir.path().to_path_buf();
+
+    let port = free_port().await;
+    let shutdown = start_server_with_storage(port, data_dir.clone()).await;
+    let mut stream = connect(port).await;
+
+    cmd(&mut stream, &["DOC.CREATE", "users"]).await;
+    cmd(
+        &mut stream,
+        &[
+            "DOC.SET",
+            "users",
+            "user:1",
+            r#"{"name":"Augustus","city":"Accra"}"#,
+        ],
+    )
+    .await;
+    cmd(
+        &mut stream,
+        &[
+            "DOC.SET",
+            "users",
+            "user:2",
+            r#"{"name":"Kwame","city":"Kumasi"}"#,
+        ],
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = shutdown.send(true);
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let port2 = free_port().await;
+    let shutdown2 = start_server_with_storage(port2, data_dir).await;
+    let mut stream2 = connect(port2).await;
+
+    let resp = cmd(&mut stream2, &["DOC.GET", "users", "user:1"]).await;
+    let parsed: Value = serde_json::from_slice(&extract_bulk_string(&resp)).unwrap();
+    assert_eq!(parsed["name"], "Augustus");
+    assert_eq!(parsed["city"], "Accra");
+
+    let resp = cmd(&mut stream2, &["DOC.GET", "users", "user:2"]).await;
+    let parsed: Value = serde_json::from_slice(&extract_bulk_string(&resp)).unwrap();
+    assert_eq!(parsed["name"], "Kwame");
+    assert_eq!(parsed["city"], "Kumasi");
+
+    let _ = shutdown2.send(true);
+}
+
+fn extract_bulk_string(resp: &[u8]) -> Vec<u8> {
+    let s = String::from_utf8_lossy(resp);
+    let lines: Vec<&str> = s.split("\r\n").collect();
+    if lines.len() >= 2 && lines[0].starts_with('$') {
+        lines[1].as_bytes().to_vec()
+    } else {
+        panic!("Expected bulk string response, got: {:?}", s);
+    }
+}
