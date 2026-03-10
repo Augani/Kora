@@ -1,9 +1,0 @@
-target/
-.git/
-.claude/
-docs/
-*.md
-!CLAUDE.md
-bench-docker.sh
-bench-memtier.sh
-aws/
