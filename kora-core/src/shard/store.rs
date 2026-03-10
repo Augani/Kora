@@ -1563,7 +1563,7 @@ impl ShardStore {
             .entries
             .iter()
             .filter(|(_, entry)| !entry.is_expired())
-            .filter(|(key, _)| pattern.map_or(true, |p| glob_match(p, key.as_bytes())))
+            .filter(|(key, _)| pattern.is_none_or(|p| glob_match(p, key.as_bytes())))
             .map(|(key, _)| key)
             .collect();
         keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
@@ -2153,7 +2153,7 @@ impl ShardStore {
                     let mut members: Vec<&Value> = set
                         .iter()
                         .filter(|v| {
-                            pattern.map_or(true, |p| {
+                            pattern.is_none_or(|p| {
                                 if let Some(CommandResponse::BulkString(b)) = v.bulk_response() {
                                     glob_match(p, &b)
                                 } else {
@@ -2758,7 +2758,7 @@ impl ShardStore {
                 Value::SortedSet(map) => {
                     let mut members: Vec<(&Vec<u8>, &f64)> = map
                         .iter()
-                        .filter(|(m, _)| pattern.map_or(true, |p| glob_match(p, m)))
+                        .filter(|(m, _)| pattern.is_none_or(|p| glob_match(p, m)))
                         .collect();
                     members.sort_by(|a, b| a.0.cmp(b.0));
 

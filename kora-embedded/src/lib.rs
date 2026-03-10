@@ -140,6 +140,7 @@ impl Database {
     ///
     /// This spawns `config.shard_count` background worker threads that remain
     /// alive for the lifetime of the returned `Database`.
+    #[allow(clippy::type_complexity)]
     pub fn open(config: Config) -> Self {
         let doc_engine = Arc::new(RwLock::new(DocEngine::new()));
 

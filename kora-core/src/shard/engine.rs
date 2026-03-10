@@ -94,6 +94,7 @@ impl ShardEngine {
     /// Each recovery callback receives the shard index and a mutable reference
     /// to the freshly created `ShardStore`, allowing callers to replay RDB
     /// snapshots and WAL entries before the worker starts accepting commands.
+    #[allow(clippy::type_complexity)]
     pub fn new_with_recovery(
         shard_count: usize,
         wal_writers: Vec<Option<Box<dyn WalWriter>>>,

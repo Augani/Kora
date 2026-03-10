@@ -408,7 +408,7 @@ impl ShardStore {
                 Value::Hash(map) => {
                     let mut fields: Vec<(&CompactKey, &Value)> = map
                         .iter()
-                        .filter(|(k, _)| pattern.map_or(true, |p| glob_match(p, k.as_bytes())))
+                        .filter(|(k, _)| pattern.is_none_or(|p| glob_match(p, k.as_bytes())))
                         .collect();
                     fields.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
 
