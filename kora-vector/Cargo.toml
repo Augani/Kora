@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "HNSW vector index and similarity search for Kōra"
+repository.workspace = true
 
 [dependencies]
 ordered-float.workspace = true

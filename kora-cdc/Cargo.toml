@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Change Data Capture with per-shard ring buffers and subscriptions for Kōra"
+repository.workspace = true
 
 [dependencies]
 kora-core.workspace = true

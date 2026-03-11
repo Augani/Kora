@@ -932,6 +932,7 @@ impl ShardStore {
             | Command::DocDictInfo { .. }
             | Command::DocStorage { .. }
             | Command::DocSet { .. }
+            | Command::DocInsert { .. }
             | Command::DocMSet { .. }
             | Command::DocGet { .. }
             | Command::DocMGet { .. }

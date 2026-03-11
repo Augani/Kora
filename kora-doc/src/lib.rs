@@ -59,7 +59,7 @@ pub use decompose::{DecomposeError, Decomposer};
 pub use dictionary::{DictionaryError, StoredValue, ValueDictionary, ValueDictionaryConfig};
 pub use engine::{
     CollectionInfo, DictionaryFieldInfo, DictionaryInfo, DocEngine, DocError, DocMutation,
-    SetResult, StorageInfo,
+    InsertResult, SetResult, StorageInfo,
 };
 pub use expr::{Expr, ExprError, ExprValue};
 pub use index::{hash32, CollectionIndexes, IndexConfig, IndexError, IndexType};

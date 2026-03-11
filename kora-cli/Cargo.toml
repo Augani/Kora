@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "CLI binary and server entrypoint for Kōra"
+repository.workspace = true
 
 [[bin]]
 name = "kora"

@@ -53,7 +53,7 @@ use kora_core::command::{Command, CommandResponse};
 use kora_core::shard::{ShardEngine, ShardStore, WalRecord, WalWriter};
 use kora_doc::{
     CollectionConfig, CollectionInfo, DictionaryInfo, DocEngine, DocError, DocMutation, IndexType,
-    SetResult, StorageInfo,
+    InsertResult, SetResult, StorageInfo,
 };
 use kora_storage::shard_storage::ShardStorage;
 use kora_storage::wal::{SyncPolicy, WalEntry};
@@ -75,6 +75,8 @@ pub type DocUpdateMutation = DocMutation;
 pub type DocDictionaryInfo = DictionaryInfo;
 /// Statistics about a collection's packed storage layer (byte counts, compaction state).
 pub type DocStorageInfo = StorageInfo;
+/// Result of a [`Database::doc_insert`] call with an auto-generated document ID.
+pub type DocInsertResult = InsertResult;
 
 /// Configuration for opening an embedded [`Database`].
 ///
@@ -292,6 +294,19 @@ impl Database {
         self.append_doc_wal(WalRecord::DocSet {
             collection: collection.as_bytes().to_vec(),
             doc_id: doc_id.as_bytes().to_vec(),
+            json: serde_json::to_vec(json).unwrap_or_default(),
+        });
+        Ok(result)
+    }
+
+    /// Insert a document with an auto-generated ID.
+    ///
+    /// Returns the generated ID and insert metadata.
+    pub fn doc_insert(&self, collection: &str, json: &Value) -> Result<DocInsertResult, DocError> {
+        let result = self.doc_engine.write().insert(collection, json)?;
+        self.append_doc_wal(WalRecord::DocSet {
+            collection: collection.as_bytes().to_vec(),
+            doc_id: result.id.as_bytes().to_vec(),
             json: serde_json::to_vec(json).unwrap_or_default(),
         });
         Ok(result)

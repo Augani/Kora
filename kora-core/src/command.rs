@@ -764,6 +764,13 @@ pub enum Command {
         /// JSON payload bytes.
         json: Vec<u8>,
     },
+    /// DOC.INSERT collection json — insert with auto-generated ID.
+    DocInsert {
+        /// Collection name.
+        collection: Vec<u8>,
+        /// JSON payload bytes.
+        json: Vec<u8>,
+    },
     /// DOC.MSET collection doc_id json \[doc_id json ...\] — batch insert/replace.
     DocMSet {
         /// Collection name.
@@ -1872,6 +1879,7 @@ impl Command {
                 | Command::DocDictInfo { .. }
                 | Command::DocStorage { .. }
                 | Command::DocSet { .. }
+                | Command::DocInsert { .. }
                 | Command::DocMSet { .. }
                 | Command::DocGet { .. }
                 | Command::DocMGet { .. }
@@ -1967,6 +1975,7 @@ impl Command {
                 | Command::DocCreate { .. }
                 | Command::DocDrop { .. }
                 | Command::DocSet { .. }
+                | Command::DocInsert { .. }
                 | Command::DocMSet { .. }
                 | Command::DocUpdate { .. }
                 | Command::DocDel { .. }
@@ -2112,6 +2121,7 @@ impl Command {
             | Command::DocDictInfo { .. }
             | Command::DocStorage { .. }
             | Command::DocSet { .. }
+            | Command::DocInsert { .. }
             | Command::DocMSet { .. }
             | Command::DocGet { .. }
             | Command::DocMGet { .. }

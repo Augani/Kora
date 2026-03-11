@@ -64,6 +64,17 @@ pub struct SetResult {
     pub created: bool,
 }
 
+/// Result of a [`DocEngine::insert`] call with an auto-generated ID.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertResult {
+    /// The auto-generated external document ID.
+    pub id: String,
+    /// Internal document ID assigned in the collection.
+    pub internal_id: DocId,
+    /// True if this write inserted a new document key (always true for insert).
+    pub created: bool,
+}
+
 /// Mutation operation used by [`DocEngine::update`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum DocMutation {
@@ -508,6 +519,25 @@ impl DocEngine {
         Ok(SetResult {
             internal_id,
             created,
+        })
+    }
+
+    /// Insert a document with an auto-generated ID.
+    ///
+    /// Returns the generated ID and whether the document was newly created.
+    pub fn insert(&mut self, collection: &str, json: &Value) -> Result<InsertResult, DocError> {
+        let collection_id = self.collection_id(collection)?;
+        let next_id = self
+            .registry
+            .segment(collection_id)
+            .ok_or_else(|| DocError::UnknownCollection(collection.to_string()))?
+            .next_doc_id();
+        let generated_id = format!("{}", next_id);
+        let set_result = self.set(collection, &generated_id, json)?;
+        Ok(InsertResult {
+            id: generated_id,
+            internal_id: set_result.internal_id,
+            created: set_result.created,
         })
     }
 

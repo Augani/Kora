@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Tiered storage, WAL, snapshots, and io_uring async I/O for Kōra"
+repository.workspace = true
 
 [dependencies]
 bytes.workspace = true

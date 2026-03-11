@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Core data structures, shard engine, and memory management for Kōra"
+repository.workspace = true
 
 [dependencies]
 ahash.workspace = true

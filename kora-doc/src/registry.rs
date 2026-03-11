@@ -225,6 +225,11 @@ impl RegistrySegment {
         Self::default()
     }
 
+    /// Return the next document ID that will be assigned (without consuming it).
+    pub fn next_doc_id(&self) -> u64 {
+        self.next_doc_id
+    }
+
     /// Return or create a field ID for `path`.
     pub fn get_or_create_field_id(
         &mut self,

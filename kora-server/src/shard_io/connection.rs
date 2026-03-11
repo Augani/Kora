@@ -1385,6 +1385,12 @@ fn try_handle_local_affinity(
             }
             Some(resp)
         }
+        Command::DocInsert { collection, json } => Some(handle_doc_insert(
+            &shared.doc_engine,
+            &shared.doc_wal,
+            collection,
+            json,
+        )),
         Command::DocMSet {
             collection,
             entries,
@@ -1766,6 +1772,36 @@ fn handle_doc_set(
 
     match doc_engine.write().set(&collection, &doc_id, &json) {
         Ok(_) => CommandResponse::Ok,
+        Err(err) => CommandResponse::Error(format!("ERR {}", err)),
+    }
+}
+
+fn handle_doc_insert(
+    doc_engine: &RwLock<DocEngine>,
+    doc_wal: &Option<parking_lot::Mutex<Box<dyn WalWriter>>>,
+    collection: &[u8],
+    json: &[u8],
+) -> CommandResponse {
+    let collection_str = match parse_utf8_arg(collection, "collection") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let json_value = match serde_json::from_slice::<serde_json::Value>(json) {
+        Ok(value) => value,
+        Err(err) => return CommandResponse::Error(format!("ERR invalid JSON: {}", err)),
+    };
+
+    match doc_engine.write().insert(&collection_str, &json_value) {
+        Ok(result) => {
+            if let Some(ref wal) = doc_wal {
+                wal.lock().append(&WalRecord::DocSet {
+                    collection: collection.to_vec(),
+                    doc_id: result.id.as_bytes().to_vec(),
+                    json: json.to_vec(),
+                });
+            }
+            CommandResponse::BulkString(result.id.into_bytes())
+        }
         Err(err) => CommandResponse::Error(format!("ERR {}", err)),
     }
 }

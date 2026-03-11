@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Sharded Pub/Sub broker for Kōra"
+repository.workspace = true
 
 [dependencies]
 ahash.workspace = true

@@ -568,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "kora-cdc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kora-core",
  "thiserror",
@@ -577,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "kora-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "kora-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ahash",
  "bytes",
@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "kora-doc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "thiserror",
@@ -615,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "kora-embedded"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kora-core",
  "kora-doc",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "kora-observability"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hdrhistogram",
  "parking_lot",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "kora-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "kora-pubsub"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ahash",
  "criterion",
@@ -663,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "kora-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ahash",
  "bytes",
@@ -690,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "kora-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "kora-vector"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "ordered-float",

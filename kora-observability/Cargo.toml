@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Per-key stats, hot-key detection, and memory attribution for Kōra"
+repository.workspace = true
 
 [dependencies]
 hdrhistogram.workspace = true

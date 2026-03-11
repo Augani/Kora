@@ -875,6 +875,7 @@ pub fn command_to_wal_record(cmd: &Command) -> Option<WalRecord> {
             doc_id: doc_id.clone(),
             json: json.clone(),
         }),
+        Command::DocInsert { .. } => None,
         Command::DocDel { collection, doc_id } => Some(WalRecord::DocDel {
             collection: collection.clone(),
             doc_id: doc_id.clone(),

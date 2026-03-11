@@ -179,6 +179,13 @@ pub fn parse_command(frame: RespValue) -> Result<Command, ProtocolError> {
                 json: extract_bytes(&args[2])?,
             })
         }
+        b"DOC.INSERT" => {
+            check_arity("DOC.INSERT", args, 2)?;
+            Ok(Command::DocInsert {
+                collection: extract_bytes(&args[0])?,
+                json: extract_bytes(&args[1])?,
+            })
+        }
         b"DOC.MSET" => parse_doc_mset(args),
         b"DOC.GET" => parse_doc_get(args),
         b"DOC.MGET" => parse_doc_mget(args),

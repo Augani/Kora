@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Embeddable library mode for Kōra — use as a direct API without a network layer"
+repository.workspace = true
 
 [dependencies]
 kora-core.workspace = true

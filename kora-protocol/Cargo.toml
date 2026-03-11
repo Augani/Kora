@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "RESP2/RESP3 protocol parser and serializer for Kōra"
+repository.workspace = true
 
 [dependencies]
 bytes.workspace = true

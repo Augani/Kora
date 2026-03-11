@@ -77,18 +77,18 @@ rand = "0.8"
 tempfile = "3"
 
 # Workspace crates
-kora-core = { path = "kora-core" }
-kora-protocol = { path = "kora-protocol" }
-kora-server = { path = "kora-server" }
-kora-embedded = { path = "kora-embedded" }
-kora-storage = { path = "kora-storage" }
-kora-vector = { path = "kora-vector" }
-kora-cdc = { path = "kora-cdc" }
+kora-core = { path = "kora-core", version = "0.2.0" }
+kora-protocol = { path = "kora-protocol", version = "0.2.0" }
+kora-server = { path = "kora-server", version = "0.2.0" }
+kora-embedded = { path = "kora-embedded", version = "0.2.0" }
+kora-storage = { path = "kora-storage", version = "0.2.0" }
+kora-vector = { path = "kora-vector", version = "0.2.0" }
+kora-cdc = { path = "kora-cdc", version = "0.2.0" }
 
-kora-observability = { path = "kora-observability" }
-kora-pubsub = { path = "kora-pubsub" }
-kora-doc = { path = "kora-doc" }
-kora-cli = { path = "kora-cli" }
+kora-observability = { path = "kora-observability", version = "0.2.0" }
+kora-pubsub = { path = "kora-pubsub", version = "0.2.0" }
+kora-doc = { path = "kora-doc", version = "0.2.0" }
+kora-cli = { path = "kora-cli", version = "0.2.0" }
 
 [profile.release]
 lto = "thin"
