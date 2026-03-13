@@ -88,7 +88,7 @@ kora-cdc = { path = "kora-cdc", version = "0.2.0" }
 kora-observability = { path = "kora-observability", version = "0.2.0" }
 kora-pubsub = { path = "kora-pubsub", version = "0.2.0" }
 kora-doc = { path = "kora-doc", version = "0.2.0" }
-kora-cli = { path = "kora-cli", version = "0.2.0" }
+koracli = { path = "kora-cli", version = "0.2.0" }
 
 [profile.release]
 lto = "thin"
